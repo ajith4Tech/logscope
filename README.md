@@ -92,6 +92,42 @@ Priority (unchanged): structured level → embedded JSON/logfmt → klog `E####`
 `W####` / `I####` → Prometheus shape → keywords → `info`. Rules are
 `severity.buckets` in config.
 
+## Multiline aggregation
+
+Without multiline, stack traces and multi-line Postgres errors are scraped
+**one physical line at a time**. Continuations (`File "…"`, `DETAIL:`, `HINT:`,
+…) get their own timestamps, often land in the wrong severity file, and are
+painful to grep as a single incident.
+
+Logscope fixes that with a Vector `reduce` transform (on by default). A line
+**starts a new event** only when `.message` matches a known start pattern —
+ISO-8601 timestamp, klog `E`/`W`/`I`/`F` prefix, JSON `{…}`, logfmt `level=`,
+or a closed set of severity words (`INFO` / `WARN` / `WARNING` / `ERROR` /
+`FATAL` / `DEBUG` / `TRACE` / `CRITICAL` / `PANIC` followed by `:`). Everything
+else is treated as a **continuation** of the previous event for that
+pod/container and is concatenated before classification.
+
+Before (fragmented Postgres error — each line a separate event):
+
+```
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(alice@example.com) already exists.
+HINT:  Use ON CONFLICT DO UPDATE to merge the row.
+STATEMENT:  INSERT INTO users(email) VALUES ('alice@example.com')
+```
+
+After (one event; newlines flattened to spaces in the flat line format):
+
+```
+… - ERROR:  duplicate key … DETAIL:  Key (email)=… HINT:  … STATEMENT:  INSERT …
+```
+
+Configure under `multiline` in `config.yaml` (`enabled`, `starts_when`,
+`timeout_ms`). Default is **enabled**. `group_by` is
+`pod_name` + `container_name` + `pod_namespace`, so concurrent pods/containers
+never merge into each other’s events. CRI split-line merge remains on via
+`auto_partial_merge`.
+
 ## Backup
 
 Byte-append, not rsync: skip a source whose last byte is not newline; if the
@@ -108,5 +144,3 @@ kubectl -n logging create job --from=cronjob/vector-log-backup backup-manual
 - Checkpoints: `/var/lib/vector` (config `paths.checkpoint`). First boot skips
   files older than 3600s (`ignore_older_secs`, not in YAML).
 - Fluent Bit manifests: [`archive/fluent-bit/`](./archive/fluent-bit/) (reference only).
-- Multiline stack traces: `multiline.enabled` (default `false`). CRI split-line
-  merge stays on via Vector `auto_partial_merge`.
