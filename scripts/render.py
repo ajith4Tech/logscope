@@ -433,11 +433,13 @@ def vector_config_dict(
             "encoding": {"codec": "text"},
         }
     if include_s3:
+        # Embed bucket/region (Vector 0.57+ disables ${ENV} interpolation by default).
+        # AWS_* keys still come from the Secret via env / IRSA — not from config.
         sinks["s3_logs"] = {
             "type": "aws_s3",
             "inputs": ["classify_and_scope"],
-            "bucket": "${S3_BUCKET}",
-            "region": "${AWS_REGION}",
+            "bucket": cfg["sinks"]["s3"]["bucket"],
+            "region": cfg["sinks"]["s3"]["region"],
             "key_prefix": cfg["sinks"]["s3"]["key_prefix"],
             "compression": "gzip",
             "encoding": {"codec": "text"},
