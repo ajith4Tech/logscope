@@ -1,0 +1,145 @@
+# Logscope configuration
+#
+# Copy this file to config.yaml and edit. Environment variables override YAML
+# (see README). Render Vector Helm values + backup CronJob with:
+#   python3 scripts/render.py
+#
+# Defaults reproduce the previous in-repo Vector pipeline (flat line format,
+# same severity rules, same infra namespace list). Change templates and lists
+# here — do not edit deploy/ by hand.
+
+# Kubernetes namespace for Vector, the backup CronJob, and the S3 Secret.
+cluster:
+  namespace: logging
+
+paths:
+  # Node directory mounted into Vector (and the backup job) at /data.
+  # Create it on every node before the first deploy (Directory, not create).
+  host_path: /var/lib/logscope
+  # Vector file checkpoints (incremental tail). The Agent chart already mounts
+  # /var/lib/vector for the local file-sink install — only the S3 values file
+  # adds an extra hostPath when sinks.s3.enabled is true (see README flag).
+  checkpoint: /var/lib/vector
+
+routing:
+  # Namespaces treated as infrastructure (file-sink directory "infra").
+  # Each entry is an exact name or a glob: * (any run), ? (one char).
+  infra_namespaces:
+    - default
+    - kube-public
+    - kube-node-lease
+    - kube-system
+  # Path component for infra events: logs/<infra_scope>/<log_type>.log
+  infra_scope: infra
+  # Tenant events: logs/<namespace_scope_prefix><namespace>/<log_type>.log
+  namespace_scope_prefix: namespaces/
+
+# Stored line layout. Placeholders: {timestamp} {namespace} {pod} {container}
+# {message} {log_type} {scope} {scope_label}
+#   scope        = path routing key (infra or namespaces/<ns>)
+#   scope_label  = "infra" or "namespace" (for a future tagged format)
+#   log_type     = error | warning | info | debug | metrics
+# Empty Kubernetes fields become "-" so awk/cut positions stay stable.
+format:
+  timestamp: "%Y-%m-%dT%H:%M:%SZ"
+  line: "{timestamp} - {namespace} - {pod}/{container} - {message}"
+  # Metrics use the same template by default (Prometheus lines are wrapped
+  # like everything else). Set a different string to special-case metrics.
+  metrics: "{timestamp} - {namespace} - {pod}/{container} - {message}"
+
+# Extra aggregation beyond kubernetes_logs auto_partial_merge (CRI P/F tags).
+# Default off — that is today's behavior. When enabled, a Vector reduce
+# transform groups lines per pod/container until starts_when matches again
+# or timeout_ms elapses. starts_when is a regex on .message (VRL match).
+multiline:
+  enabled: false
+  starts_when: "^\\S"
+  timeout_ms: 1000
+
+severity:
+  default: info
+  # First present JSON object field becomes the message body.
+  text_fields:
+    - message
+    - msg
+    - log
+    - event
+    - reason
+    - description
+  # Structured level lookup (first non-null wins, then mapped via buckets).
+  structured_fields:
+    - level
+    - lvl
+    - Level
+    - LEVEL
+    - severity
+    - severityText
+    - loglevel
+    - log_level
+    - logLevel
+  # Keys accepted inside a raw JSON payload: "level":"error"
+  json_level_keys:
+    - level
+    - lvl
+    - severity
+  # Also parse logfmt level=error
+  logfmt_level: true
+  # Bucket order for structured-level mapping and keyword fallback.
+  buckets:
+    - name: error
+      level_equals: [err]
+      level_contains: [error, fatal, panic, critical, emerg, alert]
+      klog: "E"
+      keywords:
+        - error
+        - failed
+        - failure
+        - exception
+        - traceback
+        - panic
+        - fatal
+        - critical
+        - emerg
+        - segmentation fault
+    - name: warning
+      level_contains: [warn]
+      klog: "W"
+      keywords: [warn]
+    - name: debug
+      level_contains: [debug, trace]
+      keywords: [debug, "trace:"]
+    - name: info
+      level_contains: [info, notice]
+      klog: "I"
+    - name: metrics
+      prometheus: true
+  # Applied only when no bucket is set yet (after structured/JSON/klog/Prometheus).
+  extra_patterns: []
+    # - pattern: '(?i)deadlock detected'
+    #   bucket: error
+
+sinks:
+  file:
+    enabled: true
+    # Vector path template. {{ scope }} and {{ log_type }} are event fields.
+    path: "/data/logs/{{ scope }}/{{ log_type }}.log"
+  prometheus:
+    enabled: true
+  s3:
+    enabled: false
+    # EXAMPLE values only — do not commit real bucket/region/ARNs.
+    # Required when enabled: region, bucket.
+    region: "" # e.g. us-east-1
+    bucket: "" # e.g. my-cluster-logs
+    secret_name: vector-s3-creds
+    key_prefix: "cluster-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
+    # Optional EKS IRSA. When set, Helm annotates the Vector ServiceAccount and
+    # static AWS keys are not injected. Untested in this repo (inferred).
+    irsa_role_arn: "" # e.g. arn:aws:iam::123456789012:role/logscope-s3
+
+backup:
+  enabled: true
+  schedule: "*/30 * * * *"
+  src: /data/logs
+  dst: /data/backups/current
+  log: /data/backups/backup.log
