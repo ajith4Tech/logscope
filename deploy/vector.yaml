@@ -1,0 +1,131 @@
+data_dir: /var/lib/vector
+timezone: UTC
+api:
+  enabled: false
+sources:
+  kube_logs:
+    type: kubernetes_logs
+    auto_partial_merge: true
+    ignore_older_secs: 3600
+    max_line_bytes: 10485760
+  internal_metrics:
+    type: internal_metrics
+    scrape_interval_secs: 15
+transforms:
+  classify_and_scope:
+    type: remap
+    inputs:
+    - kube_logs
+    drop_on_error: true
+    reroute_dropped: false
+    source: |
+      raw = string!(.message)
+      obj = parse_json(raw) ?? {}
+      if !is_object(obj) { obj = {} }
+
+      # ---- text body (first present field wins) ----
+      text = ""
+      for_each(["message", "msg", "log", "event", "reason", "description"]) -> |_i, fname| {
+        v, verr = get(obj, [fname])
+        if text == "" && verr == null && v != null {
+          sv, serr = to_string(v)
+          if serr == null && sv != "" { text = sv }
+        }
+      }
+      if text == "" { text = raw }
+      low = downcase(text)
+
+      # ---- candidate level: structured fields, then embedded JSON/logfmt ----
+      lv = ""
+      lvl_any = obj.level || obj.lvl || obj.Level || obj.LEVEL || obj.severity || obj.severityText || obj.loglevel || obj.log_level || obj.logLevel
+      if lvl_any != null {
+        lvs, lerr = to_string(lvl_any)
+        if lerr == null { lv = downcase(lvs) }
+      }
+      if lv == "" {
+        m = parse_regex(raw, r'"(?:level|lvl|severity)"\s*:\s*"(?P<l>[^"]+)"') ?? {}
+        if exists(m.l) { lv = downcase(string!(m.l)) }
+      }
+      if lv == "" {
+        m2 = parse_regex(raw, r'level=(?P<l>[a-zA-Z]+)') ?? {}
+        if exists(m2.l) { lv = downcase(string!(m2.l)) }
+      }
+
+      bkt = ""
+      if lv != "" {
+        if lv == "err" || contains(lv, "error") || contains(lv, "fatal") || contains(lv, "panic") || contains(lv, "critical") || contains(lv, "emerg") || contains(lv, "alert") { bkt = "error" }
+        else if contains(lv, "warn") { bkt = "warning" }
+        else if contains(lv, "debug") || contains(lv, "trace") { bkt = "debug" }
+        else if contains(lv, "info") || contains(lv, "notice") { bkt = "info" }
+      }
+
+      # ---- klog prefixes ----
+      if bkt == "" {
+        if match(text, r'^E\d{4}\s') { bkt = "error" }
+        else if match(text, r'^W\d{4}\s') { bkt = "warning" }
+        else if match(text, r'^I\d{4}\s') { bkt = "info" }
+      }
+
+      # ---- Prometheus exposition shapes ----
+      if bkt == "" {
+        is_metric = match(text, r'^#\s+(HELP|TYPE)\s+') ||
+          match(low, r'^[a-z_:][a-z0-9_:]*\{[^}]*\}\s+[+-]?[0-9]+(\.[0-9]+)?([e][+-]?[0-9]+)?$') ||
+          match(low, r'^[a-z_:][a-z0-9_:]*\s+[+-]?[0-9]+(\.[0-9]+)?([e][+-]?[0-9]+)?$')
+        if is_metric { bkt = "metrics" }
+      }
+
+      # ---- keyword heuristics ----
+      if bkt == "" && (contains(low, "error") || contains(low, "failed") || contains(low, "failure") || contains(low, "exception") || contains(low, "traceback") || contains(low, "panic") || contains(low, "fatal") || contains(low, "critical") || contains(low, "emerg") || contains(low, "segmentation fault")) { bkt = "error" }
+      if bkt == "" && (contains(low, "warn")) { bkt = "warning" }
+      if bkt == "" && (contains(low, "debug") || contains(low, "trace:")) { bkt = "debug" }
+      if bkt == "" { bkt = "info" }
+
+      # ---- flatten + timestamp + k8s metadata ----
+      flat = replace(text, r'[\r\n\t]+', " ")
+
+      ts = if is_timestamp(.timestamp) {
+        format_timestamp!(.timestamp, "%Y-%m-%dT%H:%M:%SZ")
+      } else {
+        ts_s, ts_err = to_string(.timestamp)
+        if ts_err == null { ts_s } else { "" }
+      }
+
+      kmeta  = get(., ["kubernetes"]) ?? {}
+      ns_raw, ns_err = get(kmeta, ["pod_namespace"])
+      if ns_err != null || ns_raw == null {
+        ns_raw, ns_err = get(kmeta, ["namespace_name"])
+      }
+      if ns_err != null || ns_raw == null { ns_raw = "-" }
+      ns = to_string(ns_raw) ?? "-"
+      if ns == "" { ns = "-" }
+      pod    = to_string(get(kmeta, ["pod_name"]) ?? "-") ?? "-"
+      contnr = to_string(get(kmeta, ["container_name"]) ?? "-") ?? "-"
+
+      # ---- routing scope ----
+      is_infra = false
+      if match(ns, r'^default$') { is_infra = true }
+      if match(ns, r'^kube-public$') { is_infra = true }
+      if match(ns, r'^kube-node-lease$') { is_infra = true }
+      if match(ns, r'^kube-system$') { is_infra = true }
+      scope_label = if is_infra { "infra" } else { "namespace" }
+      scope = if is_infra {
+        "infra"
+      } else {
+        "namespaces/" + ns
+      }
+
+      out = ts + " - " + ns + " - " + pod + "/" + contnr + " - " + flat
+      . = { "message": out, "log_type": bkt, "scope": scope }
+sinks:
+  log_files:
+    type: file
+    inputs:
+    - classify_and_scope
+    path: /data/logs/{{ scope }}/{{ log_type }}.log
+    encoding:
+      codec: text
+  prometheus:
+    type: prometheus_exporter
+    inputs:
+    - internal_metrics
+    address: 0.0.0.0:8686
