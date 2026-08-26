@@ -1,0 +1,17 @@
+# Local override (copy from config.example.yaml). May contain cluster names and S3 identifiers.
+config.yaml
+
+# Runtime data — never commit scraped logs or offsets
+logs/
+backups/
+.state/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+*.swp
