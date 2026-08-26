@@ -1,6 +1,9 @@
 # Local override (copy from config.example.yaml). May contain cluster names and S3 identifiers.
 config.yaml
 
+# Filled S3 credentials — copy from deploy/k3s/s3-secret.example.yaml
+deploy/k3s/s3-secret.yaml
+
 # Runtime data — never commit scraped logs or offsets
 logs/
 backups/
