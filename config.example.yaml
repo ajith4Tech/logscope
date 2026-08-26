@@ -48,12 +48,12 @@ format:
   metrics: "{timestamp} - {namespace} - {pod}/{container} - {message}"
 
 # Extra aggregation beyond kubernetes_logs auto_partial_merge (CRI P/F tags).
-# Default off — that is today's behavior. When enabled, a Vector reduce
-# transform groups lines per pod/container until starts_when matches again
-# or timeout_ms elapses. starts_when is a regex on .message (VRL match).
+# When enabled, a Vector reduce transform groups lines per pod/container until
+# starts_when matches again or timeout_ms elapses. starts_when is a regex on
+# .message (VRL match). Default on.
 multiline:
-  enabled: false
-  starts_when: "^\\S"
+  enabled: true
+  starts_when: "^(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}|[EWIF]\\d{4}\\s|\\{|level=|(?:INFO|WARN(?:ING)?|ERROR|FATAL|DEBUG|TRACE|CRITICAL|PANIC):\\s)"
   timeout_ms: 1000
 
 severity:

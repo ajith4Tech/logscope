@@ -67,10 +67,22 @@ customConfig:
       type: internal_metrics
       scrape_interval_secs: 15
   transforms:
+    multiline:
+      type: reduce
+      inputs:
+      - kube_logs
+      group_by:
+      - kubernetes.pod_name
+      - kubernetes.container_name
+      - kubernetes.pod_namespace
+      merge_strategies:
+        message: concat_newline
+      starts_when: match(string!(.message), r'^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}|[EWIF]\d{4}\s|\{|level=|(?:INFO|WARN(?:ING)?|ERROR|FATAL|DEBUG|TRACE|CRITICAL|PANIC):\s)')
+      expire_after_ms: 1000
     classify_and_scope:
       type: remap
       inputs:
-      - kube_logs
+      - multiline
       drop_on_error: true
       reroute_dropped: false
       source: |
