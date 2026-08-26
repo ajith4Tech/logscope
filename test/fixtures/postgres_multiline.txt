@@ -1,0 +1,4 @@
+ERROR:  duplicate key value violates unique constraint "users_email_key"
+DETAIL:  Key (email)=(alice@example.com) already exists.
+HINT:  Use ON CONFLICT DO UPDATE to merge the row.
+STATEMENT:  INSERT INTO users(email) VALUES ('alice@example.com')

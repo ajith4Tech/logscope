@@ -1,0 +1,3 @@
+INFO: application started successfully
+WARN: cache miss rate above threshold
+ERROR: failed to connect to upstream service

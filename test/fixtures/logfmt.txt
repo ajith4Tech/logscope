@@ -1,0 +1,2 @@
+level=error msg="logfmt error line" code=500
+level=info msg="logfmt info line" code=200

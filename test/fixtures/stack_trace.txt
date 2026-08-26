@@ -1,0 +1,5 @@
+ERROR: unhandled exception in worker
+  File "/app/worker.py", line 42, in run
+    handle(job)
+  File "/app/worker.py", line 18, in handle
+    raise RuntimeError("boom")

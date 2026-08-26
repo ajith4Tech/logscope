@@ -1,0 +1,3 @@
+E0825 16:24:04.053412       1 controller.go:42] reconcile failed
+W0825 16:24:05.000000       1 controller.go:55] retrying
+I0825 16:24:06.120612       1 event.go:389] "Event occurred"
