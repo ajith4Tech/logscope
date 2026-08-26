@@ -132,7 +132,7 @@ sinks:
     region: "" # e.g. us-east-1
     bucket: "" # e.g. my-cluster-logs
     secret_name: vector-s3-creds
-    key_prefix: "cluster-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
+    key_prefix: "k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
     # Optional EKS IRSA. When set, Helm annotates the Vector ServiceAccount and
     # static AWS keys are not injected. Untested in this repo (inferred).
     irsa_role_arn: "" # e.g. arn:aws:iam::123456789012:role/logscope-s3
