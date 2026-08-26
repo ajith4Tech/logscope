@@ -124,6 +124,25 @@ sinks:
     path: /data/logs/{{ scope }}/{{ log_type }}.log
     encoding:
       codec: text
+  s3_logs:
+    type: aws_s3
+    inputs:
+    - classify_and_scope
+    bucket: logscope
+    region: eu-north-1
+    key_prefix: k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_
+    compression: gzip
+    encoding:
+      codec: text
+    framing:
+      method: newline_delimited
+    batch:
+      max_size: 50000000
+      timeout_secs: 600
+    buffer:
+      type: disk
+      max_size: 2684354560
+      when_full: block
   prometheus:
     type: prometheus_exporter
     inputs:

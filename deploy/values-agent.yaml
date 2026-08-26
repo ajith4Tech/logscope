@@ -43,6 +43,17 @@ podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "8686"
 
+env:
+  - name: AWS_REGION
+    value: "eu-north-1"
+  - name: S3_BUCKET
+    value: "logscope"
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef: { name: logscope-s3-creds, key: AWS_ACCESS_KEY_ID }
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef: { name: logscope-s3-creds, key: AWS_SECRET_ACCESS_KEY }
 extraVolumes:
   - name: vector-data
     hostPath:
@@ -172,6 +183,25 @@ customConfig:
         out = ts + " - " + ns + " - " + pod + "/" + contnr + " - " + flat
         . = { "message": out, "log_type": bkt, "scope": scope }
   sinks:
+    s3_logs:
+      type: aws_s3
+      inputs:
+      - classify_and_scope
+      bucket: logscope
+      region: eu-north-1
+      key_prefix: "k3s-logs/logs/{{`{{ log_type }}`}}/%Y/%m/%d/%H_%M_%S_"
+      compression: gzip
+      encoding:
+        codec: text
+      framing:
+        method: newline_delimited
+      batch:
+        max_size: 50000000
+        timeout_secs: 600
+      buffer:
+        type: disk
+        max_size: 2684354560
+        when_full: block
     prometheus:
       type: prometheus_exporter
       inputs:
