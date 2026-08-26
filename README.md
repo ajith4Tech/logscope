@@ -86,6 +86,20 @@ Same `config.yaml`. Set `sinks.s3.enabled: true`, `sinks.s3.region`,
 values). Optionally `sinks.file.enabled: false` if you do not want node files.
 Re-render, then follow [`production-vector/README.md`](./production-vector/README.md).
 
+**S3 retention** (`sinks.s3.retention_days`, default 30): after setting it in
+`config.yaml`, run once:
+
+```bash
+python3 scripts/apply_s3_lifecycle.py
+# uses deploy/k3s/s3-secret.yaml when present, else AWS_* env / default chain
+```
+
+That installs a native S3 Lifecycle expiration rule (rolling by object age under
+Logscope’s `key_prefix` root). It is a **bucket property**, not a Vector or
+Helm setting — separate from `render.py` and DaemonSet deploy. Changing
+`retention_days` later requires re-running this script; editing `config.yaml`
+and redeploying Vector alone does **not** update the live rule.
+
 ## Classification
 
 Priority (unchanged): structured level → embedded JSON/logfmt → klog `E####` /

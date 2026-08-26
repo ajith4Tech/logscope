@@ -64,6 +64,7 @@ ENV_MAP = {
     "LOGSCOPE_S3_BUCKET": ("sinks.s3.bucket", "str"),
     "LOGSCOPE_S3_SECRET_NAME": ("sinks.s3.secret_name", "str"),
     "LOGSCOPE_S3_KEY_PREFIX": ("sinks.s3.key_prefix", "str"),
+    "LOGSCOPE_S3_RETENTION_DAYS": ("sinks.s3.retention_days", "int"),
     "LOGSCOPE_S3_IRSA_ROLE_ARN": ("sinks.s3.irsa_role_arn", "str"),
     "LOGSCOPE_BACKUP_ENABLED": ("backup.enabled", "bool"),
     "LOGSCOPE_BACKUP_SCHEDULE": ("backup.schedule", "str"),
@@ -367,6 +368,12 @@ def validate_cfg(cfg: dict) -> None:
             raise SystemExit("sinks.s3.region is required when sinks.s3.enabled is true")
         if not (s3.get("bucket") or "").strip():
             raise SystemExit("sinks.s3.bucket is required when sinks.s3.enabled is true")
+    # sinks.s3.retention_days: positive int (default 30). Used by apply_s3_lifecycle.py;
+    # not a Vector/Helm setting. Omit or null → treated as unset (script defaults).
+    if "retention_days" in s3 and s3["retention_days"] is not None:
+        days = s3["retention_days"]
+        if not isinstance(days, int) or isinstance(days, bool) or days < 1:
+            raise SystemExit("sinks.s3.retention_days must be a positive integer")
     file_on = cfg["sinks"]["file"].get("enabled")
     prom_on = cfg["sinks"]["prometheus"].get("enabled")
     if not file_on and not s3.get("enabled") and not prom_on:
