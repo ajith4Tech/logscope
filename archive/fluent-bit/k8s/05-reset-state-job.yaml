@@ -1,0 +1,41 @@
+# Utility: wipe Fluent Bit's root-owned scrape state (.state/) so the next
+# DaemonSet start re-scrapes ALL history from the beginning.
+# Usage:
+#   kubectl delete ds fluent-bit -n logging          # stop the scraper first
+#   kubectl apply -f k8s/05-reset-state-job.yaml     # wipe offsets (runs as root)
+#   kubectl -n logging wait --for=condition=complete job/reset-state --timeout=90s
+#   kubectl logs -n logging job/reset-state          # should print CLEAN_OK
+#   kubectl delete job reset-state -n logging
+#   kubectl apply -f k8s/03-daemonset.yaml           # scraper restarts from head
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: reset-state
+  namespace: logging
+  labels:
+    app.kubernetes.io/name: fluent-bit
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fluent-bit
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: cleaner
+          image: busybox:1.36
+          imagePullPolicy: IfNotPresent
+          # container runs as root -> can remove root-owned .state files;
+          # also clears categorized files so buckets don't mix formats/duplicates
+          command: ["sh", "-c"]
+          args:
+            - rm -rf /clean/.state/* /clean/logs/*/*.log && echo CLEAN_OK
+          volumeMounts:
+            - name: clean
+              mountPath: /clean
+      volumes:
+        - name: clean
+          hostPath:
+            path: /home/falcon/Projects/Logs_Scraping
+            type: Directory
