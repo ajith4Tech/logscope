@@ -272,6 +272,11 @@ class LogStorage:
             out[field] = [{"value": row[0], "count": int(row[1])} for row in rows]
         return out
 
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Read access to the shared records connection (used by InsightsJob)."""
+        return self._conn
+
     def get_status(self) -> dict[str, Any]:
         last_polled_at = self._get_state("last_polled_at")
         last_successful_ingest_at = self._get_state("last_successful_ingest_at")

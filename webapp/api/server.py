@@ -8,8 +8,10 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .ai_summary import summarize_anomaly
 from .config import AppConfig, load_app_config
 from .ingest import S3Ingestor
+from .insights import AnomalyStore, InsightsJob
 from .storage import LogStorage, decode_cursor
 
 
@@ -91,6 +93,9 @@ class LogscopeHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/tail":
             self._send_json(app.api_tail(params))
             return
+        if parsed.path == "/api/anomalies":
+            self._send_json(app.api_anomalies(params))
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
 
@@ -110,18 +115,38 @@ class WebApp:
         self.ingestor = S3Ingestor(cfg, self.storage)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._ingest_loop, daemon=True)
+        self.anomaly_store = AnomalyStore(cfg.webapp.db_path)
+        self.insights = InsightsJob(
+            cfg,
+            self.storage.conn,
+            self.anomaly_store,
+            summarizer=lambda anomaly: summarize_anomaly(anomaly, cfg.ai),
+        )
 
     def start(self) -> None:
         self._thread.start()
+        if self.cfg.insights.enabled:
+            self.insights.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
+        if self.cfg.insights.enabled:
+            self.insights.stop()
 
     def _ingest_loop(self) -> None:
         while not self._stop.is_set():
             self.ingestor.ingest_once()
             self._stop.wait(self.cfg.webapp.poll_interval_secs)
+
+    def api_anomalies(self, params: dict[str, list[str]]) -> dict:
+        flat = {
+            key: _first(params, key)
+            for key in ("status", "type", "namespace")
+            if _first(params, key)
+        }
+        limit = _coerce_limit(_first(params, "limit"), self.cfg.webapp.page_size_default, self.cfg.webapp.page_size_max)
+        return self.anomaly_store.query_anomalies(flat, limit=limit)
 
     def api_logs(self, params: dict[str, list[str]]) -> dict:
         flat = _query_params(params)

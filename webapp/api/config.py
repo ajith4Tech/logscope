@@ -14,6 +14,27 @@ DEFAULT_BACKEND = {
     "page_size_max": 1000,
 }
 
+DEFAULT_INSIGHTS = {
+    "enabled": True,
+    "detect_interval_secs": 300,
+    "baseline_window_days": 7,
+    "spike_multiplier": 3.0,
+    "spike_min_count": 10,
+    "shift_share_delta": 0.25,
+    "shift_min_count": 20,
+    "frequency_multiplier": 5.0,
+    "frequency_min_count": 30,
+    "detect_per_pod": False,
+    "sample_timestamps_max": 10,
+}
+
+DEFAULT_AI = {
+    "provider": "none",
+    "model": "",
+    "api_key_env": "LOGSCOPE_AI_API_KEY",
+    "max_anomalies_per_tick": 5,
+}
+
 
 @dataclass(frozen=True)
 class BackendConfig:
@@ -21,6 +42,29 @@ class BackendConfig:
     db_path: Path
     page_size_default: int
     page_size_max: int
+
+
+@dataclass(frozen=True)
+class InsightsConfig:
+    enabled: bool
+    detect_interval_secs: int
+    baseline_window_days: int
+    spike_multiplier: float
+    spike_min_count: int
+    shift_share_delta: float
+    shift_min_count: int
+    frequency_multiplier: float
+    frequency_min_count: int
+    detect_per_pod: bool
+    sample_timestamps_max: int
+
+
+@dataclass(frozen=True)
+class AiConfig:
+    provider: str
+    model: str
+    api_key_env: str
+    max_anomalies_per_tick: int
 
 
 @dataclass(frozen=True)
@@ -36,6 +80,8 @@ class AppConfig:
     severity_buckets: tuple[str, ...]
     falco_namespace: str | None
     webapp: BackendConfig
+    insights: InsightsConfig
+    ai: AiConfig
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -76,6 +122,10 @@ def load_app_config(config_path: Path) -> AppConfig:
     webapp = raw.get("webapp") or {}
     backend = dict(DEFAULT_BACKEND)
     backend.update(webapp.get("backend") or {})
+    insights = dict(DEFAULT_INSIGHTS)
+    insights.update(webapp.get("insights") or {})
+    ai = dict(DEFAULT_AI)
+    ai.update(webapp.get("ai") or {})
     creds = _load_secret_credentials(config_path.parent / "deploy" / "k3s" / "s3-secret.yaml")
 
     if not s3_cfg.get("bucket"):
@@ -105,6 +155,25 @@ def load_app_config(config_path: Path) -> AppConfig:
             db_path=Path(str(backend["db_path"])).expanduser(),
             page_size_default=int(backend["page_size_default"]),
             page_size_max=int(backend["page_size_max"]),
+        ),
+        insights=InsightsConfig(
+            enabled=bool(insights["enabled"]),
+            detect_interval_secs=int(insights["detect_interval_secs"]),
+            baseline_window_days=int(insights["baseline_window_days"]),
+            spike_multiplier=float(insights["spike_multiplier"]),
+            spike_min_count=int(insights["spike_min_count"]),
+            shift_share_delta=float(insights["shift_share_delta"]),
+            shift_min_count=int(insights["shift_min_count"]),
+            frequency_multiplier=float(insights["frequency_multiplier"]),
+            frequency_min_count=int(insights["frequency_min_count"]),
+            detect_per_pod=bool(insights["detect_per_pod"]),
+            sample_timestamps_max=int(insights["sample_timestamps_max"]),
+        ),
+        ai=AiConfig(
+            provider=str(ai["provider"]),
+            model=str(ai["model"]),
+            api_key_env=str(ai["api_key_env"]),
+            max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
         ),
     )
 

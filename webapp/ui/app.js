@@ -1,12 +1,18 @@
+const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 minutes
+
 const state = {
   filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
   facets: {},
   items: [],
   nextCursor: null,
+  hasMore: false,
   liveCursor: null,
   liveTimer: null,
   lastUpdatedAt: null,
   lastStatus: null,
+  expandedRows: new Set(),
+  expandedGroups: new Set(),
+  groupByRule: false,
 };
 
 const el = (id) => document.getElementById(id);
@@ -89,9 +95,124 @@ function renderFacets(facets) {
   state.facets = facets;
   el('scope').innerHTML = optionList(facets.scope || []);
   el('namespace').innerHTML = optionList(facets.namespace || []);
-  el('pod').innerHTML = optionList(facets.pod || []);
-  el('container').innerHTML = optionList(facets.container || []);
   el('severity_bucket').innerHTML = optionList(facets.severity_bucket || []);
+  // pod / container use searchable comboboxes; their option lists refresh
+  // the next time a combobox opens.
+}
+
+const RANGE_PRESETS = {
+  today: { label: 'Today', apply: setDefaultDateRange },
+  '1h': { label: 'Last hour', apply: () => applyRelativeWindow(60 * 60 * 1000) },
+  '6h': { label: 'Last 6 hours', apply: () => applyRelativeWindow(6 * 60 * 60 * 1000) },
+  '24h': { label: 'Last 24 hours', apply: () => applyRelativeWindow(24 * 60 * 60 * 1000) },
+  '7d': { label: 'Last 7 days', apply: () => applyRelativeWindow(7 * 24 * 60 * 60 * 1000) },
+  all: { label: 'All time', apply: () => { el('start').value = ''; el('end').value = ''; } },
+};
+
+function applyRelativeWindow(spanMs) {
+  const now = new Date();
+  const start = new Date(now.getTime() - spanMs);
+  el('start').value = toDatetimeLocal(start);
+  el('end').value = toDatetimeLocal(now);
+}
+
+function toDatetimeLocal(date) {
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function buildCombobox(inputId, facetKey) {
+  const input = el(inputId);
+  const wrapper = document.createElement('div');
+  wrapper.className = 'combobox';
+  input.parentNode.insertBefore(wrapper, input);
+  wrapper.appendChild(input);
+  const list = document.createElement('div');
+  list.className = 'combobox-list';
+  list.id = `${inputId}-list`;
+  wrapper.appendChild(list);
+
+  const close = () => { list.classList.remove('open'); };
+
+  const renderList = () => {
+    const needle = input.value.trim().toLowerCase();
+    const values = (state.facets[facetKey] || [])
+      .filter((item) => !needle || String(item.value).toLowerCase().includes(needle))
+      .slice(0, 200);
+    const parts = ['<button type="button" class="combobox-option" data-value="">All</button>'];
+    for (const item of values) {
+      const selected = item.value === input.value ? ' selected' : '';
+      parts.push(`<button type="button" class="combobox-option${selected}" data-value="${escapeHtml(item.value)}">${escapeHtml(item.value)} <span class="combobox-count">${item.count}</span></button>`);
+    }
+    if (!values.length) parts.push('<div class="combobox-empty">No matches</div>');
+    list.innerHTML = parts.join('');
+  };
+
+  const open = () => {
+    renderList();
+    list.classList.add('open');
+  };
+
+  input.addEventListener('focus', open);
+  input.addEventListener('input', open);
+  input.addEventListener('blur', () => window.setTimeout(close, 150));
+  list.addEventListener('mousedown', (event) => {
+    const option = event.target.closest('.combobox-option');
+    if (!option) return;
+    event.preventDefault();
+    input.value = option.dataset.value || '';
+    close();
+    syncFiltersFromUi();
+    loadLogs(true).catch((err) => { el('health').textContent = err.message; });
+  });
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); close(); input.blur(); }
+    else if (event.key === 'Escape') { close(); }
+  });
+}
+
+// Normalize a Falco message to its rule-level text: the embedded per-event
+// timestamp ("15:50:11.473402755: ") and the trailing field dump (" | k=v …")
+// are stripped so repeated hits of the same rule collapse together.
+function ruleKeyOf(item) {
+  let message = String(item.message || '');
+  message = message.replace(/\b\d{2}:\d{2}:\d{2}\.\d+:\s*/g, '');
+  const detailIndex = message.indexOf(' | ');
+  if (detailIndex > 0 && message.slice(detailIndex).includes('=')) {
+    message = message.slice(0, detailIndex);
+  }
+  return message;
+}
+
+function groupKeyOf(item) {
+  // ruleKeyOf strips embedded per-event Falco timestamps so identical alerts
+  // collapse even when their raw messages differ only by event time.
+  const message = ruleKeyOf(item);
+  return [item.severity_bucket, item.namespace, item.pod, item.container, message].join('|');
+}
+
+// items arrive newest-first; identical keys within GROUP_WINDOW_MS merge,
+// except in "group by rule" mode where matching rules aggregate across the
+// whole result set (no window).
+function buildGroups(items) {
+  const groups = [];
+  const byKey = new Map();
+  for (const item of items) {
+    const key = groupKeyOf(item);
+    const ts = Date.parse(item.timestamp) || 0;
+    let group = byKey.get(key);
+    if (group && !state.groupByRule && Math.abs(ts - group.lastTs) > GROUP_WINDOW_MS) {
+      group = null;
+    }
+    if (!group) {
+      group = { items: [], lastTs: ts };
+      byKey.set(key, group);
+      groups.push(group);
+    }
+    group.items.push(item);
+    if (!state.groupByRule) group.lastTs = ts;
+  }
+  return groups;
 }
 
 function rowMarkup(item) {
@@ -108,13 +229,54 @@ function rowMarkup(item) {
   node.querySelector('.source').textContent = `${item.namespace} · ${item.pod}/${item.container}`;
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
-  messageButton.title = 'Click to view full message';
-  messageButton.addEventListener('click', (event) => {
-    event.stopPropagation();
-    openMessageDialog(item);
-  });
-  node.addEventListener('click', () => openMessageDialog(item));
+  messageButton.title = 'Click row to expand full details';
   return node;
+}
+
+function addDetailBlock(wrap, label, text) {
+  const block = document.createElement('div');
+  block.className = 'detail-block';
+  const labelNode = document.createElement('div');
+  labelNode.className = 'detail-label';
+  labelNode.textContent = label;
+  const pre = document.createElement('pre');
+  pre.className = 'detail-pre';
+  pre.textContent = text;
+  block.appendChild(labelNode);
+  block.appendChild(pre);
+  wrap.appendChild(block);
+}
+
+// Expandable detail: full (untruncated) message, raw_line, source_key,
+// line_number, and output_fields when the backend provides them.
+function detailMarkup(item) {
+  const wrap = document.createElement('div');
+  wrap.className = 'row-detail';
+  addDetailBlock(wrap, 'Full message', item.message);
+  if (item.raw_line) addDetailBlock(wrap, 'raw_line', item.raw_line);
+  addDetailBlock(wrap, 'source_key', item.source_key);
+  addDetailBlock(wrap, 'line_number', String(item.line_number));
+  if (item.output_fields && Object.keys(item.output_fields).length) {
+    addDetailBlock(wrap, 'output_fields', JSON.stringify(item.output_fields, null, 2));
+  }
+  return wrap;
+}
+
+function timestampsMarkup(group) {
+  const wrap = document.createElement('div');
+  wrap.className = 'row-detail group-timestamps';
+  const label = document.createElement('div');
+  label.className = 'detail-label';
+  label.textContent = `${group.items.length} occurrences`;
+  wrap.appendChild(label);
+  for (const item of group.items) {
+    const line = document.createElement('div');
+    line.className = 'timestamp-line';
+    line.textContent = formatTimestamp(item.timestamp);
+    line.title = item.timestamp;
+    wrap.appendChild(line);
+  }
+  return wrap;
 }
 
 function renderRows(items, append = false) {
@@ -129,9 +291,49 @@ function renderRows(items, append = false) {
     el('resultSummary').textContent = 'No rows match';
     return;
   }
-  for (const item of items) rows.appendChild(rowMarkup(item));
+  let collapsed = 0;
+  for (const group of buildGroups(items)) {
+    const representative = group.items[0];
+    collapsed += group.items.length - 1;
+    const node = rowMarkup(representative);
+    if (group.items.length > 1) {
+      const badge = node.querySelector('.badge');
+      const count = document.createElement('span');
+      count.className = 'count-badge';
+      count.textContent = `×${group.items.length}`;
+      count.title = `${group.items.length} identical alerts — click row to show individual timestamps`;
+      badge.after(count);
+      node.classList.add('grouped');
+      node.dataset.groupKey = groupKeyOf(representative);
+      if (state.expandedGroups.has(node.dataset.groupKey)) {
+        node.appendChild(timestampsMarkup(group));
+      }
+    }
+    const rowId = String(representative.id);
+    node.dataset.rowId = rowId;
+    if (state.expandedRows.has(rowId)) {
+      node.classList.add('expanded');
+      node.appendChild(detailMarkup(representative));
+    }
+    node.addEventListener('click', () => {
+      if (group.items.length > 1 && !state.expandedRows.has(rowId)) {
+        const key = node.dataset.groupKey;
+        if (state.expandedGroups.has(key)) state.expandedGroups.delete(key);
+        else state.expandedGroups.add(key);
+      }
+      if (state.expandedRows.has(rowId)) state.expandedRows.delete(rowId);
+      else state.expandedRows.add(rowId);
+      renderAll();
+    });
+    rows.appendChild(node);
+  }
   const total = append ? state.items.length : items.length;
-  el('resultSummary').textContent = `${total} visible lines`;
+  const groupedNote = collapsed > 0 ? ` · ${collapsed} collapsed` : '';
+  el('resultSummary').textContent = `${total} visible lines${groupedNote}`;
+}
+
+function renderAll() {
+  renderRows(state.items, false);
 }
 
 async function loadFacets() {
@@ -147,18 +349,6 @@ function updateHealthFromStatus(status) {
   }
 }
 
-function openMessageDialog(item) {
-  const dialog = el('messageDialog');
-  el('dialogTitle').textContent = `${item.timestamp} · ${item.namespace}/${item.pod}`;
-  el('dialogBody').textContent = item.message;
-  el('dialogMeta').textContent = `${item.scope} · ${item.severity_bucket} · ${item.container} · source id ${item.id}`;
-  if (typeof dialog.showModal === 'function') {
-    dialog.showModal();
-  } else {
-    alert(item.message);
-  }
-}
-
 function encodeCursor(item) {
   return btoa(JSON.stringify({ ts: item.timestamp, id: item.id })).replaceAll('=', '').replaceAll('+', '-').replaceAll('/', '_');
 }
@@ -168,14 +358,28 @@ async function loadLogs(reset = true) {
   if (!reset && state.nextCursor) params.set('cursor', state.nextCursor);
   const data = await fetchJson(`/api/logs?${params.toString()}`);
   state.nextCursor = data.next_cursor;
+  state.hasMore = Boolean(data.has_more);
   state.lastUpdatedAt = data.last_updated_at;
   if (reset) state.items = data.items; else state.items = state.items.concat(data.items);
-  renderRows(data.items, !reset);
+  state.expandedRows.clear();
+  state.expandedGroups.clear();
+  renderAll();
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+  const loadMore = el('loadMore');
+  loadMore.disabled = !state.hasMore;
+  loadMore.textContent = state.hasMore ? 'Load older' : 'End of results';
   if (!el('health').textContent || !el('health').textContent.startsWith('Ingestion error')) {
     el('health').textContent = data.has_more ? 'More rows available' : 'End of current page';
   }
   if (reset && el('live').checked && state.items.length) state.liveCursor = encodeCursor(state.items[0]);
+}
+
+function flashNewRows(count) {
+  const banner = el('newRowsBanner');
+  el('newRowsCount').textContent = String(count);
+  banner.classList.add('show');
+  window.clearTimeout(flashNewRows.timer);
+  flashNewRows.timer = window.setTimeout(() => banner.classList.remove('show'), 6000);
 }
 
 async function pollTail() {
@@ -184,9 +388,11 @@ async function pollTail() {
   const data = await fetchJson(`/api/tail?${params.toString()}`);
   if (data.items.length) {
     state.items = data.items.concat(state.items);
-    const rows = el('rows');
-    for (const item of data.items.slice().reverse()) rows.prepend(rowMarkup(item));
     state.liveCursor = encodeCursor(data.items[data.items.length - 1]);
+    state.expandedRows.clear();
+    state.expandedGroups.clear();
+    renderAll();
+    flashNewRows(data.items.length);
   }
   state.lastUpdatedAt = data.last_updated_at;
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
@@ -213,6 +419,8 @@ function stopTailPolling() {
 
 async function init() {
   setDefaultDateRange();
+  buildCombobox('pod', 'pod');
+  buildCombobox('container', 'container');
   const status = await fetchJson('/api/status');
   state.lastStatus = status;
   updateHealthFromStatus(status);
@@ -245,6 +453,7 @@ el('clearFilters').addEventListener('click', async () => {
   el('container').value = '';
   el('severity_bucket').value = '';
   el('q').value = '';
+  el('rangePreset').value = 'today';
   setDefaultDateRange();
   syncFiltersFromUi();
   await loadLogs(true);
@@ -253,6 +462,18 @@ el('securityShortcut').addEventListener('click', async () => {
   el('scope').value = 'security';
   syncFiltersFromUi();
   await loadLogs(true);
+});
+el('rangePreset').addEventListener('change', async () => {
+  const preset = RANGE_PRESETS[el('rangePreset').value];
+  if (!preset) return;
+  preset.apply();
+  syncFiltersFromUi();
+  await loadLogs(true);
+});
+el('groupByRule').addEventListener('change', async () => {
+  state.groupByRule = el('groupByRule').checked;
+  state.expandedGroups.clear();
+  renderAll();
 });
 document.addEventListener('click', async (event) => {
   const target = event.target;
@@ -271,10 +492,8 @@ document.addEventListener('click', async (event) => {
     await loadLogs(true);
   }
 });
-el('messageDialog').addEventListener('click', (event) => {
-  const rect = el('messageDialog').getBoundingClientRect();
-  const clickedInPanel = rect.top <= event.clientY && event.clientY <= rect.bottom && rect.left <= event.clientX && event.clientX <= rect.right;
-  if (!clickedInPanel) el('messageDialog').close();
+el('newRowsBanner').addEventListener('click', () => {
+  el('newRowsBanner').classList.remove('show');
 });
 el('live').addEventListener('change', () => {
   if (el('live').checked) startTailPolling(); else stopTailPolling();

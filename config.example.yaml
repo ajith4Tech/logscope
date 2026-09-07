@@ -172,3 +172,25 @@ webapp:
     db_path: /tmp/logscope-webapp.sqlite
     page_size_default: 200
     page_size_max: 1000
+  # Logscope Insights — statistical anomaly detection over the same records store.
+  insights:
+    enabled: true
+    detect_interval_secs: 300      # detection tick, mirrors the ingest poll style
+    baseline_window_days: 7        # trailing rolling baseline window
+    spike_multiplier: 3.0          # error-rate spike: current >= multiplier * baseline
+    spike_min_count: 10            # floor so tiny namespaces stay quiet
+    shift_share_delta: 0.25        # severity share must move by this much
+    shift_min_count: 20            # absolute floor for a shifted bucket
+    frequency_multiplier: 5.0      # recurring-message frequency vs baseline
+    frequency_min_count: 30
+    detect_per_pod: false          # also spike-check per pod (not just namespace)
+    sample_timestamps_max: 10      # sample timestamps kept in evidence
+  # AI summarization (stage 2). Only invoked for newly-detected anomalies.
+  # 'none' (the current default) performs no call and returns None. Adding a real
+  # provider later means adding one branch here that builds `prompt_payload`
+  # into a request — no detection-code changes needed.
+  ai:
+    provider: none                 # none | openai | anthropic
+    model: ""
+    api_key_env: LOGSCOPE_AI_API_KEY
+    max_anomalies_per_tick: 5

@@ -35,8 +35,8 @@
         <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
         <label>Scope <select id="scope"></select></label>
         <label>Namespace <select id="namespace"></select></label>
-        <label>Pod <select id="pod"></select></label>
-        <label>Container <select id="container"></select></label>
+        <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
+        <label>Container <input id="container" type="text" placeholder="All — type to search" autocomplete="off" /></label>
         <label>Severity <select id="severity_bucket"></select></label>
         <label>Search <input id="q" type="search" placeholder="error, trace, rule name, etc." /></label>
         <div class="time-grid">
@@ -56,11 +56,25 @@
         </div>
         <div class="toolbar">
           <div class="toolbar-group">
+            <label class="inline-label">Range
+              <select id="rangePreset">
+                <option value="today" selected>Today</option>
+                <option value="1h">Last hour</option>
+                <option value="6h">Last 6 hours</option>
+                <option value="24h">Last 24 hours</option>
+                <option value="7d">Last 7 days</option>
+                <option value="all">All time</option>
+              </select>
+            </label>
             <button id="todayShortcut" class="ghost">Today</button>
             <button id="clearFilters" class="ghost">Clear filters</button>
+            <label class="toggle" title="Collapse repeated Falco rule hits into one row per rule">
+              <input id="groupByRule" type="checkbox" /> Group by rule
+            </label>
           </div>
-          <div class="toolbar-note">Newest rows appear first. Live tail shows new S3 objects as they land.</div>
+          <div class="toolbar-note">Newest rows first. Click a row for the full message and source details.</div>
         </div>
+        <button id="newRowsBanner" type="button" class="new-rows-banner">▲ <span id="newRowsCount">0</span> new rows — click to dismiss</button>
         <div class="table-head">
           <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
         </div>
@@ -81,20 +95,6 @@
       <button type="button" class="cell message message-button"></button>
     </article>
   </template>
-
-  <dialog id="messageDialog" class="message-dialog">
-    <form method="dialog" class="message-dialog-panel">
-      <div class="dialog-head">
-        <div>
-          <div class="dialog-kicker">Full log message</div>
-          <h3 id="dialogTitle">Message</h3>
-        </div>
-        <button value="close" class="ghost">Close</button>
-      </div>
-      <pre id="dialogBody" class="dialog-body"></pre>
-      <div id="dialogMeta" class="dialog-meta"></div>
-    </form>
-  </dialog>
 
   <script src="/app.js"></script>
 </body>
