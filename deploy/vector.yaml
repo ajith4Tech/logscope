@@ -126,14 +126,64 @@ transforms:
         "namespaces/" + ns
       }
 
+      # ---- falco (detect via config namespace; parallel sink uses .falco) ----
+      falco_hit = false
+      if ns == "falco" {
+        falco_hit = true
+        scope = "security"
+        fout, foerr = get(obj, ["output"])
+        if foerr == null && fout != null {
+          fout_s, ferr = to_string(fout)
+          if ferr == null && fout_s != "" {
+            text = fout_s
+            frule, frerr = get(obj, ["rule"])
+            if frerr == null && frule != null {
+              rs, rerr = to_string(frule)
+              if rerr == null && rs != "" && !contains(text, rs) {
+                text = rs + ": " + text
+              }
+            }
+            flat = replace(text, r'[\r\n\t]+', " ")
+          }
+        }
+        fp, fperr = get(obj, ["priority"])
+        if fperr == null && fp != null {
+          fps, perr = to_string(fp)
+          if perr == null {
+            fpl = downcase(fps)
+              if fpl == "emergency" { bkt = "error" }
+              else if fpl == "alert" { bkt = "error" }
+              else if fpl == "critical" { bkt = "error" }
+              else if fpl == "error" { bkt = "error" }
+              else if fpl == "warning" { bkt = "warning" }
+              else if fpl == "notice" { bkt = "info" }
+              else if fpl == "informational" { bkt = "info" }
+              else if fpl == "debug" { bkt = "debug" }
+          }
+        }
+      }
+
       out = ts + " - " + ns + " - " + pod + "/" + contnr + " - " + flat
-      . = { "message": out, "log_type": bkt, "scope": scope }
+      if falco_hit { out = out + " scope=" + scope }
+      . = { "message": out, "log_type": bkt, "scope": scope, "falco": falco_hit }
+  falco_security:
+    type: filter
+    inputs:
+    - classify_and_scope
+    condition: .falco == true
 sinks:
   log_files:
     type: file
     inputs:
     - classify_and_scope
     path: /data/logs/{{ scope }}/{{ log_type }}.log
+    encoding:
+      codec: text
+  falco_security_log:
+    type: file
+    inputs:
+    - falco_security
+    path: /data/logs/{{ scope }}.log
     encoding:
       codec: text
   s3_logs:
@@ -143,6 +193,25 @@ sinks:
     bucket: logscope
     region: eu-north-1
     key_prefix: k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_
+    compression: gzip
+    encoding:
+      codec: text
+    framing:
+      method: newline_delimited
+    batch:
+      max_size: 50000000
+      timeout_secs: 600
+    buffer:
+      type: disk
+      max_size: 2684354560
+      when_full: block
+  falco_security_s3:
+    type: aws_s3
+    inputs:
+    - falco_security
+    bucket: logscope
+    region: eu-north-1
+    key_prefix: k3s-logs/logs/{{ scope }}/{{ log_type }}/%Y/%m/%d/%H_%M_%S_
     compression: gzip
     encoding:
       codec: text

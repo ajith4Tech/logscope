@@ -88,6 +88,7 @@ def test_starts_when_covers_fixture_formats():
         "klog.txt": _lines("klog.txt")[0],
         "single_lines.txt": _lines("single_lines.txt")[0],
         "stack_trace.txt": _lines("stack_trace.txt")[0],
+        "falco_alerts.txt": _lines("falco_alerts.txt")[0],
     }
     missing = [name for name, line in samples.items() if not rx.search(line)]
     assert not missing, (
@@ -212,6 +213,159 @@ def test_rendered_values_include_multiline_reduce():
         assert "- multiline" in text
 
 
+def _is_infra(cfg: dict[str, Any], ns: str) -> bool:
+    for p in cfg["routing"]["infra_namespaces"] or []:
+        if re.match(R.glob_to_regex(str(p)), ns):
+            return True
+    return False
+
+
+def _bucket_from_level(cfg: dict[str, Any], lv: str) -> str:
+    for b in cfg["severity"]["buckets"]:
+        for e in b.get("level_equals") or []:
+            if lv == str(e).lower():
+                return b["name"]
+        for c in b.get("level_contains") or []:
+            if str(c).lower() in lv:
+                return b["name"]
+    return ""
+
+
+def classify_event(cfg: dict[str, Any], message: str, namespace: str) -> dict[str, Any]:
+    """Python stand-in for classify_and_scope + Falco overlay (tests)."""
+    import json
+
+    obj: dict[str, Any] = {}
+    try:
+        parsed = json.loads(message)
+        if isinstance(parsed, dict):
+            obj = parsed
+    except json.JSONDecodeError:
+        pass
+
+    bkt = cfg["severity"]["default"]
+    for field in cfg["severity"]["structured_fields"]:
+        if field in obj and obj[field] is not None:
+            mapped = _bucket_from_level(cfg, str(obj[field]).lower())
+            if mapped:
+                bkt = mapped
+            break
+
+    text = message
+    for fname in cfg["severity"]["text_fields"]:
+        if fname in obj and obj[fname]:
+            text = str(obj[fname])
+            break
+
+    if _is_infra(cfg, namespace):
+        scope = cfg["routing"]["infra_scope"]
+    else:
+        scope = cfg["routing"]["namespace_scope_prefix"] + namespace
+
+    falco_hit = False
+    if R.falco_enabled(cfg) and namespace == cfg["falco"]["namespace"]:
+        falco_hit = True
+        scope = "security"
+        if obj.get("output"):
+            text = str(obj["output"])
+            rule = obj.get("rule")
+            if rule and str(rule) not in text:
+                text = f"{rule}: {text}"
+        if obj.get("priority") is not None:
+            pmap = R.falco_priority_map(cfg)
+            key = str(obj["priority"]).lower()
+            if key not in pmap:
+                raise AssertionError(f"fixture priority {key!r} missing from priority_map")
+            bkt = pmap[key]
+
+    dests = [f"{scope}/{bkt}.log"]
+    if falco_hit:
+        dests.append(f"{scope}.log")
+    return {
+        "log_type": bkt,
+        "scope": scope,
+        "falco": falco_hit,
+        "text": text,
+        "dests": dests,
+        "obj": obj,
+    }
+
+
+def test_falco_scope_security_overrides_infra():
+    cfg = R.load_config(ROOT / "config.yaml")
+    assert R.falco_enabled(cfg)
+    ns = cfg["falco"]["namespace"]
+    cfg["routing"]["infra_namespaces"] = list(cfg["routing"]["infra_namespaces"]) + [ns]
+    line = _lines("falco_alerts.txt")[0]
+    got = classify_event(cfg, line, ns)
+    assert got["scope"] == "security"
+    assert got["falco"] is True
+    assert _is_infra(cfg, ns)
+
+
+def test_falco_priority_map_and_dual_write():
+    cfg = R.load_config(ROOT / "config.yaml")
+    R.validate_cfg(cfg)
+    pmap = R.falco_priority_map(cfg)
+    ns = cfg["falco"]["namespace"]
+    lines = _lines("falco_alerts.txt")
+    priorities = set()
+    nested = False
+    for line in lines:
+        got = classify_event(cfg, line, ns)
+        pr = str(got["obj"]["priority"]).lower()
+        priorities.add(pr)
+        assert got["scope"] == "security"
+        assert got["log_type"] == pmap[pr]
+        assert got["obj"]["output"] in got["text"]
+        assert f"security/{pmap[pr]}.log" in got["dests"]
+        assert "security.log" in got["dests"]
+        assert got["dests"].count("security.log") == 1
+        if isinstance(got["obj"].get("output_fields"), dict):
+            nested = True
+    assert len(priorities) >= 4, f"need ≥4 fixture priorities, got {priorities}"
+    assert nested, "fixture must include a nested output_fields object"
+
+
+def test_non_falco_fixtures_no_security_leakage():
+    cfg = R.load_config(ROOT / "config.yaml")
+    samples = [
+        ("json_lines.txt", "app"),
+        ("klog.txt", "kube-system"),
+        ("plain_timestamp.txt", "default"),
+        ("logfmt.txt", "app"),
+        ("single_lines.txt", "app"),
+    ]
+    for name, ns in samples:
+        for line in _lines(name):
+            got = classify_event(cfg, line, ns)
+            assert got["falco"] is False
+            assert got["scope"] != "security"
+            assert "security.log" not in got["dests"]
+            assert len(got["dests"]) == 1
+
+
+def test_falco_disabled_falls_through():
+    from copy import deepcopy
+
+    cfg = deepcopy(R.load_config(ROOT / "config.yaml"))
+    cfg["falco"]["enabled"] = False
+    ns = cfg["falco"]["namespace"]
+    line = _lines("falco_alerts.txt")[0]
+    got = classify_event(cfg, line, ns)
+    assert got["falco"] is False
+    assert got["scope"] == cfg["routing"]["namespace_scope_prefix"] + ns
+    assert "security.log" not in got["dests"]
+    assert got["dests"] == [f"{got['scope']}/{got['log_type']}.log"]
+
+
+def test_falco_json_starts_when():
+    cfg = R.load_config(ROOT / "config.yaml")
+    rx = re.compile(cfg["multiline"]["starts_when"])
+    for line in _lines("falco_alerts.txt"):
+        assert rx.search(line), f"Falco JSON should start an event: {line[:80]!r}"
+
+
 if __name__ == "__main__":
     test_starts_when_covers_fixture_formats()
     test_stack_trace_merges_to_one_event()
@@ -220,4 +374,9 @@ if __name__ == "__main__":
     test_format_fixtures_stay_separate_events()
     test_group_by_keeps_interleaved_pods_apart()
     test_rendered_values_include_multiline_reduce()
+    test_falco_scope_security_overrides_infra()
+    test_falco_priority_map_and_dual_write()
+    test_non_falco_fixtures_no_security_leakage()
+    test_falco_disabled_falls_through()
+    test_falco_json_starts_when()
     print("ok")

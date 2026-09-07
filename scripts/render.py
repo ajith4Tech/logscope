@@ -71,7 +71,21 @@ ENV_MAP = {
     "LOGSCOPE_BACKUP_SRC": ("backup.src", "str"),
     "LOGSCOPE_BACKUP_DST": ("backup.dst", "str"),
     "LOGSCOPE_BACKUP_LOG": ("backup.log", "str"),
+    "LOGSCOPE_FALCO_ENABLED": ("falco.enabled", "bool"),
+    "LOGSCOPE_FALCO_NAMESPACE": ("falco.namespace", "str"),
 }
+
+# Official Falco priority names (JSON `priority` field), lowercased as config keys.
+FALCO_PRIORITIES = (
+    "emergency",
+    "alert",
+    "critical",
+    "error",
+    "warning",
+    "notice",
+    "informational",
+    "debug",
+)
 
 
 def deep_get(d: dict, dotted: str) -> Any:
@@ -185,6 +199,59 @@ def indent_block(text: str, n: int) -> str:
 
 def yaml_str(s: str) -> str:
     return yaml.dump(s, default_style='"').strip()
+
+
+def falco_enabled(cfg: dict) -> bool:
+    f = cfg.get("falco")
+    return bool(isinstance(f, dict) and f.get("enabled"))
+
+
+def falco_priority_map(cfg: dict) -> dict[str, str]:
+    raw = cfg["falco"].get("priority_map") or {}
+    if not isinstance(raw, dict):
+        raise SystemExit("falco.priority_map must be a mapping of Falco priority → bucket")
+    return {str(k).lower(): str(v) for k, v in raw.items()}
+
+
+def falco_security_file_path(cfg: dict) -> str:
+    """Sibling of the scoped severity files: …/logs/{{ scope }}.log → security.log."""
+    p = cfg["sinks"]["file"]["path"]
+    marker = "{{ scope }}"
+    if marker in p:
+        return p.split(marker, 1)[0].rstrip("/") + "/" + "{{ scope }}.log"
+    return "/data/logs/{{ scope }}.log"
+
+
+def falco_security_s3_prefix(cfg: dict) -> str:
+    """Falco copy under logs/{{ scope }}/{{ log_type }}/ → security/<bucket>/."""
+    p = cfg["sinks"]["s3"]["key_prefix"]
+    marker = "{{ log_type }}"
+    if marker in p:
+        return p.replace(marker, "{{ scope }}/{{ log_type }}", 1)
+    return "k3s-logs/logs/{{ scope }}/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
+
+
+def _aws_s3_sink(cfg: dict, *, inputs: list[str], key_prefix: str) -> dict:
+    s3 = cfg["sinks"]["s3"]
+    return {
+        "type": "aws_s3",
+        "inputs": inputs,
+        "bucket": s3["bucket"],
+        "region": s3["region"],
+        "key_prefix": key_prefix,
+        "compression": "gzip",
+        "encoding": {"codec": "text"},
+        "framing": {"method": "newline_delimited"},
+        "batch": {
+            "max_size": S3_BATCH_MAX_SIZE,
+            "timeout_secs": S3_BATCH_TIMEOUT_SECS,
+        },
+        "buffer": {
+            "type": "disk",
+            "max_size": S3_BUFFER_MAX_SIZE,
+            "when_full": "block",
+        },
+    }
 
 
 def build_vrl(cfg: dict) -> str:
@@ -349,10 +416,69 @@ def build_vrl(cfg: dict) -> str:
         f"  {vrl_string(ns_prefix)} + ns",
         "}",
         "",
-        out_assign,
-        '. = { "message": out, "log_type": bkt, "scope": scope }',
     ]
+    if falco_enabled(cfg):
+        lines += _falco_vrl(cfg)
+        emit = '. = { "message": out, "log_type": bkt, "scope": scope, "falco": falco_hit }'
+        lines += [
+            out_assign,
+            # Text sinks only emit .message — tag Falco lines so scope is visible in S3.
+            'if falco_hit { out = out + " scope=" + scope }',
+            emit,
+        ]
+    else:
+        emit = '. = { "message": out, "log_type": bkt, "scope": scope }'
+        lines += [
+            out_assign,
+            emit,
+        ]
     return "\n".join(lines) + "\n"
+
+
+def _falco_vrl(cfg: dict) -> list[str]:
+    """Override scope/severity/message for pods in falco.namespace (from config)."""
+    ns = vrl_string(cfg["falco"]["namespace"])
+    pmap = falco_priority_map(cfg)
+    lines = [
+        "# ---- falco (detect via config namespace; parallel sink uses .falco) ----",
+        "falco_hit = false",
+        f"if ns == {ns} {{",
+        "  falco_hit = true",
+        '  scope = "security"',
+        '  fout, foerr = get(obj, ["output"])',
+        "  if foerr == null && fout != null {",
+        "    fout_s, ferr = to_string(fout)",
+        '    if ferr == null && fout_s != "" {',
+        "      text = fout_s",
+        '      frule, frerr = get(obj, ["rule"])',
+        "      if frerr == null && frule != null {",
+        "        rs, rerr = to_string(frule)",
+        '        if rerr == null && rs != "" && !contains(text, rs) {',
+        '          text = rs + ": " + text',
+        "        }",
+        "      }",
+        '      flat = replace(text, r\'[\\r\\n\\t]+\', " ")',
+        "    }",
+        "  }",
+        '  fp, fperr = get(obj, ["priority"])',
+        "  if fperr == null && fp != null {",
+        "    fps, perr = to_string(fp)",
+        "    if perr == null {",
+        "      fpl = downcase(fps)",
+    ]
+    first = True
+    for key in FALCO_PRIORITIES:
+        bucket = pmap[key]
+        kw = "if" if first else "else if"
+        first = False
+        lines.append(f"        {kw} fpl == {vrl_string(key)} {{ bkt = {vrl_string(bucket)} }}")
+    lines += [
+        "    }",
+        "  }",
+        "}",
+        "",
+    ]
+    return lines
 
 
 def validate_cfg(cfg: dict) -> None:
@@ -380,6 +506,36 @@ def validate_cfg(cfg: dict) -> None:
         raise SystemExit("at least one sink must be enabled")
     format_to_vrl(cfg["format"]["line"])
     format_to_vrl(cfg["format"]["metrics"])
+    _validate_falco(cfg)
+
+
+def _validate_falco(cfg: dict) -> None:
+    f = cfg.get("falco")
+    if not f:
+        return
+    if not isinstance(f, dict):
+        raise SystemExit("falco must be a mapping")
+    if not f.get("enabled"):
+        return
+    ns = f.get("namespace")
+    if not isinstance(ns, str) or not ns.strip():
+        raise SystemExit("falco.namespace is required when falco.enabled is true")
+    pmap = falco_priority_map(cfg)
+    missing = [p for p in FALCO_PRIORITIES if p not in pmap]
+    if missing:
+        need = ", ".join(FALCO_PRIORITIES)
+        raise SystemExit(
+            "falco.priority_map is missing required Falco priorit"
+            + ("y" if len(missing) == 1 else "ies")
+            + f": {', '.join(missing)} (need all 8: {need})"
+        )
+    buckets = {b["name"] for b in cfg["severity"]["buckets"]}
+    for prio, dest in pmap.items():
+        if prio in FALCO_PRIORITIES and dest not in buckets:
+            raise SystemExit(
+                f"falco.priority_map[{prio!r}] maps to {dest!r}, "
+                f"which is not a severity.buckets name"
+            )
 
 
 def classify_inputs(cfg: dict) -> list[str]:
@@ -432,6 +588,14 @@ def vector_config_dict(
         "source": vrl,
     }
     sinks: dict[str, Any] = {}
+    # Dual-write Falco: main sink still gets every event; filter fans out a second copy.
+    # Vector `route` is first-match exclusive — do not use it here.
+    if falco_enabled(cfg) and (include_file or include_s3):
+        transforms["falco_security"] = {
+            "type": "filter",
+            "inputs": ["classify_and_scope"],
+            "condition": ".falco == true",
+        }
     if include_file:
         sinks["log_files"] = {
             "type": "file",
@@ -439,28 +603,23 @@ def vector_config_dict(
             "path": cfg["sinks"]["file"]["path"],
             "encoding": {"codec": "text"},
         }
+        if falco_enabled(cfg):
+            sinks["falco_security_log"] = {
+                "type": "file",
+                "inputs": ["falco_security"],
+                "path": falco_security_file_path(cfg),
+                "encoding": {"codec": "text"},
+            }
     if include_s3:
         # Embed bucket/region (Vector 0.57+ disables ${ENV} interpolation by default).
         # AWS_* keys still come from the Secret via env / IRSA — not from config.
-        sinks["s3_logs"] = {
-            "type": "aws_s3",
-            "inputs": ["classify_and_scope"],
-            "bucket": cfg["sinks"]["s3"]["bucket"],
-            "region": cfg["sinks"]["s3"]["region"],
-            "key_prefix": cfg["sinks"]["s3"]["key_prefix"],
-            "compression": "gzip",
-            "encoding": {"codec": "text"},
-            "framing": {"method": "newline_delimited"},
-            "batch": {
-                "max_size": S3_BATCH_MAX_SIZE,
-                "timeout_secs": S3_BATCH_TIMEOUT_SECS,
-            },
-            "buffer": {
-                "type": "disk",
-                "max_size": S3_BUFFER_MAX_SIZE,
-                "when_full": "block",
-            },
-        }
+        sinks["s3_logs"] = _aws_s3_sink(
+            cfg, inputs=["classify_and_scope"], key_prefix=cfg["sinks"]["s3"]["key_prefix"]
+        )
+        if falco_enabled(cfg):
+            sinks["falco_security_s3"] = _aws_s3_sink(
+                cfg, inputs=["falco_security"], key_prefix=falco_security_s3_prefix(cfg)
+            )
     if cfg["sinks"]["prometheus"].get("enabled"):
         sources["internal_metrics"] = {
             "type": "internal_metrics",
@@ -499,8 +658,12 @@ def build_custom_config_for_helm(cfg: dict, *, include_file: bool, include_s3: b
     vrl = doc["transforms"]["classify_and_scope"].pop("source")
     if include_file:
         doc["sinks"]["log_files"]["path"] = "__FILE_PATH__"
+        if falco_enabled(cfg) and "falco_security_log" in doc.get("sinks", {}):
+            doc["sinks"]["falco_security_log"]["path"] = "__FALCO_SECURITY_PATH__"
     if include_s3:
         doc["sinks"]["s3_logs"]["key_prefix"] = "__S3_PREFIX__"
+        if falco_enabled(cfg) and "falco_security_s3" in doc.get("sinks", {}):
+            doc["sinks"]["falco_security_s3"]["key_prefix"] = "__FALCO_S3_PREFIX__"
 
     dumped = yaml.dump(doc, default_flow_style=False, sort_keys=False, width=1000)
     dumped = dumped.replace("    reroute_dropped: false\n", "    reroute_dropped: false\nPLACEHOLDER_SOURCE\n", 1)
@@ -511,11 +674,21 @@ def build_custom_config_for_helm(cfg: dict, *, include_file: bool, include_s3: b
             "path: __FILE_PATH__",
             'path: "' + helm_escape_vector_tpl(cfg["sinks"]["file"]["path"]) + '"',
         )
+        if falco_enabled(cfg):
+            dumped = dumped.replace(
+                "path: __FALCO_SECURITY_PATH__",
+                'path: "' + helm_escape_vector_tpl(falco_security_file_path(cfg)) + '"',
+            )
     if include_s3:
         dumped = dumped.replace(
             "key_prefix: __S3_PREFIX__",
             'key_prefix: "' + helm_escape_vector_tpl(cfg["sinks"]["s3"]["key_prefix"]) + '"',
         )
+        if falco_enabled(cfg):
+            dumped = dumped.replace(
+                "key_prefix: __FALCO_S3_PREFIX__",
+                'key_prefix: "' + helm_escape_vector_tpl(falco_security_s3_prefix(cfg)) + '"',
+            )
     return dumped
 
 

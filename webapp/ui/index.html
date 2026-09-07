@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Logscope</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="hero">
+      <div>
+        <div class="eyebrow">Logscope S3 viewer</div>
+        <h1>S3 log viewer.</h1>
+        <p class="lede">Historical browsing and near-live polling from the same S3-backed store. The tail view updates when new objects land, not as a socket stream.</p>
+        <div class="hero-chips">
+          <span class="chip chip-accent" id="defaultWindowChip">Today</span>
+          <span class="chip">Polling every 10s</span>
+          <span class="chip">S3-backed only</span>
+        </div>
+      </div>
+      <div class="status-card">
+        <div class="status-label">Last updated</div>
+        <div id="freshness" class="status-value">Loading…</div>
+        <div id="health" class="status-meta"></div>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="filters panel">
+        <div class="panel-head">
+          <h2>Filters</h2>
+          <button id="securityShortcut" class="ghost">Security only</button>
+        </div>
+        <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
+        <label>Scope <select id="scope"></select></label>
+        <label>Namespace <select id="namespace"></select></label>
+        <label>Pod <select id="pod"></select></label>
+        <label>Container <select id="container"></select></label>
+        <label>Severity <select id="severity_bucket"></select></label>
+        <label>Search <input id="q" type="search" placeholder="error, trace, rule name, etc." /></label>
+        <div class="time-grid">
+          <label>Start <input id="start" type="datetime-local" /></label>
+          <label>End <input id="end" type="datetime-local" /></label>
+        </div>
+        <div class="actions">
+          <button id="apply">Apply</button>
+          <label class="toggle"><input id="live" type="checkbox" checked /> Live tail</label>
+        </div>
+      </aside>
+
+      <section class="panel logs">
+        <div class="panel-head">
+          <h2>Log lines</h2>
+          <div class="subtle" id="resultSummary">Ready</div>
+        </div>
+        <div class="toolbar">
+          <div class="toolbar-group">
+            <button id="todayShortcut" class="ghost">Today</button>
+            <button id="clearFilters" class="ghost">Clear filters</button>
+          </div>
+          <div class="toolbar-note">Newest rows appear first. Live tail shows new S3 objects as they land.</div>
+        </div>
+        <div class="table-head">
+          <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
+        </div>
+        <div id="rows" class="rows"></div>
+        <div class="pager">
+          <button id="loadMore">Load older</button>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <template id="rowTemplate">
+    <article class="row">
+      <div class="cell time"></div>
+      <div class="cell severity"><span class="badge"></span></div>
+      <div class="cell scope"></div>
+      <div class="cell source"></div>
+      <button type="button" class="cell message message-button"></button>
+    </article>
+  </template>
+
+  <dialog id="messageDialog" class="message-dialog">
+    <form method="dialog" class="message-dialog-panel">
+      <div class="dialog-head">
+        <div>
+          <div class="dialog-kicker">Full log message</div>
+          <h3 id="dialogTitle">Message</h3>
+        </div>
+        <button value="close" class="ghost">Close</button>
+      </div>
+      <pre id="dialogBody" class="dialog-body"></pre>
+      <div id="dialogMeta" class="dialog-meta"></div>
+    </form>
+  </dialog>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,29 @@
+# Helm values for the official Falco chart (falcosecurity/falco).
+# Logscope does not bundle or manage Falco's ruleset — this file only enables
+# JSON-on-stdout so Vector's existing kubernetes_logs source picks Falco
+# pod output up. No extra Vector source is required.
+#
+# Keep `namespaceOverride` (and helm -n) in sync with config.yaml falco.namespace.
+#
+#   helm repo add falcosecurity https://falcosecurity.github.io/charts
+#   helm repo update
+#   helm install falco falcosecurity/falco \
+#     -f deploy/k3s/falco-values.yaml -n falco --create-namespace
+#
+# Do not install/upgrade Falco from Logscope render — this file is hand-maintained.
+
+namespaceOverride: falco
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 512Mi
+  limits:
+    cpu: 1000m
+    memory: 1024Mi
+
+falco:
+  json_output: true
+  json_include_output_property: true
+  stdout_output:
+    enabled: true

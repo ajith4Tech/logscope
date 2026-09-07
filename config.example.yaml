@@ -34,6 +34,24 @@ routing:
   # Tenant events: logs/<namespace_scope_prefix><namespace>/<log_type>.log
   namespace_scope_prefix: namespaces/
 
+# Falco (falcosecurity/falco) — optional. Logscope does not install Falco's
+# ruleset. When enabled, Vector classifies Falco pod stdout (JSON) from
+# kubernetes_logs: scope=security, priority_map → severity bucket, and
+# dual-writes security.log plus the mapped severity file.
+# Keep namespace in sync with helm -n / deploy/k3s/falco-values.yaml.
+falco:
+  enabled: true
+  namespace: falco
+  priority_map:
+    emergency: error
+    alert: error
+    critical: error
+    error: error
+    warning: warning
+    notice: info
+    informational: info
+    debug: debug
+
 # Stored line layout. Placeholders: {timestamp} {namespace} {pod} {container}
 # {message} {log_type} {scope} {scope_label}
 #   scope        = path routing key (infra or namespaces/<ns>)
@@ -147,3 +165,10 @@ backup:
   src: /data/logs
   dst: /data/backups/current
   log: /data/backups/backup.log
+
+webapp:
+  backend:
+    poll_interval_secs: 30
+    db_path: /tmp/logscope-webapp.sqlite
+    page_size_default: 200
+    page_size_max: 1000

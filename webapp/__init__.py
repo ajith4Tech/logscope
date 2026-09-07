@@ -1,0 +1,1 @@
+"""Logscope web application package."""

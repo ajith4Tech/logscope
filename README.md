@@ -40,6 +40,8 @@ config edit, not a Vector rewrite.
 <host_path>/
 ├── logs/infra/{error,warning,info,debug,metrics}.log
 ├── logs/namespaces/<ns>/{error,warning,info,debug,metrics}.log
+├── logs/security/{error,warning,info,debug}.log   # Falco (scope=security)
+├── logs/security.log                              # every Falco event (dual-write)
 └── backups/current/          # incremental mirror (CronJob)
 ```
 
@@ -141,6 +143,61 @@ Configure under `multiline` in `config.yaml` (`enabled`, `starts_when`,
 `pod_name` + `container_name` + `pod_namespace`, so concurrent pods/containers
 never merge into each other’s events. CRI split-line merge remains on via
 `auto_partial_merge`.
+
+## Security events (Falco)
+
+Logscope does **not** bundle or manage Falco’s ruleset. Falco is a separate
+[official Helm chart](https://github.com/falcosecurity/charts) install. When
+`falco.enabled` is true, Vector recognizes Falco’s **own pod stdout** already
+flowing through the existing `kubernetes_logs` source (JSON lines: `output`,
+`priority`, `rule`, `time`, `output_fields`). There is **no additional Vector
+source**.
+
+Classification (config-driven; namespace is `falco.namespace`, not a hardcoded
+string):
+
+- **scope** is set to `security` (even if that namespace would otherwise be
+  infra or `namespaces/<ns>`).
+- Falco `priority` is mapped through `falco.priority_map` to a Logscope
+  severity bucket. Config validation fails if any of the eight official
+  levels is missing from the map.
+- The tagged line’s message is Falco’s `output` field (rule name prefixed
+  when it is not already in `output`).
+
+**Dual-write** (parallel sinks, not exclusive routing): every Falco event is
+written to **both** `security.log` (unconditional) **and** the mapped
+severity file under `logs/security/` (`error.log` / `warning.log` /
+`info.log` / `debug.log`). Non-Falco events are unchanged. Set
+`falco.enabled: false` to skip this path entirely; Falco-namespace logs then
+use normal classification.
+
+Deploy Falco (not run by `scripts/render.py`):
+
+```bash
+helm repo add falcosecurity https://falcosecurity.github.io/charts
+helm repo update
+helm install falco falcosecurity/falco \
+  -f deploy/k3s/falco-values.yaml -n falco --create-namespace
+```
+
+Values in [`deploy/k3s/falco-values.yaml`](./deploy/k3s/falco-values.yaml)
+turn on JSON + stdout. Keep Helm `-n` / `namespaceOverride` in sync with
+`falco.namespace` in config:
+
+```yaml
+falco:
+  enabled: true
+  namespace: falco          # which namespace Falco's own pods run in — used to detect Falco output
+  priority_map:             # Falco priority scale -> Logscope severity buckets
+    emergency: error
+    alert: error
+    critical: error
+    error: error
+    warning: warning
+    notice: info
+    informational: info
+    debug: debug
+```
 
 ## Backup
 
