@@ -1,4 +1,5 @@
 const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 minutes
+const EXPLAIN_COOLDOWN_MS = 12000; // client-side cooldown after clicking Explain
 
 const state = {
   filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
@@ -13,9 +14,36 @@ const state = {
   expandedRows: new Set(),
   expandedGroups: new Set(),
   groupByRule: false,
+  aiConfigured: false,
+  explainCooldownUntil: 0,
+  anomalies: [],
+  expandedAnomalies: new Set(),
+  activeTab: 'logs',
+  lineExplainState: new Map(), // rowId -> { status: 'idle'|'loading'|'done'|'error', summary, action, error }
 };
 
 const el = (id) => document.getElementById(id);
+
+// ─── Tab switching ───────────────────────────────────────────────────────────
+
+function switchTab(name) {
+  state.activeTab = name;
+  const isLogs = name === 'logs';
+  el('tabLogs').classList.toggle('active', isLogs);
+  el('tabInsights').classList.toggle('active', !isLogs);
+  el('tabLogs').setAttribute('aria-selected', isLogs ? 'true' : 'false');
+  el('tabInsights').setAttribute('aria-selected', !isLogs ? 'true' : 'false');
+  el('panelLogs').hidden = !isLogs;
+  el('panelInsights').hidden = isLogs;
+  if (!isLogs && !state.anomalies.length) {
+    loadInsights().catch((err) => { el('health').textContent = err.message; });
+  }
+}
+
+el('tabLogs').addEventListener('click', () => switchTab('logs'));
+el('tabInsights').addEventListener('click', () => switchTab('insights'));
+
+// ─── Date helpers ────────────────────────────────────────────────────────────
 
 function localDateParts(date = new Date()) {
   const pad = (value) => String(value).padStart(2, '0');
@@ -73,8 +101,8 @@ function queryFromFilters(extra = {}) {
   return Object.fromEntries(Object.entries(current).filter(([, v]) => v));
 }
 
-async function fetchJson(url) {
-  const res = await fetch(url);
+async function fetchJson(url, options = {}) {
+  const res = await fetch(url, options);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
@@ -171,6 +199,8 @@ function buildCombobox(inputId, facetKey) {
   });
 }
 
+// ─── Logs row rendering ──────────────────────────────────────────────────────
+
 // Normalize a Falco message to its rule-level text: the embedded per-event
 // timestamp ("15:50:11.473402755: ") and the trailing field dump (" | k=v …")
 // are stripped so repeated hits of the same rule collapse together.
@@ -185,15 +215,10 @@ function ruleKeyOf(item) {
 }
 
 function groupKeyOf(item) {
-  // ruleKeyOf strips embedded per-event Falco timestamps so identical alerts
-  // collapse even when their raw messages differ only by event time.
   const message = ruleKeyOf(item);
   return [item.severity_bucket, item.namespace, item.pod, item.container, message].join('|');
 }
 
-// items arrive newest-first; identical keys within GROUP_WINDOW_MS merge,
-// except in "group by rule" mode where matching rules aggregate across the
-// whole result set (no window).
 function buildGroups(items) {
   const groups = [];
   const byKey = new Map();
@@ -247,9 +272,77 @@ function addDetailBlock(wrap, label, text) {
   wrap.appendChild(block);
 }
 
+// ─── Per-line "Explain this log" ─────────────────────────────────────────────
+
+function lineExplainMarkup(rowId, item) {
+  const box = document.createElement('div');
+  box.className = 'detail-block line-explain';
+
+  const lineState = state.lineExplainState.get(rowId) || { status: 'idle' };
+
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ghost line-explain-btn';
+  btn.textContent = lineState.status === 'loading' ? '✦ Explaining…' : '✦ Explain this line';
+  btn.disabled = lineState.status === 'loading';
+  btn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    explainLine(rowId, item);
+  });
+  box.appendChild(btn);
+
+  if (lineState.status === 'done') {
+    const result = document.createElement('div');
+    result.className = 'line-explain-result';
+    const summary = document.createElement('div');
+    summary.className = 'line-explain-summary';
+    summary.textContent = lineState.summary;
+    result.appendChild(summary);
+    if (lineState.action) {
+      const action = document.createElement('div');
+      action.className = 'line-explain-action';
+      action.textContent = `→ ${lineState.action}`;
+      result.appendChild(action);
+    }
+    box.appendChild(result);
+  } else if (lineState.status === 'error') {
+    const errNode = document.createElement('div');
+    errNode.className = 'line-explain-result line-explain-error-text';
+    errNode.textContent = lineState.error;
+    box.appendChild(errNode);
+  }
+
+  return box;
+}
+
+async function explainLine(rowId, item) {
+  if (!state.aiConfigured) return;
+  state.lineExplainState.set(rowId, { status: 'loading' });
+  renderAll();
+  try {
+    const result = await fetchJson('/api/explain-line', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: item.id }),
+    });
+    if (result.error) {
+      state.lineExplainState.set(rowId, { status: 'error', error: result.error });
+    } else {
+      state.lineExplainState.set(rowId, {
+        status: 'done',
+        summary: result.summary || 'No explanation returned.',
+        action: result.suggested_action || '',
+      });
+    }
+  } catch (err) {
+    state.lineExplainState.set(rowId, { status: 'error', error: err.message });
+  }
+  renderAll();
+}
+
 // Expandable detail: full (untruncated) message, raw_line, source_key,
-// line_number, and output_fields when the backend provides them.
-function detailMarkup(item) {
+// line_number, output_fields when present, and a per-line Explain action.
+function detailMarkup(item, rowId) {
   const wrap = document.createElement('div');
   wrap.className = 'row-detail';
   addDetailBlock(wrap, 'Full message', item.message);
@@ -258,6 +351,9 @@ function detailMarkup(item) {
   addDetailBlock(wrap, 'line_number', String(item.line_number));
   if (item.output_fields && Object.keys(item.output_fields).length) {
     addDetailBlock(wrap, 'output_fields', JSON.stringify(item.output_fields, null, 2));
+  }
+  if (state.aiConfigured) {
+    wrap.appendChild(lineExplainMarkup(rowId, item));
   }
   return wrap;
 }
@@ -313,7 +409,7 @@ function renderRows(items, append = false) {
     node.dataset.rowId = rowId;
     if (state.expandedRows.has(rowId)) {
       node.classList.add('expanded');
-      node.appendChild(detailMarkup(representative));
+      node.appendChild(detailMarkup(representative, rowId));
     }
     node.addEventListener('click', () => {
       if (group.items.length > 1 && !state.expandedRows.has(rowId)) {
@@ -335,6 +431,256 @@ function renderRows(items, append = false) {
 function renderAll() {
   renderRows(state.items, false);
 }
+
+// ─── Insights tab ────────────────────────────────────────────────────────────
+
+const STATUS_LABELS = { new: 'New', reviewed: 'Reviewed', dismissed: 'Dismissed' };
+
+function anomalyTypeLabel(type) {
+  const map = {
+    error_rate_spike: 'Error spike',
+    message_frequency: 'Frequency spike',
+    new_falco_rule: 'New Falco rule',
+    severity_shift: 'Severity shift',
+  };
+  return map[type] || type;
+}
+
+function renderAnomalies() {
+  const container = el('anomalyRows');
+  container.innerHTML = '';
+  const { anomalies } = state;
+  el('insightsEmpty').hidden = anomalies.length > 0;
+  if (!anomalies.length) return;
+
+  for (const anomaly of anomalies) {
+    const tpl = el('anomalyRowTemplate');
+    const node = tpl.content.firstElementChild.cloneNode(true);
+
+    node.dataset.anomalyId = String(anomaly.id);
+
+    const typeBadge = node.querySelector('.anomaly-type-badge');
+    typeBadge.textContent = anomalyTypeLabel(anomaly.type);
+    typeBadge.classList.add(`atype-${anomaly.type}`);
+
+    node.querySelector('.anomaly-namespace').textContent = anomaly.namespace || '—';
+    const podText = [anomaly.pod, anomaly.rule_key].filter(Boolean).join(' / ');
+    node.querySelector('.anomaly-pod').textContent = podText || '—';
+
+    // Severity badge — FIX: only add a class when severity is non-empty.
+    // message_frequency anomalies have severity: "" by design; classList.add('')
+    // throws a DOMException and previously crashed the whole render loop,
+    // leaving every anomaly after (or including) the first empty-severity one
+    // unrendered — the root cause of "badge shows a count but the list is blank".
+    const sevBadge = node.querySelector('.badge');
+    sevBadge.textContent = anomaly.severity || '—';
+    if (anomaly.severity) {
+      sevBadge.closest('.anomaly-col-severity').classList.add(anomaly.severity);
+    }
+
+    const summaryEl = node.querySelector('.anomaly-summary-text');
+    const actionEl = node.querySelector('.anomaly-action-text');
+    if (anomaly.ai_summary) {
+      summaryEl.textContent = anomaly.ai_summary;
+    } else {
+      summaryEl.textContent = 'Awaiting AI summary…';
+      summaryEl.classList.add('muted');
+    }
+    if (anomaly.ai_suggested_action) {
+      actionEl.textContent = `→ ${anomaly.ai_suggested_action}`;
+    } else {
+      actionEl.hidden = true;
+    }
+
+    const statusBadge = node.querySelector('.anomaly-status-badge');
+    statusBadge.textContent = STATUS_LABELS[anomaly.status] || anomaly.status;
+    if (anomaly.status) {
+      statusBadge.classList.add(`astatus-${anomaly.status}`);
+    }
+
+    node.querySelector('.anomaly-time').textContent = anomaly.detected_at
+      ? formatTimestamp(anomaly.detected_at)
+      : '—';
+
+    const btnReviewed = node.querySelector('.anomaly-btn-reviewed');
+    const btnDismissed = node.querySelector('.anomaly-btn-dismissed');
+    if (anomaly.status === 'reviewed') {
+      btnReviewed.disabled = true;
+      btnReviewed.textContent = '✓ Reviewed';
+    }
+    if (anomaly.status === 'dismissed') {
+      btnDismissed.disabled = true;
+      btnDismissed.textContent = '✕ Dismissed';
+    }
+    btnReviewed.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      patchAnomalyStatus(anomaly.id, 'reviewed', node);
+    });
+    btnDismissed.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      patchAnomalyStatus(anomaly.id, 'dismissed', node);
+    });
+
+    const detail = node.querySelector('.anomaly-detail');
+    const expandBtn = node.querySelector('.anomaly-expand-btn');
+    const anomalyId = String(anomaly.id);
+    if (state.expandedAnomalies.has(anomalyId)) {
+      detail.hidden = false;
+      expandBtn.textContent = '▴';
+      fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+    }
+    node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
+      if (ev.target.closest('button')) return;
+      if (state.expandedAnomalies.has(anomalyId)) {
+        state.expandedAnomalies.delete(anomalyId);
+        detail.hidden = true;
+        expandBtn.textContent = '▾';
+      } else {
+        state.expandedAnomalies.add(anomalyId);
+        detail.hidden = false;
+        expandBtn.textContent = '▴';
+        fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+      }
+    });
+
+    container.appendChild(node);
+  }
+}
+
+function fillAnomalyDetail(container, anomaly) {
+  container.innerHTML = '';
+  const evidence = anomaly.evidence || {};
+
+  const msgs = evidence.sample_messages;
+  if (msgs && msgs.length) {
+    addDetailBlock(container, `Sample log messages (${msgs.length})`, msgs.join('\n'));
+  }
+
+  const evidenceClean = { ...evidence };
+  delete evidenceClean.sample_messages;
+  delete evidenceClean.ai_error;
+  if (Object.keys(evidenceClean).length) {
+    addDetailBlock(container, 'Evidence', JSON.stringify(evidenceClean, null, 2));
+  }
+  if (evidence.ai_error) {
+    addDetailBlock(container, 'AI error', evidence.ai_error);
+  }
+}
+
+async function patchAnomalyStatus(id, status, rowNode) {
+  try {
+    await fetchJson(`/api/anomalies/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
+    });
+    const anomaly = state.anomalies.find((a) => a.id === id);
+    if (anomaly) anomaly.status = status;
+    renderAnomalies();
+  } catch (err) {
+    el('health').textContent = `Failed to update anomaly: ${err.message}`;
+  }
+}
+
+async function loadInsights() {
+  const statusValue = el('insightsStatusFilter').value;
+  const params = new URLSearchParams();
+  if (statusValue) params.set('status', statusValue);
+  params.set('limit', '200');
+  const data = await fetchJson(`/api/anomalies?${params.toString()}`);
+  state.anomalies = data.items || [];
+  const newCount = state.anomalies.filter((a) => a.status === 'new').length;
+  const badge = el('insightsBadge');
+  if (newCount > 0) {
+    badge.textContent = String(newCount);
+    badge.hidden = false;
+  } else {
+    badge.hidden = true;
+  }
+  renderAnomalies();
+}
+
+// ─── Explain these logs (bulk, filtered view) ────────────────────────────────
+
+function updateExplainButton() {
+  const btn = el('explainBtn');
+  if (!state.aiConfigured) {
+    btn.disabled = true;
+    btn.title = 'AI provider not configured — set ai.provider in config.yaml';
+    return;
+  }
+  const coolingDown = Date.now() < state.explainCooldownUntil;
+  btn.disabled = coolingDown;
+  if (coolingDown) {
+    const remaining = Math.ceil((state.explainCooldownUntil - Date.now()) / 1000);
+    btn.title = `Please wait ${remaining}s before explaining again`;
+  } else {
+    btn.title = 'Summarize the currently filtered logs with AI';
+  }
+}
+
+function startExplainCooldown() {
+  state.explainCooldownUntil = Date.now() + EXPLAIN_COOLDOWN_MS;
+  updateExplainButton();
+  window.setTimeout(() => {
+    updateExplainButton();
+  }, EXPLAIN_COOLDOWN_MS + 50);
+}
+
+async function runExplain() {
+  if (!state.aiConfigured) return;
+  if (Date.now() < state.explainCooldownUntil) return;
+  startExplainCooldown();
+
+  const panel = el('explainPanel');
+  const summaryEl = el('explainSummary');
+  const actionEl = el('explainAction');
+  const cachedBadge = el('explainCachedBadge');
+
+  panel.hidden = false;
+  summaryEl.textContent = 'Thinking…';
+  summaryEl.classList.add('thinking');
+  actionEl.hidden = true;
+  cachedBadge.hidden = true;
+
+  try {
+    const params = new URLSearchParams(queryFromFilters());
+    const result = await fetchJson(`/api/explain?${params.toString()}`, { method: 'POST' });
+    summaryEl.classList.remove('thinking');
+    if (result.error) {
+      summaryEl.textContent = `Error: ${result.error}`;
+      summaryEl.classList.add('explain-error');
+    } else {
+      summaryEl.classList.remove('explain-error');
+      summaryEl.textContent = result.summary || 'No summary returned.';
+      if (result.suggested_action) {
+        actionEl.textContent = `→ ${result.suggested_action}`;
+        actionEl.hidden = false;
+      }
+      if (result.cached) {
+        cachedBadge.hidden = false;
+      }
+    }
+  } catch (err) {
+    summaryEl.classList.remove('thinking');
+    summaryEl.textContent = `Failed: ${err.message}`;
+    summaryEl.classList.add('explain-error');
+  }
+}
+
+el('explainBtn').addEventListener('click', () => {
+  runExplain().catch((err) => { el('health').textContent = err.message; });
+});
+
+el('explainDismiss').addEventListener('click', () => {
+  el('explainPanel').hidden = true;
+  el('explainSummary').textContent = '';
+  el('explainSummary').classList.remove('explain-error', 'thinking');
+  el('explainAction').hidden = true;
+  el('explainCachedBadge').hidden = true;
+});
+
+// ─── Data loading ────────────────────────────────────────────────────────────
 
 async function loadFacets() {
   renderFacets(await fetchJson('/api/facets'));
@@ -417,12 +763,16 @@ function stopTailPolling() {
   state.liveTimer = null;
 }
 
+// ─── Init ────────────────────────────────────────────────────────────────────
+
 async function init() {
   setDefaultDateRange();
   buildCombobox('pod', 'pod');
   buildCombobox('container', 'container');
   const status = await fetchJson('/api/status');
   state.lastStatus = status;
+  state.aiConfigured = Boolean(status.ai_configured);
+  updateExplainButton();
   updateHealthFromStatus(status);
   if (status.last_successful_ingest_at) {
     el('freshness').textContent = fmtFreshness(status.last_successful_ingest_at);
@@ -432,7 +782,10 @@ async function init() {
   await loadFacets();
   await loadLogs(true);
   startTailPolling();
+  loadInsights().catch(() => { });
 }
+
+// ─── Event listeners ─────────────────────────────────────────────────────────
 
 el('apply').addEventListener('click', async () => {
   syncFiltersFromUi();
@@ -474,6 +827,12 @@ el('groupByRule').addEventListener('change', async () => {
   state.groupByRule = el('groupByRule').checked;
   state.expandedGroups.clear();
   renderAll();
+});
+el('refreshInsights').addEventListener('click', async () => {
+  await loadInsights();
+});
+el('insightsStatusFilter').addEventListener('change', async () => {
+  await loadInsights();
 });
 document.addEventListener('click', async (event) => {
   const target = event.target;

@@ -271,7 +271,21 @@ class LogStorage:
             ).fetchall()
             out[field] = [{"value": row[0], "count": int(row[1])} for row in rows]
         return out
-
+    def get_record_by_id(self, record_id: int) -> dict[str, Any] | None:
+        """Fetch a single record by its row id, for per-line explain.
+        Re-derives from storage rather than trusting client-supplied text."""
+        row = self._conn.execute(
+            """
+            SELECT id, timestamp, severity_bucket, scope, namespace, pod, container,
+                   message, raw_line, source_key, source_etag, line_number, is_falco
+            FROM records
+            WHERE id = ?
+            """,
+            (record_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return dict(row)
     @property
     def conn(self) -> sqlite3.Connection:
         """Read access to the shared records connection (used by InsightsJob)."""

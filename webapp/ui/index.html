@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Logscope</title>
+  <title>Logscope — S3 Log Viewer &amp; Insights</title>
+  <meta name="description" content="Historical S3 log browsing, near-live tail polling, and AI-powered anomaly insights for your Kubernetes cluster." />
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
@@ -49,38 +50,91 @@
         </div>
       </aside>
 
-      <section class="panel logs">
-        <div class="panel-head">
-          <h2>Log lines</h2>
-          <div class="subtle" id="resultSummary">Ready</div>
-        </div>
-        <div class="toolbar">
-          <div class="toolbar-group">
-            <label class="inline-label">Range
-              <select id="rangePreset">
-                <option value="today" selected>Today</option>
-                <option value="1h">Last hour</option>
-                <option value="6h">Last 6 hours</option>
-                <option value="24h">Last 24 hours</option>
-                <option value="7d">Last 7 days</option>
-                <option value="all">All time</option>
-              </select>
-            </label>
-            <button id="todayShortcut" class="ghost">Today</button>
-            <button id="clearFilters" class="ghost">Clear filters</button>
-            <label class="toggle" title="Collapse repeated Falco rule hits into one row per rule">
-              <input id="groupByRule" type="checkbox" /> Group by rule
-            </label>
+      <section class="main-content">
+        <!-- Tab bar -->
+        <nav class="tab-bar" role="tablist" aria-label="Main views">
+          <button id="tabLogs" class="tab active" role="tab" aria-selected="true" aria-controls="panelLogs">
+            <span class="tab-icon">▤</span> Logs
+          </button>
+          <button id="tabInsights" class="tab" role="tab" aria-selected="false" aria-controls="panelInsights">
+            <span class="tab-icon">◈</span> Insights
+            <span id="insightsBadge" class="tab-badge" hidden></span>
+          </button>
+        </nav>
+
+        <!-- Logs panel -->
+        <div id="panelLogs" class="panel logs" role="tabpanel">
+          <div class="panel-head">
+            <h2>Log lines</h2>
+            <div class="subtle" id="resultSummary">Ready</div>
           </div>
+          <div class="toolbar">
+            <div class="toolbar-group">
+              <label class="inline-label">Range
+                <select id="rangePreset">
+                  <option value="today" selected>Today</option>
+                  <option value="1h">Last hour</option>
+                  <option value="6h">Last 6 hours</option>
+                  <option value="24h">Last 24 hours</option>
+                  <option value="7d">Last 7 days</option>
+                  <option value="all">All time</option>
+                </select>
+              </label>
+              <button id="todayShortcut" class="ghost">Today</button>
+              <button id="clearFilters" class="ghost">Clear filters</button>
+              <label class="toggle" title="Collapse repeated Falco rule hits into one row per rule">
+                <input id="groupByRule" type="checkbox" /> Group by rule
+              </label>
+            </div>
+            <div class="toolbar-right">
+              <button id="explainBtn" class="explain-btn" title="Summarize the currently filtered logs with AI">
+                <span class="explain-icon">✦</span> Explain these logs
+              </button>
+            </div>
+          </div>
+
+          <!-- Explain result panel (hidden until used) -->
+          <div id="explainPanel" class="explain-panel" hidden>
+            <div class="explain-panel-head">
+              <div class="explain-label">
+                <span class="explain-icon-sm">✦</span> AI summary
+                <span id="explainCachedBadge" class="cached-badge" hidden>cached</span>
+              </div>
+              <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
+            </div>
+            <div id="explainSummary" class="explain-summary"></div>
+            <div id="explainAction" class="explain-action" hidden></div>
+          </div>
+
           <div class="toolbar-note">Newest rows first. Click a row for the full message and source details.</div>
+          <button id="newRowsBanner" type="button" class="new-rows-banner">▲ <span id="newRowsCount">0</span> new rows — click to dismiss</button>
+          <div class="table-head">
+            <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
+          </div>
+          <div id="rows" class="rows"></div>
+          <div class="pager">
+            <button id="loadMore">Load older</button>
+          </div>
         </div>
-        <button id="newRowsBanner" type="button" class="new-rows-banner">▲ <span id="newRowsCount">0</span> new rows — click to dismiss</button>
-        <div class="table-head">
-          <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
-        </div>
-        <div id="rows" class="rows"></div>
-        <div class="pager">
-          <button id="loadMore">Load older</button>
+
+        <!-- Insights panel -->
+        <div id="panelInsights" class="panel insights" role="tabpanel" hidden>
+          <div class="panel-head">
+            <h2>Anomaly Insights</h2>
+            <div class="insights-toolbar">
+              <label class="inline-label">Status
+                <select id="insightsStatusFilter">
+                  <option value="">All</option>
+                  <option value="new" selected>New</option>
+                  <option value="reviewed">Reviewed</option>
+                  <option value="dismissed">Dismissed</option>
+                </select>
+              </label>
+              <button id="refreshInsights" class="ghost">Refresh</button>
+            </div>
+          </div>
+          <div id="insightsEmpty" class="empty-state" hidden>No anomalies found for the selected filter.</div>
+          <div id="anomalyRows" class="anomaly-rows"></div>
         </div>
       </section>
     </main>
@@ -93,6 +147,39 @@
       <div class="cell scope"></div>
       <div class="cell source"></div>
       <button type="button" class="cell message message-button"></button>
+    </article>
+  </template>
+
+  <template id="anomalyRowTemplate">
+    <article class="anomaly-row">
+      <div class="anomaly-main">
+        <div class="anomaly-col anomaly-col-type">
+          <span class="anomaly-type-badge"></span>
+        </div>
+        <div class="anomaly-col anomaly-col-source">
+          <div class="anomaly-namespace"></div>
+          <div class="anomaly-pod"></div>
+        </div>
+        <div class="anomaly-col anomaly-col-severity">
+          <span class="badge"></span>
+        </div>
+        <div class="anomaly-col anomaly-col-summary">
+          <div class="anomaly-summary-text"></div>
+          <div class="anomaly-action-text"></div>
+        </div>
+        <div class="anomaly-col anomaly-col-meta">
+          <span class="anomaly-status-badge"></span>
+          <div class="anomaly-time"></div>
+        </div>
+        <div class="anomaly-col anomaly-col-actions">
+          <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
+          <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
+        </div>
+        <button type="button" class="anomaly-expand-btn" aria-label="Expand evidence">▾</button>
+      </div>
+      <div class="anomaly-detail" hidden>
+        <div class="anomaly-detail-inner"></div>
+      </div>
     </article>
   </template>
 

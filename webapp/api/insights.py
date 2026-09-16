@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import threading
@@ -9,6 +10,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig, InsightsConfig
+
+
+logger = logging.getLogger(__name__)
 
 # Ports of the UI's message-normalization (webapp/ui/app.js ruleKeyOf) so the
 # grouping keys used for anomaly detection are identical to the ones used for
@@ -170,6 +174,20 @@ class AnomalyStore:
             item["evidence"] = json.loads(item["evidence"])
         return {"items": items, "has_more": has_more}
 
+    _VALID_STATUSES = frozenset({"new", "reviewed", "dismissed"})
+
+    def set_status(self, anomaly_id: int, status: str) -> bool:
+        """Update the status of a single anomaly. Returns True if a row was updated."""
+        if status not in self._VALID_STATUSES:
+            raise ValueError(f"Invalid status {status!r}; must be one of {sorted(self._VALID_STATUSES)}")
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE anomalies SET status=?, updated_at=? WHERE id=?",
+                (status, _utc_now_iso(), anomaly_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
 
 class InsightsDetector:
     """Deterministic detection over the records table. All windows derive from
@@ -195,12 +213,24 @@ class InsightsDetector:
         ).fetchall()
 
     def _evidence(self, hour_start: str, hour_end: str, items: list, **extra: Any) -> dict[str, Any]:
+        sample_messages: list[str] = []
+        for r in items:
+            try:
+                msg = str(r["message"]).strip()
+            except (KeyError, TypeError, IndexError):
+                msg = ""
+            if msg and msg not in sample_messages:
+                sample_messages.append(msg)
+            if len(sample_messages) >= 5:
+                break
+
         evidence = {
             "window_start": hour_start,
             "window_end": hour_end,
             "current_count": len(items),
             "baseline_window_days": self.cfg.baseline_window_days,
             "sample_timestamps": [r["timestamp"] for r in items[: self.cfg.sample_timestamps_max]],
+            "sample_messages": sample_messages,
         }
         evidence.update(extra)
         return evidence
@@ -434,13 +464,11 @@ class InsightsJob:
             try:
                 result = summarizer(anomaly)
             except Exception as exc:
-                # Mark as processed so a broken AI backend does not retry every
-                # poll; the error is kept in evidence for later inspection.
-                self.store.record_ai_failure(int(anomaly["id"]), str(exc))
+                logger.warning("AI summarization failed for anomaly %s: %s", anomaly["id"], exc)
                 continue
             if result:
                 self.store.save_ai_summary(
                     int(anomaly["id"]), result["summary"], result["suggested_action"]
                 )
-            count += 1
+                count += 1
         return count

@@ -29,10 +29,11 @@ DEFAULT_INSIGHTS = {
 }
 
 DEFAULT_AI = {
-    "provider": "none",
+    "provider": "openrouter",
     "model": "",
-    "api_key_env": "LOGSCOPE_AI_API_KEY",
+    "api_key_env": "OPENROUTER_API_KEY",
     "max_anomalies_per_tick": 5,
+    "reasoning_effort": "medium",
 }
 
 
@@ -65,6 +66,7 @@ class AiConfig:
     model: str
     api_key_env: str
     max_anomalies_per_tick: int
+    reasoning_effort: str
 
 
 @dataclass(frozen=True)
@@ -170,10 +172,11 @@ def load_app_config(config_path: Path) -> AppConfig:
             sample_timestamps_max=int(insights["sample_timestamps_max"]),
         ),
         ai=AiConfig(
-            provider=str(ai["provider"]),
+            provider=str(ai.get("provider", "openrouter")),
             model=str(ai["model"]),
-            api_key_env=str(ai["api_key_env"]),
+            api_key_env=str(ai.get("api_key_env", "GEMINI_API_KEY" if str(ai.get("provider")) == "gemini" else "OPENROUTER_API_KEY")),
             max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
+            reasoning_effort=str(ai.get("reasoning_effort", "medium")),
         ),
     )
 

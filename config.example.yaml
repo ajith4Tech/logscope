@@ -186,11 +186,13 @@ webapp:
     detect_per_pod: false          # also spike-check per pod (not just namespace)
     sample_timestamps_max: 10      # sample timestamps kept in evidence
   # AI summarization (stage 2). Only invoked for newly-detected anomalies.
-  # 'none' (the current default) performs no call and returns None. Adding a real
-  # provider later means adding one branch here that builds `prompt_payload`
-  # into a request — no detection-code changes needed.
+  # 'none' disables AI calls; keys come from the env var below, never from files.
+  # OpenRouter: POST https://openrouter.ai/api/v1/chat/completions (Bearer ${OPENROUTER_API_KEY}).
+  # Gemini: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent (x-goog-api-key: ${GEMINI_API_KEY}).
+  # model must be set explicitly; reasoning_effort is passed only to models that support it.
   ai:
-    provider: none                 # none | openai | anthropic
-    model: ""
-    api_key_env: LOGSCOPE_AI_API_KEY
+    provider: openrouter            # none | openrouter | gemini
+    model: ""                       # user sets explicitly, e.g. a free-tier model — don't hardcode a default that may not exist/be free later
+    api_key_env: OPENROUTER_API_KEY # key itself NEVER in config, env var only (e.g. OPENROUTER_API_KEY or GEMINI_API_KEY)
     max_anomalies_per_tick: 5
+    reasoning_effort: medium        # low|medium|high — only passed to models that support it; ignored otherwise, don't error
