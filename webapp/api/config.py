@@ -36,6 +36,15 @@ DEFAULT_AI = {
     "reasoning_effort": "medium",
 }
 
+DEFAULT_MATTERMOST = {
+    "enabled": False,
+    "webhook_url_env": "MATTERMOST_WEBHOOK_URL",
+    "min_urgency": "high",
+}
+
+# Ordering used to compare an anomaly's ai_urgency against min_urgency.
+URGENCY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
+
 
 @dataclass(frozen=True)
 class BackendConfig:
@@ -70,6 +79,13 @@ class AiConfig:
 
 
 @dataclass(frozen=True)
+class MattermostConfig:
+    enabled: bool
+    webhook_url_env: str
+    min_urgency: str  # low | medium | high | urgent — threshold, inclusive
+
+
+@dataclass(frozen=True)
 class AppConfig:
     root: Path
     s3_bucket: str
@@ -84,6 +100,7 @@ class AppConfig:
     webapp: BackendConfig
     insights: InsightsConfig
     ai: AiConfig
+    mattermost: MattermostConfig
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -128,6 +145,8 @@ def load_app_config(config_path: Path) -> AppConfig:
     insights.update(webapp.get("insights") or {})
     ai = dict(DEFAULT_AI)
     ai.update(webapp.get("ai") or {})
+    mattermost = dict(DEFAULT_MATTERMOST)
+    mattermost.update(webapp.get("mattermost") or {})
     creds = _load_secret_credentials(config_path.parent / "deploy" / "k3s" / "s3-secret.yaml")
 
     if not s3_cfg.get("bucket"):
@@ -140,6 +159,12 @@ def load_app_config(config_path: Path) -> AppConfig:
     buckets = tuple(str(item.get("name")) for item in (severity.get("buckets") or []) if item.get("name"))
     if not buckets:
         raise ValueError("severity.buckets must define at least one bucket")
+
+    min_urgency = str(mattermost.get("min_urgency", "high")).strip().lower()
+    if min_urgency not in URGENCY_ORDER:
+        raise ValueError(
+            f"webapp.mattermost.min_urgency must be one of {sorted(URGENCY_ORDER)}, got {min_urgency!r}"
+        )
 
     return AppConfig(
         root=config_path.resolve().parent,
@@ -177,6 +202,11 @@ def load_app_config(config_path: Path) -> AppConfig:
             api_key_env=str(ai.get("api_key_env", "GEMINI_API_KEY" if str(ai.get("provider")) == "gemini" else "OPENROUTER_API_KEY")),
             max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
             reasoning_effort=str(ai.get("reasoning_effort", "medium")),
+        ),
+        mattermost=MattermostConfig(
+            enabled=bool(mattermost["enabled"]),
+            webhook_url_env=str(mattermost["webhook_url_env"]),
+            min_urgency=min_urgency,
         ),
     )
 

@@ -56,11 +56,10 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 24px;
-  padding: 14px 24px;
+  gap: 32px;
+  padding: 18px 24px;
   border-bottom: 1px solid var(--panel-border);
   background: var(--panel-alt);
-  margin-bottom: 0;
 }
 
 .eyebrow {
@@ -155,12 +154,14 @@ h1 {
 .layout {
   display: grid;
   grid-template-columns: 264px minmax(0, 1fr);
-  gap: 0;
+  gap: 20px;
   align-items: start;
   padding: 20px 24px;
 }
 
 .panel {
+  min-width: 0;
+  width: 100%;
   background: var(--panel);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius-md);
@@ -197,7 +198,6 @@ h1 {
 .filters {
   position: sticky;
   top: 20px;
-  margin-right: 16px;
 }
 
 .filter-helper {
@@ -219,6 +219,8 @@ h1 {
 input,
 select,
 button {
+  box-sizing: border-box;
+  max-width: 100%;
   border-radius: var(--radius-sm);
   border: 1px solid var(--panel-border);
   background: var(--panel-alt);
@@ -226,6 +228,12 @@ button {
   padding: 8px 10px;
   font: inherit;
   font-size: 12.5px;
+}
+
+input,
+select {
+  width: 100%;
+  min-width: 0;
 }
 
 input:focus,
@@ -301,14 +309,14 @@ button.ghost:hover {
 }
 
 .logs {
-  min-height: 72vh;
+  min-width: 0;
 }
 
 /* ── Tab bar ─────────────────────────────────────────────────────────── */
 .main-content {
+  min-width: 0;
   display: grid;
   gap: 0;
-  padding-left: 16px;
 }
 
 .tab-bar {
@@ -507,8 +515,8 @@ button.ghost:hover {
 .table-head,
 .row {
   display: grid;
-  grid-template-columns: 156px 88px 100px 230px minmax(0, 1fr);
-  gap: 10px;
+  grid-template-columns: 150px 82px 90px 210px minmax(0, 1fr);
+  gap: 12px;
 }
 
 .table-head {
@@ -528,7 +536,8 @@ button.ghost:hover {
   background: var(--panel-border);
   border: 1px solid var(--panel-border);
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  overflow: auto;
+  max-height: calc(100vh - 360px);
 }
 
 .row {
@@ -841,7 +850,7 @@ button.ghost:hover {
 
 /* ── Anomaly Insights tab ────────────────────────────────────────────── */
 .insights {
-  min-height: 72vh;
+  min-width: 0;
 }
 
 .insights-toolbar {
@@ -1084,13 +1093,15 @@ button.ghost:hover {
 
 /* ── Empty state ─────────────────────────────────────────────────────── */
 .empty-state {
-  padding: 20px 16px;
+  padding: 16px;
   border-radius: var(--radius-md);
   border: 1px dashed var(--panel-border-strong);
   background: transparent;
   color: var(--muted);
   font-size: 12.5px;
+  line-height: 1.5;
 }
+
 
 .empty-action {
   display: inline-flex;
