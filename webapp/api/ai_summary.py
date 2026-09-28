@@ -15,14 +15,15 @@ AI responses are structured as:
         {
             "title": "...",
             "command": "...",
-            "explanation": "..."
+            "explanation": "...",
+            "risk": "read-only|medium|high"
         }
     ],
     "suggested_action": "..."
 }
 
 The legacy `suggested_action` field is retained temporarily for compatibility
-with the current frontend. The first troubleshooting step is used to populate it.
+with existing code/tests. The first troubleshooting step is used to populate it.
 """
 
 from __future__ import annotations
@@ -30,11 +31,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any
 from urllib import error, request
 
+from .actions import parse_command_to_action
 from .config import AiConfig
 
 
@@ -68,44 +71,34 @@ _warned_once_lock = threading.Lock()
 _EXPLAIN_LINE_SYSTEM_PROMPT = (
     "You are a Kubernetes observability assistant for Logscope. "
     "Explain this single Kubernetes log record for an operator using ONLY the provided fields. "
-
     "First explain what the record explicitly shows: timestamp, severity, namespace, pod, "
     "container, scope, and important message details when present. "
     "Do not infer root causes, user intent, attacks, dependencies, or related services "
     "unless explicitly stated in the record. "
     "If the line alone cannot establish why the event happened, say so clearly. "
-
     "Then provide 2 to 3 ordered troubleshooting steps when the available fields support them. "
-    "Each step must contain: title, command, and explanation. "
-    "The command must be read-only and the explanation must say exactly what the command checks "
-    "and why that check is useful. "
-
+    "Each step must contain: title, command, explanation, and risk. "
+    "The command must be a read-only diagnostic command and the explanation must say in one short line "
+    "what the command checks and why that check is useful. "
+    "Set risk to 'read-only' for diagnostic checks, or 'medium'/'high' if mutating. "
+    "Prefer read-only diagnostic commands first. "
     "Only use namespace, pod, container, node, file path, process name, or other identifiers "
     "that are explicitly present in the provided record. "
     "Never invent identifiers or replace missing identifiers with fake placeholders such as "
     "<pod-name>, <namespace>, or <node>. "
-
     "Prefer safe diagnostic commands such as kubectl get, kubectl describe, kubectl logs, "
-    "kubectl events, journalctl, grep, or other read-only inspection commands. "
+    "kubectl events. "
     "Do not suggest delete, restart, scale, patch, exec, configuration changes, permission changes, "
     "security-rule changes, allowlist changes, or disabling alerts from a single log record. "
-
-    "The troubleshooting steps should progress from basic context gathering to more specific "
-    "verification when possible. "
-    "Do not repeat the same check in multiple steps. "
-
+    "Separate unrelated problems instead of forcing one root cause. "
+    "State clearly when evidence is insufficient. "
     "If the record does not contain enough information to construct a safe command, "
     "leave command empty and use the explanation to state the exact additional evidence "
     "that should be collected. "
-    "Do not invent a command just to fill the field. "
-
-    "Avoid generic advice such as 'review the logs', 'monitor the system', or "
-    "'investigate further' without specifying exactly what should be checked. "
-
     "Return valid JSON only with this structure: "
     "{\"summary\":\"...\",\"steps\":["
-    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\"}"
-    "]}."
+    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\",\"risk\":\"read-only|medium|high\"}"
+    "]}"
 )
 
 
@@ -113,50 +106,40 @@ _SYSTEM_PROMPT = (
     "You are a Kubernetes observability assistant for Logscope. "
     "Summarize the detected anomaly for an operator using ONLY the provided evidence "
     "and sample log messages. "
-
     "Do not invent root causes, services, infrastructure state, intent, dependencies, "
     "or facts not present in the evidence. "
     "Clearly distinguish what the logs show from what cannot yet be determined. "
     "The summary should state what happened, where it happened, the important evidence, "
     "and whether the available evidence is sufficient to establish a likely cause. "
-
     "If the evidence contains multiple unrelated event groups, explicitly separate them "
     "instead of forcing them into one explanation. "
     "Do not describe a security event as malicious unless the evidence explicitly establishes "
     "malicious activity. "
-
     "Then provide 2 to 5 ordered troubleshooting steps. "
-    "Each step must contain: title, command, and explanation. "
+    "Each step must contain: title, command, explanation, and risk. "
     "The command must be a read-only diagnostic command whenever the evidence provides "
     "the identifiers required to construct one. "
-    "The explanation must state what that command checks and why that check helps determine "
-    "the cause or next direction of investigation. "
-
+    "The explanation must state in one short line what that command checks and why that check helps. "
+    "Set risk to 'read-only' for diagnostic checks, or 'medium'/'high' if mutating. "
+    "Prefer read-only diagnostic commands first. "
     "Use only namespace names, pod names, container names, node names, rule names, process names, "
     "file paths, and other identifiers explicitly present in the evidence. "
     "Do not invent identifiers or use fake placeholders. "
-
-    "Prefer commands such as kubectl get, kubectl describe, kubectl logs, kubectl events, "
-    "journalctl, grep, and narrowly scoped inspection of Falco or host logs. "
+    "Prefer commands such as kubectl get, kubectl describe, kubectl logs, kubectl events. "
     "The steps should progress from context gathering to evidence verification and correlation. "
-
     "Do not suggest commands that delete, restart, scale, patch, exec into, modify, disable, "
-    "or otherwise change cluster state. "
+    "or otherwise change cluster state as the first response. "
     "Do not recommend changing Falco exceptions, allowlists, permissions, or production "
     "configuration as the first response. "
     "First inspect and verify the observed behavior. "
-
     "If a command cannot be safely constructed from the supplied evidence, leave command empty "
     "and explain exactly what additional evidence or identifier must be obtained. "
     "Do not invent commands simply to complete the list. "
-
     "Each step must add new diagnostic information; do not repeat the same command with minor changes. "
-    "Avoid generic advice such as 'review the logs', 'monitor the system', or "
-    "'investigate further' without specifying exactly what should be checked. "
-
+    "Avoid generic advice without specifying exactly what should be checked. "
     "Return valid JSON only with this structure: "
     "{\"summary\":\"...\",\"steps\":["
-    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\"}"
+    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\",\"risk\":\"read-only|medium|high\"}"
     "]}"
 )
 
@@ -165,50 +148,38 @@ _EXPLAIN_SYSTEM_PROMPT = (
     "You are a Kubernetes observability assistant for Logscope. "
     "Summarize the currently filtered Kubernetes logs for an operator using ONLY the provided "
     "log_sample, filters, sample_size, and total_matching_exceeds_sample metadata. "
-
     "Do not invent root causes, services, dependencies, infrastructure state, intent, "
     "or patterns that are not evidenced in the sample. "
-
     "Identify the dominant or most important observed behavior, including severity, affected "
     "namespace/pod/container when supported, and notable repeated errors, warnings, failures, "
     "or security events. "
-
     "If the sample contains multiple unrelated event groups, clearly separate them. "
     "Do not force unrelated logs into a single incident or cause. "
     "Clearly state when the available sample is insufficient to determine a root cause. "
-
     "Then provide 2 to 5 ordered troubleshooting steps for the most important observed issue(s). "
-    "Each step must contain: title, command, and explanation. "
+    "Each step must contain: title, command, explanation, and risk. "
     "The command must be read-only whenever the provided evidence contains the identifiers "
     "required to build it. "
-    "The explanation must say what the command checks and why that check is useful. "
-
+    "The explanation must say in one short line what the command checks and why that check is useful. "
+    "Set risk to 'read-only' for diagnostic checks, or 'medium'/'high' if mutating. "
+    "Prefer read-only diagnostic commands first. "
     "Use only identifiers explicitly present in the supplied filters and log sample. "
     "Do not invent namespace names, pod names, container names, node names, process names, "
     "rule names, deployment names, file paths, or other identifiers. "
     "Never use fake placeholders. "
-
-    "Prefer diagnostic commands such as kubectl get, kubectl describe, kubectl logs, "
-    "kubectl events, journalctl, grep, and narrowly scoped inspection of security or application logs. "
-
-    "Order the steps logically. A useful sequence is: establish the affected resource, "
-    "inspect its current state, inspect related logs/events, correlate with another source, "
-    "then determine what evidence confirms or refutes the likely explanation. "
-
+    "Prefer diagnostic commands such as kubectl get, kubectl describe, kubectl logs, kubectl events. "
+    "Order the steps logically: establish affected resource, inspect current state, "
+    "inspect related logs/events, then correlate evidence. "
     "Do not suggest destructive or state-changing commands such as delete, restart, scale, patch, "
-    "exec, or rollout changes. "
+    "or rollout changes. "
     "Do not recommend weakening security rules, changing allowlists/exceptions, changing permissions, "
     "or modifying production configuration as the first response. "
-
     "If the sample does not provide enough information for a safe specific command, leave the command "
     "empty and state the exact evidence that should be collected next. "
-
-    "Avoid generic advice such as 'review the logs', 'monitor the system', or "
-    "'investigate further' without a concrete diagnostic target. "
-
+    "Avoid generic advice without a concrete diagnostic target. "
     "Return valid JSON only with this structure: "
     "{\"summary\":\"...\",\"steps\":["
-    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\"}"
+    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\",\"risk\":\"read-only|medium|high\"}"
     "]}"
 )
 
@@ -417,24 +388,16 @@ def build_prompt_payload(anomaly: dict[str, Any]) -> dict[str, Any]:
 def _strip_json_fence(content: str) -> str:
     text = str(content or "").strip()
 
-    if text.startswith("```") and text.endswith("```"):
-        lines = text.splitlines()
-
-        if lines:
-            lines = lines[1:]
-
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-
-        text = "\n".join(lines).strip()
-
-        if text.lower().startswith("json"):
-            text = text[4:].lstrip()
+    # If code fence present anywhere, try to extract inside of it
+    if "```" in text:
+        match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+        if match:
+            return match.group(1).strip()
 
     return text
 
 
-def _format_step_action(step: dict[str, str]) -> str:
+def _format_step_action(step: dict[str, Any]) -> str:
     command = str(step.get("command") or "").strip()
     explanation = str(step.get("explanation") or "").strip()
 
@@ -447,11 +410,29 @@ def _format_step_action(step: dict[str, str]) -> str:
     return explanation
 
 
-def _normalise_steps(value: Any, max_steps: int) -> list[dict[str, str]]:
+def _infer_risk(command: str, raw_risk: str | None) -> str:
+    risk_clean = str(raw_risk or "").strip().lower()
+    if risk_clean in ("read-only", "readonly", "low", "safe"):
+        return "read-only"
+    if risk_clean in ("medium", "modifying", "mutating"):
+        return "medium"
+    if risk_clean in ("high", "dangerous", "destructive"):
+        return "high"
+
+    cmd_lower = command.lower()
+    if any(k in cmd_lower for k in ("delete", "drain", "cordon", "purge", "rm ")):
+        return "high"
+    if any(k in cmd_lower for k in ("restart", "undo", "scale", "patch", "apply", "set ", "rollout")):
+        return "medium"
+
+    return "read-only"
+
+
+def _normalise_steps(value: Any, max_steps: int) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
 
-    steps: list[dict[str, str]] = []
+    steps: list[dict[str, Any]] = []
 
     for index, raw_step in enumerate(value[:max_steps], start=1):
         if isinstance(raw_step, dict):
@@ -474,10 +455,13 @@ def _normalise_steps(value: Any, max_steps: int) -> list[dict[str, str]]:
                 or ""
             ).strip()
 
+            raw_risk = raw_step.get("risk")
+
         elif isinstance(raw_step, str):
             title = f"Step {index}"
             command = ""
             explanation = raw_step.strip()
+            raw_risk = "read-only"
 
         else:
             continue
@@ -488,11 +472,17 @@ def _normalise_steps(value: Any, max_steps: int) -> list[dict[str, str]]:
         if not command and not explanation:
             continue
 
+        risk = _infer_risk(command, raw_risk)
+        parsed_action = parse_command_to_action(command) if command else None
+
         steps.append(
             {
                 "title": title,
                 "command": command,
                 "explanation": explanation,
+                "risk": risk,
+                "action": parsed_action,
+                "is_supported": parsed_action is not None,
             }
         )
 
@@ -516,7 +506,14 @@ def _parse_summary_response(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        parsed = None
+        # If text has leading/trailing characters around JSON, try substring
+        first_brace = text.find("{")
+        last_brace = text.rfind("}")
+        if first_brace != -1 and last_brace > first_brace:
+            try:
+                parsed = json.loads(text[first_brace : last_brace + 1])
+            except json.JSONDecodeError:
+                parsed = None
 
     if isinstance(parsed, dict):
         summary = str(
@@ -546,6 +543,9 @@ def _parse_summary_response(content: str) -> dict[str, Any]:
                     "title": "Suggested next step",
                     "command": "",
                     "explanation": legacy_action,
+                    "risk": "read-only",
+                    "action": None,
+                    "is_supported": False,
                 }
             ]
 
@@ -563,7 +563,7 @@ def _parse_summary_response(content: str) -> dict[str, Any]:
     # Plain-text compatibility fallback.
     summary = text
     suggested_action = ""
-    parsed_steps: list[dict[str, str]] = []
+    parsed_steps: list[dict[str, Any]] = []
 
     for line in text.splitlines():
         stripped = line.strip()
@@ -577,30 +577,29 @@ def _parse_summary_response(content: str) -> dict[str, Any]:
             suggested_action = stripped.split(":", 1)[1].strip()
             continue
 
-        # Basic support for:
+        # Basic support for numbered steps:
         # 1. COMMAND — explanation
         # 2. COMMAND - explanation
         if len(stripped) >= 3 and stripped[0].isdigit() and stripped[1:3] in {". ", ") "}:
             step_text = stripped[3:].strip()
+            cmd = ""
+            exp = step_text
 
             if " — " in step_text:
-                command, explanation = step_text.split(" — ", 1)
-                parsed_steps.append(
-                    {
-                        "title": f"Step {len(parsed_steps) + 1}",
-                        "command": command.strip(),
-                        "explanation": explanation.strip(),
-                    }
-                )
+                cmd, exp = step_text.split(" — ", 1)
             elif " - " in step_text:
-                command, explanation = step_text.split(" - ", 1)
-                parsed_steps.append(
-                    {
-                        "title": f"Step {len(parsed_steps) + 1}",
-                        "command": command.strip(),
-                        "explanation": explanation.strip(),
-                    }
-                )
+                cmd, exp = step_text.split(" - ", 1)
+
+            parsed_steps.append(
+                {
+                    "title": f"Step {len(parsed_steps) + 1}",
+                    "command": cmd.strip(),
+                    "explanation": exp.strip(),
+                    "risk": _infer_risk(cmd.strip(), None),
+                    "action": parse_command_to_action(cmd.strip()) if cmd.strip() else None,
+                    "is_supported": parse_command_to_action(cmd.strip()) is not None if cmd.strip() else False,
+                }
+            )
 
     steps = parsed_steps[:5]
 
@@ -641,6 +640,36 @@ def _retry_delay(exc: error.HTTPError, attempt: int) -> float:
     return min(delay, _MAX_RETRY_SECONDS)
 
 
+def _clean_error_message(raw_text: str, *keys: str) -> str:
+    text = str(raw_text or "").strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict) and "error" in parsed:
+                err = parsed["error"]
+                if isinstance(err, dict):
+                    msg = err.get("message") or err.get("status") or ""
+                    status = err.get("status") or ""
+                    if msg:
+                        text = f"{msg} ({status})" if status and status not in msg else msg
+                elif isinstance(err, str):
+                    text = err
+        except Exception:
+            pass
+
+    for k in keys:
+        if k and len(k) >= 4 and k in text:
+            text = text.replace(k, "***REDACTED***")
+
+    text = re.sub(r"key=[A-Za-z0-9_\-]+", "key=***REDACTED***", text)
+    text = re.sub(r"Bearer\s+[A-Za-z0-9_\-\.]+", "Bearer ***REDACTED***", text)
+
+    if len(text) > 400:
+        text = f"{text[:400]}..."
+
+    return text
+
+
 def _read_http_error_body(exc: error.HTTPError) -> str:
     try:
         raw = exc.read()
@@ -655,12 +684,7 @@ def _read_http_error_body(exc: error.HTTPError) -> str:
     except Exception:
         body = str(raw)
 
-    body = body.strip()
-
-    if len(body) > 600:
-        body = f"{body[:600]}..."
-
-    return body
+    return body.strip()
 
 
 def _post_json(
@@ -669,8 +693,13 @@ def _post_json(
     url: str,
     body: dict[str, Any],
     headers: dict[str, str],
+    api_key_to_redact: str = "",
 ) -> dict[str, Any]:
-    """POST JSON with bounded retries for transient failures."""
+    """POST JSON with bounded retries for transient failures (429, 5xx, network, timeouts).
+
+    Permanent errors (400, 401, 403, 404) are NOT retried.
+    API keys are strictly redacted from logs and error messages.
+    """
 
     encoded_body = json.dumps(
         body,
@@ -703,6 +732,7 @@ def _post_json(
         except error.HTTPError as exc:
             code = int(exc.code)
             body_text = _read_http_error_body(exc)
+            clean_detail = _clean_error_message(body_text, api_key_to_redact)
 
             if (
                 code in _TRANSIENT_HTTP_STATUS_CODES
@@ -711,10 +741,11 @@ def _post_json(
                 delay = _retry_delay(exc, attempt)
 
                 logger.warning(
-                    "%s summarization returned HTTP %s; "
+                    "%s summarization returned transient HTTP %s (%s); "
                     "retrying in %.1fs (attempt %s/%s)",
                     provider,
                     code,
+                    clean_detail,
                     delay,
                     attempt,
                     _MAX_AI_ATTEMPTS,
@@ -723,13 +754,16 @@ def _post_json(
                 time.sleep(delay)
                 continue
 
-            detail = f": {body_text}" if body_text else ""
-
+            # Non-transient or attempts exhausted: clean error, no key exposure
+            detail = f": {clean_detail}" if clean_detail else ""
             raise RuntimeError(
                 f"{provider} summarization failed with HTTP {code}{detail}"
             ) from None
 
-        except error.URLError as exc:
+        except (error.URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", str(exc))
+            clean_reason = _clean_error_message(str(reason), api_key_to_redact)
+
             if attempt < _MAX_AI_ATTEMPTS:
                 delay = min(
                     _RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
@@ -737,33 +771,10 @@ def _post_json(
                 )
 
                 logger.warning(
-                    "%s summarization network error; "
-                    "retrying in %.1fs (attempt %s/%s): %s",
-                    provider,
-                    delay,
-                    attempt,
-                    _MAX_AI_ATTEMPTS,
-                    exc.reason,
-                )
-
-                time.sleep(delay)
-                continue
-
-            raise RuntimeError(
-                f"{provider} summarization failed: {exc.reason}"
-            ) from None
-
-        except TimeoutError:
-            if attempt < _MAX_AI_ATTEMPTS:
-                delay = min(
-                    _RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
-                    _MAX_RETRY_SECONDS,
-                )
-
-                logger.warning(
-                    "%s summarization timed out; "
+                    "%s summarization network error/timeout (%s); "
                     "retrying in %.1fs (attempt %s/%s)",
                     provider,
+                    clean_reason,
                     delay,
                     attempt,
                     _MAX_AI_ATTEMPTS,
@@ -773,10 +784,10 @@ def _post_json(
                 continue
 
             raise RuntimeError(
-                f"{provider} summarization timed out"
+                f"{provider} summarization network error: {clean_reason}"
             ) from None
 
-    raise RuntimeError(f"{provider} summarization failed")
+    raise RuntimeError(f"{provider} summarization failed after {_MAX_AI_ATTEMPTS} attempts")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -850,7 +861,7 @@ def _summarize_openrouter(
     body: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "max_tokens": 700,
+        "max_tokens": 2048,
         "temperature": 0.2,
     }
 
@@ -872,6 +883,7 @@ def _summarize_openrouter(
             "Content-Type": "application/json",
             "User-Agent": "logscope-webapp/1.0",
         },
+        api_key_to_redact=api_key,
     )
 
     choices = data.get("choices") or []
@@ -933,7 +945,7 @@ def _summarize_gemini(
         ],
         "generationConfig": {
             "responseMimeType": "application/json",
-            "maxOutputTokens": 700,
+            "maxOutputTokens": 2048,
             "temperature": 0.2,
         },
     }
@@ -948,6 +960,7 @@ def _summarize_gemini(
             "User-Agent": "logscope-webapp/1.0",
             "x-goog-api-key": api_key,
         },
+        api_key_to_redact=api_key,
     )
 
     candidates = data.get("candidates") or []

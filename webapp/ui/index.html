@@ -60,6 +60,10 @@
             <span class="tab-icon">◈</span> Insights
             <span id="insightsBadge" class="tab-badge" hidden></span>
           </button>
+          <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable">
+            <span class="tab-icon">⚡</span> Actionable
+            <span id="actionableBadge" class="tab-badge" hidden></span>
+          </button>
         </nav>
 
         <!-- Logs panel -->
@@ -100,7 +104,10 @@
                 <span class="explain-icon-sm">✦</span> AI summary
                 <span id="explainCachedBadge" class="cached-badge" hidden>cached</span>
               </div>
-              <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
+              <div class="explain-head-actions">
+                <button id="openInActionableBtn" class="ghost explain-open-actionable" title="Open troubleshooting workspace with this plan">⚡ Troubleshoot in Actionable</button>
+                <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
+              </div>
             </div>
             <div id="explainSummary" class="explain-summary"></div>
             <div id="explainAction" class="explain-action" hidden></div>
@@ -136,9 +143,89 @@
           <div id="insightsEmpty" class="empty-state" hidden>No anomalies found for the selected filter.</div>
           <div id="anomalyRows" class="anomaly-rows"></div>
         </div>
+
+        <!-- Actionable panel (Troubleshooting Workspace) -->
+        <div id="panelActionable" class="panel actionable-panel" role="tabpanel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>Troubleshooting Workspace</h2>
+              <div class="subtle" id="actionableContextDesc">Active investigation: Filtered Logs</div>
+            </div>
+            <div class="actionable-toolbar">
+              <label class="inline-label">Target
+                <select id="actionableSourceSelect">
+                  <option value="logs" selected>Current Filtered Logs</option>
+                </select>
+              </label>
+              <button id="actionableRefreshBtn" class="primary">
+                <span class="explain-icon-sm">✦</span> <span id="actionableRefreshLabel">Generate Plan</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Empty or prompt state -->
+          <div id="actionableEmpty" class="empty-state">
+            <div class="empty-state-title">No Active Troubleshooting Plan</div>
+            <div class="empty-state-sub">Select an anomaly from Insights or analyze your currently filtered logs to generate an actionable investigation plan.</div>
+            <button id="actionableAnalyzeLogsBtn" class="primary" style="margin-top: 1rem;">⚡ Analyze Filtered Logs</button>
+          </div>
+
+          <!-- Active Workspace container -->
+          <div id="actionableWorkspace" class="actionable-workspace" hidden>
+            <!-- Summary Card -->
+            <div class="troubleshoot-card">
+              <div class="troubleshoot-card-head">
+                <div class="troubleshoot-card-title">
+                  <span class="explain-icon">✦</span>
+                  <span id="actionableSummaryTitle">Issue Summary</span>
+                </div>
+                <div id="actionableTags" class="troubleshoot-tags"></div>
+              </div>
+              <div id="actionableSummary" class="troubleshoot-summary-body"></div>
+              <div id="actionableEvidence" class="troubleshoot-evidence" hidden></div>
+            </div>
+
+            <!-- Steps Section -->
+            <div class="actionable-steps-section">
+              <div class="actionable-steps-header">
+                <div>
+                  <h3>Investigation Steps</h3>
+                  <div class="subtle" id="actionableStepsCount">0 steps ready</div>
+                </div>
+                <div class="actionable-steps-tools">
+                  <button id="actionableRunNextBtn" class="primary actionable-next-btn">Run Next Step</button>
+                  <button id="actionableResetStepsBtn" class="ghost">Reset Statuses</button>
+                </div>
+              </div>
+
+              <!-- Steps List -->
+              <div id="actionableStepsList" class="troubleshoot-steps-list"></div>
+            </div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
+
+  <!-- Confirmation Modal for Mutating Actions -->
+  <dialog id="actionConfirmModal" class="confirm-modal">
+    <form method="dialog" class="confirm-modal-box">
+      <div class="confirm-modal-head">
+        <span class="confirm-modal-icon">⚠️</span>
+        <h3>Confirm State Mutation</h3>
+      </div>
+      <p id="confirmModalText" class="confirm-modal-text">
+        This action modifies cluster state (e.g. restart or rollback). Are you sure you want to execute it?
+      </p>
+      <div class="confirm-modal-command">
+        <code id="confirmModalCommand"></code>
+      </div>
+      <div class="confirm-modal-actions">
+        <button id="confirmCancelBtn" type="button" class="ghost">Cancel</button>
+        <button id="confirmExecuteBtn" type="button" class="destructive-btn">Execute Action</button>
+      </div>
+    </form>
+  </dialog>
 
   <template id="rowTemplate">
     <article class="row">
@@ -172,6 +259,7 @@
           <div class="anomaly-time"></div>
         </div>
         <div class="anomaly-col anomaly-col-actions">
+          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab">⚡ Troubleshoot</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
         </div>

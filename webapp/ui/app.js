@@ -20,6 +20,15 @@ const state = {
   expandedAnomalies: new Set(),
   activeTab: 'logs',
   lineExplainState: new Map(), // rowId -> { status: 'idle'|'loading'|'done'|'error', summary, action, error }
+  actionable: {
+    sourceType: 'logs', // 'logs' | 'anomaly' | 'line'
+    anomalyId: null,
+    plan: null,
+    stepStates: new Map(), // stepIndex -> { status, stdout, stderr, exit_code, duration_ms, error }
+    activeStepIndex: 0,
+    runningIndex: null,
+    pendingMutationAction: null,
+  },
 };
 
 const el = (id) => document.getElementById(id);
@@ -29,19 +38,33 @@ const el = (id) => document.getElementById(id);
 function switchTab(name) {
   state.activeTab = name;
   const isLogs = name === 'logs';
+  const isInsights = name === 'insights';
+  const isActionable = name === 'actionable';
+
   el('tabLogs').classList.toggle('active', isLogs);
-  el('tabInsights').classList.toggle('active', !isLogs);
+  el('tabInsights').classList.toggle('active', isInsights);
+  el('tabActionable').classList.toggle('active', isActionable);
+
   el('tabLogs').setAttribute('aria-selected', isLogs ? 'true' : 'false');
-  el('tabInsights').setAttribute('aria-selected', !isLogs ? 'true' : 'false');
+  el('tabInsights').setAttribute('aria-selected', isInsights ? 'true' : 'false');
+  el('tabActionable').setAttribute('aria-selected', isActionable ? 'true' : 'false');
+
   el('panelLogs').hidden = !isLogs;
-  el('panelInsights').hidden = isLogs;
-  if (!isLogs && !state.anomalies.length) {
+  el('panelInsights').hidden = !isInsights;
+  el('panelActionable').hidden = !isActionable;
+
+  if (isInsights && !state.anomalies.length) {
     loadInsights().catch((err) => { el('health').textContent = err.message; });
+  }
+  if (isActionable) {
+    updateActionableSourceOptions();
+    renderActionableWorkspace();
   }
 }
 
 el('tabLogs').addEventListener('click', () => switchTab('logs'));
 el('tabInsights').addEventListener('click', () => switchTab('insights'));
+el('tabActionable').addEventListener('click', () => switchTab('actionable'));
 
 // ─── Date helpers ────────────────────────────────────────────────────────────
 
@@ -103,7 +126,16 @@ function queryFromFilters(extra = {}) {
 
 async function fetchJson(url, options = {}) {
   const res = await fetch(url, options);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const data = await res.json();
+      if (data && data.error) {
+        msg = data.error;
+      }
+    } catch (_) {}
+    throw new Error(msg);
+  }
   return res.json();
 }
 
@@ -304,6 +336,19 @@ function lineExplainMarkup(rowId, item) {
       action.textContent = `→ ${lineState.action}`;
       result.appendChild(action);
     }
+    if (lineState.steps && lineState.steps.length) {
+      const tBtn = document.createElement('button');
+      tBtn.type = 'button';
+      tBtn.className = 'ghost line-explain-btn';
+      tBtn.style.marginTop = '6px';
+      tBtn.textContent = '⚡ Troubleshoot in Actionable';
+      tBtn.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        setPlanFromExplainResult(lineState.rawResult, 'line', null, item);
+        switchTab('actionable');
+      });
+      result.appendChild(tBtn);
+    }
     box.appendChild(result);
   } else if (lineState.status === 'error') {
     const errNode = document.createElement('div');
@@ -332,6 +377,8 @@ async function explainLine(rowId, item) {
         status: 'done',
         summary: result.summary || 'No explanation returned.',
         action: result.suggested_action || '',
+        steps: result.steps || [],
+        rawResult: result,
       });
     }
   } catch (err) {
@@ -502,6 +549,7 @@ function renderAnomalies() {
       ? formatTimestamp(anomaly.detected_at)
       : '—';
 
+    const btnTroubleshoot = node.querySelector('.anomaly-btn-troubleshoot');
     const btnReviewed = node.querySelector('.anomaly-btn-reviewed');
     const btnDismissed = node.querySelector('.anomaly-btn-dismissed');
     if (anomaly.status === 'reviewed') {
@@ -511,6 +559,12 @@ function renderAnomalies() {
     if (anomaly.status === 'dismissed') {
       btnDismissed.disabled = true;
       btnDismissed.textContent = '✕ Dismissed';
+    }
+    if (btnTroubleshoot) {
+      btnTroubleshoot.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        openAnomalyInActionable(anomaly);
+      });
     }
     btnReviewed.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -660,6 +714,7 @@ async function runExplain() {
       if (result.cached) {
         cachedBadge.hidden = false;
       }
+      setPlanFromExplainResult(result, 'logs');
     }
   } catch (err) {
     summaryEl.classList.remove('thinking');
@@ -679,6 +734,403 @@ el('explainDismiss').addEventListener('click', () => {
   el('explainAction').hidden = true;
   el('explainCachedBadge').hidden = true;
 });
+
+// ─── Actionable Troubleshooting Workspace ────────────────────────────────────
+
+function setPlanFromExplainResult(result, sourceType, anomaly = null, lineItem = null) {
+  state.actionable.sourceType = sourceType;
+  state.actionable.anomalyId = anomaly ? anomaly.id : null;
+  state.actionable.lineItem = lineItem;
+  state.actionable.plan = {
+    summary: result.summary || '',
+    steps: result.steps || [],
+    suggested_action: result.suggested_action || '',
+    filters: result.filters || (sourceType === 'logs' ? queryFromFilters() : null),
+    sample_count: result.sample_count,
+    anomaly: anomaly,
+    lineItem: lineItem,
+  };
+  state.actionable.stepStates.clear();
+  renderActionableWorkspace();
+}
+
+function openAnomalyInActionable(anomaly) {
+  state.actionable.sourceType = 'anomaly';
+  state.actionable.anomalyId = anomaly.id;
+
+  let steps = anomaly.ai_steps || [];
+  if (!steps.length && anomaly.ai_suggested_action) {
+    steps = [
+      {
+        title: 'Suggested Action',
+        command: '',
+        explanation: anomaly.ai_suggested_action,
+        risk: 'read-only',
+        action: null,
+        is_supported: false,
+      },
+    ];
+  }
+
+  state.actionable.plan = {
+    summary: anomaly.ai_summary || `Detected anomaly: ${anomaly.type} in ${anomaly.namespace || 'cluster'}`,
+    steps: steps,
+    suggested_action: anomaly.ai_suggested_action || '',
+    evidence: anomaly.evidence,
+    anomaly: anomaly,
+  };
+  state.actionable.stepStates.clear();
+  switchTab('actionable');
+}
+
+function updateActionableSourceOptions() {
+  const sel = el('actionableSourceSelect');
+  if (!sel) return;
+  const currentVal = sel.value;
+  sel.innerHTML = '<option value="logs">Current Filtered Logs</option>';
+
+  for (const anom of state.anomalies) {
+    const opt = document.createElement('option');
+    opt.value = `anomaly-${anom.id}`;
+    const desc = anom.pod ? `${anom.namespace}/${anom.pod}` : (anom.namespace || 'cluster');
+    opt.textContent = `Anomaly #${anom.id}: ${anomalyTypeLabel(anom.type)} (${desc})`;
+    sel.appendChild(opt);
+  }
+
+  if (state.actionable.sourceType === 'anomaly' && state.actionable.anomalyId) {
+    sel.value = `anomaly-${state.actionable.anomalyId}`;
+  } else if (state.actionable.sourceType === 'logs') {
+    sel.value = 'logs';
+  } else if (currentVal) {
+    sel.value = currentVal;
+  }
+}
+
+function copyToClipboard(text, btnEl) {
+  if (!navigator.clipboard) return;
+  navigator.clipboard.writeText(text).then(() => {
+    const orig = btnEl.textContent;
+    btnEl.textContent = 'Copied!';
+    setTimeout(() => { btnEl.textContent = orig; }, 1500);
+  }).catch(() => {});
+}
+
+function renderActionableWorkspace() {
+  const emptyEl = el('actionableEmpty');
+  const wsEl = el('actionableWorkspace');
+  const descEl = el('actionableContextDesc');
+  const plan = state.actionable.plan;
+
+  if (!plan || !plan.summary) {
+    emptyEl.hidden = false;
+    wsEl.hidden = true;
+    el('actionableRefreshLabel').textContent = 'Generate Plan';
+    descEl.textContent = 'Ready to investigate';
+    return;
+  }
+
+  emptyEl.hidden = true;
+  wsEl.hidden = false;
+  el('actionableRefreshLabel').textContent = 'Refresh Plan';
+
+  // Context Description
+  if (state.actionable.sourceType === 'anomaly' && plan.anomaly) {
+    const anom = plan.anomaly;
+    descEl.textContent = `Investigating Anomaly #${anom.id}: ${anomalyTypeLabel(anom.type)} (${anom.namespace || 'cluster'})`;
+    el('actionableSummaryTitle').textContent = `Anomaly Investigation: ${anomalyTypeLabel(anom.type)}`;
+  } else if (state.actionable.sourceType === 'line') {
+    descEl.textContent = 'Investigating single log record';
+    el('actionableSummaryTitle').textContent = 'Log Record Investigation';
+  } else {
+    descEl.textContent = 'Investigating Filtered Logs';
+    el('actionableSummaryTitle').textContent = 'Filtered Logs Investigation';
+  }
+
+  // Tags
+  const tagsEl = el('actionableTags');
+  tagsEl.innerHTML = '';
+  const addTag = (text) => {
+    const tag = document.createElement('span');
+    tag.className = 'troubleshoot-tag';
+    tag.textContent = text;
+    tagsEl.appendChild(tag);
+  };
+
+  if (state.actionable.sourceType === 'anomaly' && plan.anomaly) {
+    addTag(`type: ${plan.anomaly.type}`);
+    if (plan.anomaly.namespace) addTag(`ns: ${plan.anomaly.namespace}`);
+    if (plan.anomaly.pod) addTag(`pod: ${plan.anomaly.pod}`);
+    if (plan.anomaly.severity) addTag(`sev: ${plan.anomaly.severity}`);
+  } else if (plan.filters) {
+    if (plan.filters.namespace) addTag(`ns: ${plan.filters.namespace}`);
+    if (plan.filters.severity_bucket) addTag(`sev: ${plan.filters.severity_bucket}`);
+    if (plan.sample_count) addTag(`sample: ${plan.sample_count} lines`);
+  }
+  const steps = plan.steps || [];
+  addTag(`${steps.length} steps`);
+
+  // Summary Text
+  el('actionableSummary').textContent = plan.summary;
+
+  // Evidence Block (if anomaly)
+  const evidenceEl = el('actionableEvidence');
+  if (plan.anomaly?.evidence) {
+    evidenceEl.hidden = false;
+    const ev = { ...plan.anomaly.evidence };
+    const sampleMsgs = ev.sample_messages || [];
+    delete ev.sample_messages;
+    delete ev.ai_error;
+    let text = '';
+    if (sampleMsgs.length) {
+      text += `Sample messages:\n${sampleMsgs.map(m => '• ' + m).join('\n')}\n\n`;
+    }
+    if (Object.keys(ev).length) {
+      text += `Evidence: ${JSON.stringify(ev, null, 2)}`;
+    }
+    evidenceEl.textContent = text.trim();
+  } else {
+    evidenceEl.hidden = true;
+  }
+
+  // Steps Rendering
+  const stepsList = el('actionableStepsList');
+  stepsList.innerHTML = '';
+
+  let successCount = 0;
+
+  steps.forEach((step, index) => {
+    const stepState = state.actionable.stepStates.get(index) || { status: 'ready' };
+    if (stepState.status === 'success') successCount++;
+
+    const card = document.createElement('div');
+    card.className = `troubleshoot-step-card ${stepState.status === 'running' ? 'active-step' : ''}`;
+
+    // Header
+    const head = document.createElement('div');
+    head.className = 'step-card-header';
+
+    const titleGroup = document.createElement('div');
+    titleGroup.className = 'step-title-group';
+    titleGroup.innerHTML = `
+      <span class="step-index-badge">${index + 1}</span>
+      <span>${escapeHtml(step.title || `Step ${index + 1}`)}</span>
+    `;
+
+    const badges = document.createElement('div');
+    badges.className = 'step-badges';
+
+    const risk = step.risk || 'read-only';
+    const riskBadge = document.createElement('span');
+    riskBadge.className = `badge-risk badge-risk-${risk}`;
+    riskBadge.textContent = risk;
+
+    const statusBadge = document.createElement('span');
+    statusBadge.className = `badge-status badge-status-${stepState.status}`;
+    const statusLabels = { ready: 'Ready', running: 'Running…', success: 'Success', failed: 'Failed' };
+    statusBadge.textContent = statusLabels[stepState.status] || stepState.status;
+
+    badges.appendChild(riskBadge);
+    badges.appendChild(statusBadge);
+    head.appendChild(titleGroup);
+    head.appendChild(badges);
+    card.appendChild(head);
+
+    // Body
+    const body = document.createElement('div');
+    body.className = 'step-card-body';
+
+    // Explanation
+    if (step.explanation) {
+      const exp = document.createElement('div');
+      exp.className = 'step-explanation';
+      exp.innerHTML = `<span class="step-explanation-prefix">Checks:</span> ${escapeHtml(step.explanation)}`;
+      body.appendChild(exp);
+    }
+
+    // Command box
+    if (step.command) {
+      const cmdBox = document.createElement('div');
+      cmdBox.className = 'step-command-box';
+
+      const code = document.createElement('code');
+      code.className = 'step-command-code';
+      code.textContent = step.command;
+
+      const tools = document.createElement('div');
+      tools.className = 'step-command-tools';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.type = 'button';
+      copyBtn.className = 'ghost';
+      copyBtn.style.fontSize = '11px';
+      copyBtn.style.padding = '3px 8px';
+      copyBtn.textContent = 'Copy';
+      copyBtn.addEventListener('click', () => copyToClipboard(step.command, copyBtn));
+
+      const runBtn = document.createElement('button');
+      runBtn.type = 'button';
+      runBtn.className = `step-btn-run ${risk !== 'read-only' ? 'mutating' : ''}`;
+      runBtn.disabled = stepState.status === 'running';
+
+      if (stepState.status === 'running') {
+        runBtn.textContent = 'Running…';
+      } else if (stepState.status === 'success' || stepState.status === 'failed') {
+        runBtn.textContent = 'Re-run';
+      } else if (risk !== 'read-only') {
+        runBtn.textContent = 'Confirm & Run';
+      } else {
+        runBtn.textContent = 'Run Step';
+      }
+
+      runBtn.addEventListener('click', () => executeActionableStep(index));
+
+      tools.appendChild(copyBtn);
+      tools.appendChild(runBtn);
+      cmdBox.appendChild(code);
+      cmdBox.appendChild(tools);
+      body.appendChild(cmdBox);
+    }
+
+    // Output area
+    if (stepState.status !== 'ready') {
+      const outContainer = document.createElement('div');
+      outContainer.className = 'step-output-container';
+
+      const outHead = document.createElement('div');
+      outHead.className = 'step-output-head';
+
+      const outTitle = document.createElement('span');
+      outTitle.textContent = stepState.command || step.command || 'Output';
+
+      const outMeta = document.createElement('div');
+      outMeta.className = 'step-output-meta';
+
+      if (stepState.duration_ms !== undefined) {
+        outMeta.innerHTML += `<span>${stepState.duration_ms}ms</span>`;
+      }
+      if (stepState.exit_code !== undefined) {
+        const codeClass = stepState.exit_code === 0 ? 'color: var(--ai)' : 'color: var(--error)';
+        outMeta.innerHTML += `<span style="${codeClass}; font-weight: 600;">Exit ${stepState.exit_code}</span>`;
+      }
+
+      outHead.appendChild(outTitle);
+      outHead.appendChild(outMeta);
+      outContainer.appendChild(outHead);
+
+      const outBody = document.createElement('pre');
+      outBody.className = 'step-output-body';
+
+      if (stepState.status === 'running') {
+        outBody.textContent = 'Executing Kubernetes diagnostic action…';
+        outBody.classList.add('empty-output');
+      } else {
+        const text = [stepState.stdout, stepState.stderr, stepState.error].filter(Boolean).join('\n\n');
+        if (text) {
+          outBody.textContent = text;
+          if (stepState.exit_code !== 0 || stepState.error) {
+            outBody.classList.add('step-output-error');
+          }
+        } else {
+          outBody.textContent = '(Command completed with no output)';
+          outBody.classList.add('empty-output');
+        }
+      }
+
+      outContainer.appendChild(outBody);
+      body.appendChild(outContainer);
+    }
+
+    card.appendChild(body);
+    stepsList.appendChild(card);
+  });
+
+  // Progress summary
+  el('actionableStepsCount').textContent = `${successCount} of ${steps.length} steps completed`;
+}
+
+async function executeActionableStep(index, confirmed = false) {
+  const plan = state.actionable.plan;
+  if (!plan || !plan.steps || !plan.steps[index]) return;
+
+  const step = plan.steps[index];
+  const risk = step.risk || 'read-only';
+
+  if (!confirmed && risk !== 'read-only') {
+    state.actionable.pendingMutationIndex = index;
+    el('confirmModalCommand').textContent = step.command || '(structured state-modifying action)';
+    el('confirmModalText').textContent = `Step "${step.title}" is a mutating operation that may change cluster state. Do you want to proceed?`;
+    el('actionConfirmModal').showModal();
+    return;
+  }
+
+  state.actionable.stepStates.set(index, { status: 'running', command: step.command });
+  renderActionableWorkspace();
+
+  try {
+    const payload = {
+      command: step.command || '',
+      action: step.action ? step.action.action : undefined,
+      namespace: step.action ? step.action.namespace : undefined,
+      resource: step.action ? step.action.resource : undefined,
+      confirmed: confirmed,
+    };
+
+    const res = await fetchJson('/api/actions/execute', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+
+    if (res.requires_confirmation && !confirmed) {
+      state.actionable.pendingMutationIndex = index;
+      el('confirmModalCommand').textContent = res.command || step.command;
+      el('confirmModalText').textContent = res.message || 'Explicit confirmation required.';
+      el('actionConfirmModal').showModal();
+      state.actionable.stepStates.set(index, { status: 'ready' });
+      renderActionableWorkspace();
+      return;
+    }
+
+    const success = Boolean(res.success);
+    state.actionable.stepStates.set(index, {
+      status: success ? 'success' : 'failed',
+      exit_code: res.exit_code,
+      stdout: res.stdout || '',
+      stderr: res.stderr || '',
+      duration_ms: res.duration_ms || 0,
+      command: res.command || step.command,
+    });
+  } catch (err) {
+    state.actionable.stepStates.set(index, {
+      status: 'failed',
+      exit_code: -1,
+      stdout: '',
+      stderr: '',
+      error: `Execution error: ${err.message}`,
+      duration_ms: 0,
+      command: step.command,
+    });
+  }
+
+  renderActionableWorkspace();
+}
+
+function runNextActionableStep() {
+  const plan = state.actionable.plan;
+  if (!plan || !plan.steps) return;
+  for (let i = 0; i < plan.steps.length; i++) {
+    const st = state.actionable.stepStates.get(i);
+    if (!st || st.status !== 'success') {
+      executeActionableStep(i);
+      return;
+    }
+  }
+}
+
+function resetActionableSteps() {
+  state.actionable.stepStates.clear();
+  renderActionableWorkspace();
+}
 
 // ─── Data loading ────────────────────────────────────────────────────────────
 
@@ -856,6 +1308,61 @@ el('newRowsBanner').addEventListener('click', () => {
 });
 el('live').addEventListener('change', () => {
   if (el('live').checked) startTailPolling(); else stopTailPolling();
+});
+el('openInActionableBtn').addEventListener('click', () => {
+  switchTab('actionable');
+});
+
+el('actionableAnalyzeLogsBtn').addEventListener('click', async () => {
+  await runExplain();
+  switchTab('actionable');
+});
+
+el('actionableRefreshBtn').addEventListener('click', async () => {
+  const selVal = el('actionableSourceSelect').value;
+  if (selVal && selVal.startsWith('anomaly-')) {
+    const anomId = parseInt(selVal.replace('anomaly-', ''), 10);
+    const anom = state.anomalies.find((a) => a.id === anomId);
+    if (anom) openAnomalyInActionable(anom);
+  } else {
+    await runExplain();
+    switchTab('actionable');
+  }
+});
+
+el('actionableSourceSelect').addEventListener('change', () => {
+  const selVal = el('actionableSourceSelect').value;
+  if (selVal && selVal.startsWith('anomaly-')) {
+    const anomId = parseInt(selVal.replace('anomaly-', ''), 10);
+    const anom = state.anomalies.find((a) => a.id === anomId);
+    if (anom) openAnomalyInActionable(anom);
+  } else {
+    state.actionable.sourceType = 'logs';
+    state.actionable.anomalyId = null;
+    renderActionableWorkspace();
+  }
+});
+
+el('actionableRunNextBtn').addEventListener('click', () => {
+  runNextActionableStep();
+});
+
+el('actionableResetStepsBtn').addEventListener('click', () => {
+  resetActionableSteps();
+});
+
+el('confirmCancelBtn').addEventListener('click', () => {
+  el('actionConfirmModal').close();
+  state.actionable.pendingMutationIndex = null;
+});
+
+el('confirmExecuteBtn').addEventListener('click', () => {
+  el('actionConfirmModal').close();
+  const idx = state.actionable.pendingMutationIndex;
+  if (idx !== null && idx !== undefined) {
+    state.actionable.pendingMutationIndex = null;
+    executeActionableStep(idx, true);
+  }
 });
 
 init().catch((err) => {

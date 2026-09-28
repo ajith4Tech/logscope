@@ -281,10 +281,9 @@ def test_openrouter_summarize_anomaly_uses_supported_parameters(monkeypatch, cap
     monkeypatch.setattr("webapp.api.ai_summary.request.urlopen", fake_urlopen)
     result = summarize_anomaly(anomaly, cfg)
 
-    assert result == {
-        "summary": "Error spike concentrated in app namespace.",
-        "suggested_action": "Inspect recent deploys and upstream dependencies.",
-    }
+    assert result["summary"] == "Error spike concentrated in app namespace."
+    assert result["suggested_action"] == "Inspect recent deploys and upstream dependencies."
+    assert len(result["steps"]) == 1
     assert captured["url"] == "https://openrouter.ai/api/v1/chat/completions"
     assert captured["body"]["model"] == "qwen/qwen3.5-plus:free"
     assert captured["body"]["reasoning_effort"] == "medium"
@@ -472,10 +471,9 @@ def test_gemini_summarize_anomaly_uses_correct_headers(monkeypatch):
     monkeypatch.setattr("webapp.api.ai_summary.request.urlopen", fake_urlopen)
     result = summarize_anomaly(anomaly, cfg)
 
-    assert result == {
-        "summary": "15 connection timeouts to db-1 detected in app namespace.",
-        "suggested_action": "Check database db-1 health and network latency.",
-    }
+    assert result["summary"] == "15 connection timeouts to db-1 detected in app namespace."
+    assert result["suggested_action"] == "Check database db-1 health and network latency."
+    assert len(result["steps"]) == 1
     assert captured["url"] == "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
     # Auth header must be x-goog-api-key, NOT Authorization Bearer
     assert captured["headers"]["X-goog-api-key"] == "test-gemini-key"
@@ -558,9 +556,13 @@ def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
 
     def fake_summarize(payload, ai_cfg):
         call_count[0] += 1
-        return {"summary": "Test summary.", "suggested_action": "Take action."}
+        return {
+            "summary": "Test summary.",
+            "suggested_action": "Take action.",
+            "steps": [{"title": "Step 1", "command": "", "explanation": "Take action.", "risk": "read-only"}],
+        }
 
-    monkeypatch.setattr("webapp.api.server.summarize_anomaly", fake_summarize)
+    monkeypatch.setattr("webapp.api.server.explain_logs", fake_summarize)
 
     # Insert one log record so the explain has something to sample
     app.storage.conn.execute(

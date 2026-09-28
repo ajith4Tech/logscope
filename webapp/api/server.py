@@ -11,6 +11,7 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from .actions import SUPPORTED_ACTIONS, execute_action, parse_command_to_action
 from .ai_summary import explain_log_line, explain_logs, summarize_anomaly
 from .config import AppConfig, load_app_config
 from .ingest import S3Ingestor
@@ -122,6 +123,37 @@ class LogscopeHandler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
         app = self.server.app
+        if parsed.path == "/api/actions/execute":
+            body = self._read_body_json()
+            confirmed = bool(body.get("confirmed", False))
+            try:
+                res = execute_action(body, confirmed=confirmed)
+                self._send_json(res)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({"error": str(exc)}, status=500)
+            return
+        if parsed.path == "/api/actions/validate":
+            body = self._read_body_json()
+            cmd = str(body.get("command") or "").strip()
+            parsed_action = parse_command_to_action(cmd) if cmd else None
+            if parsed_action:
+                act = parsed_action["action"]
+                spec = SUPPORTED_ACTIONS.get(act, {})
+                self._send_json({
+                    "valid": True,
+                    "action": act,
+                    "risk": spec.get("risk", "read-only"),
+                    "is_mutating": spec.get("is_mutating", False),
+                    "parsed": parsed_action,
+                })
+            else:
+                self._send_json({
+                    "valid": False,
+                    "error": "Unsupported or unparseable command",
+                }, status=400)
+            return
         if parsed.path == "/api/explain":
             try:
                 result = app.api_explain(params)
@@ -249,13 +281,13 @@ class WebApp:
             cached = self._explain_cache.get(cache_key)
             if cached:
                 result, expiry = cached
-                if now < expiry:
+                if now < expiry and bool(result.get("steps")):
                     return {**result, "cached": True}
         data = self.storage.query_logs(flat, limit=_EXPLAIN_SAMPLE_SIZE, cursor=None, direction="desc")
         items = data.get("items") or []
         total_matching_exceeds_sample = bool(data.get("has_more"))
         if not items:
-            return {"summary": "No logs found matching the current filters.", "suggested_action": "", "sample_count": 0, "total_matching_exceeds_sample": False, "cached": False}
+            return {"summary": "No logs found matching the current filters.", "steps": [], "suggested_action": "", "sample_count": 0, "total_matching_exceeds_sample": False, "cached": False}
         sample = [
             {
                 "timestamp": item.get("timestamp"),
@@ -304,7 +336,7 @@ class WebApp:
             cached = self._explain_line_cache.get(record_id)
             if cached:
                 result, expiry = cached
-                if now < expiry:
+                if now < expiry and bool(result.get("steps")):
                     return {**result, "cached": True}
 
         record = self.storage.get_record_by_id(record_id)

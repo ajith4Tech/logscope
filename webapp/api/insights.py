@@ -81,10 +81,19 @@ class AnomalyStore:
                     status TEXT NOT NULL DEFAULT 'new',
                     ai_summary TEXT,
                     ai_suggested_action TEXT,
+                    ai_steps TEXT,
                     ai_summarized_at TEXT,
                     UNIQUE(type, namespace, pod, rule_key, detected_day)
                 )
                 """
+            )
+            cols = [info[1] for info in cur.execute("PRAGMA table_info(anomalies)").fetchall()]
+            if "ai_steps" not in cols:
+                cur.execute("ALTER TABLE anomalies ADD COLUMN ai_steps TEXT")
+            # Regenerate existing cached AI summaries that lack structured steps
+            cur.execute(
+                "UPDATE anomalies SET ai_summarized_at = NULL "
+                "WHERE ai_steps IS NULL AND ai_summary IS NOT NULL AND status = 'new'"
             )
             cur.execute(
                 "CREATE INDEX IF NOT EXISTS idx_records_ts_ns ON records(timestamp, namespace)"
@@ -140,11 +149,18 @@ class AnomalyStore:
             )
             self._conn.commit()
 
-    def save_ai_summary(self, anomaly_id: int, summary: str, action: str) -> None:
+    def save_ai_summary(
+        self,
+        anomaly_id: int,
+        summary: str,
+        action: str,
+        steps: list[dict[str, Any]] | None = None,
+    ) -> None:
+        steps_json = json.dumps(steps, separators=(",", ":")) if steps is not None else None
         with self._lock:
             self._conn.execute(
-                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_summarized_at=? WHERE id=?",
-                (summary, action, _utc_now_iso(), anomaly_id),
+                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_steps=?, ai_summarized_at=? WHERE id=?",
+                (summary, action, steps_json, _utc_now_iso(), anomaly_id),
             )
             self._conn.commit()
 
@@ -172,6 +188,14 @@ class AnomalyStore:
         items = [dict(row) for row in rows[:limit]]
         for item in items:
             item["evidence"] = json.loads(item["evidence"])
+            raw_steps = item.get("ai_steps")
+            if raw_steps:
+                try:
+                    item["ai_steps"] = json.loads(raw_steps)
+                except Exception:
+                    item["ai_steps"] = []
+            else:
+                item["ai_steps"] = []
         return {"items": items, "has_more": has_more}
 
     _VALID_STATUSES = frozenset({"new", "reviewed", "dismissed"})
@@ -468,7 +492,10 @@ class InsightsJob:
                 continue
             if result:
                 self.store.save_ai_summary(
-                    int(anomaly["id"]), result["summary"], result["suggested_action"]
+                    int(anomaly["id"]),
+                    result["summary"],
+                    result.get("suggested_action", ""),
+                    result.get("steps"),
                 )
                 count += 1
         return count
