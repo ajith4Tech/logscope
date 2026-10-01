@@ -11,13 +11,14 @@
   <div class="shell">
     <header class="hero">
       <div>
-        <div class="eyebrow">Logscope S3 viewer</div>
-        <h1>S3 log viewer.</h1>
-        <p class="lede">Historical browsing and near-live polling from the same S3-backed store. The tail view updates when new objects land, not as a socket stream.</p>
+        <div class="eyebrow">LOGSCOPE</div>
+        <h1>Log viewer.</h1>
+<p class="lede">
+  Browse historical logs, monitor new events, and investigate anomalies across your cluster.
+</p>
         <div class="hero-chips">
           <span class="chip chip-accent" id="defaultWindowChip">Today</span>
           <span class="chip">Polling every 10s</span>
-          <span class="chip">S3-backed only</span>
         </div>
       </div>
       <div class="status-card">
@@ -31,7 +32,7 @@
       <aside class="filters panel">
         <div class="panel-head">
           <h2>Filters</h2>
-          <button id="securityShortcut" class="ghost">Security only</button>
+          <button id="securityShortcut" class="ghost">Security</button>
         </div>
         <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
         <label>Scope <select id="scope"></select></label>
@@ -54,14 +55,14 @@
         <!-- Tab bar -->
         <nav class="tab-bar" role="tablist" aria-label="Main views">
           <button id="tabLogs" class="tab active" role="tab" aria-selected="true" aria-controls="panelLogs">
-            <span class="tab-icon">▤</span> Logs
+            <span class="tab-icon"></span> Logs
           </button>
           <button id="tabInsights" class="tab" role="tab" aria-selected="false" aria-controls="panelInsights">
-            <span class="tab-icon">◈</span> Insights
+            <span class="tab-icon"></span> Insights
             <span id="insightsBadge" class="tab-badge" hidden></span>
           </button>
           <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable">
-            <span class="tab-icon">⚡</span> Actionable
+            <span class="tab-icon"></span> Actionable
             <span id="actionableBadge" class="tab-badge" hidden></span>
           </button>
         </nav>
@@ -105,7 +106,7 @@
                 <span id="explainCachedBadge" class="cached-badge" hidden>cached</span>
               </div>
               <div class="explain-head-actions">
-                <button id="openInActionableBtn" class="ghost explain-open-actionable" title="Open troubleshooting workspace with this plan">⚡ Troubleshoot in Actionable</button>
+                <button id="openInActionableBtn" class="ghost explain-open-actionable" title="Open troubleshooting workspace with this plan">Troubleshoot in Actionable</button>
                 <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
               </div>
             </div>
@@ -118,7 +119,21 @@
           <div class="table-head">
             <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
           </div>
-          <div id="rows" class="rows"></div>
+          <div id="logListHost" class="log-list-host">
+            <div id="rows" class="rows"></div>
+            <div id="olderLogsOverlay" class="older-log-overlay" hidden aria-label="Older logs" role="dialog" aria-modal="false">
+              <div class="older-log-panel" role="document">
+                <div class="older-log-head">
+                  <h3>Older logs</h3>
+                  <button id="olderLogsClose" type="button" class="ghost older-log-close" aria-label="Close older logs">✕</button>
+                </div>
+                <div id="olderLogsList" class="older-log-list" aria-live="polite"></div>
+                <div class="older-log-footer">
+                  <button id="olderLogsLoadMore" type="button" class="ghost">Load older</button>
+                </div>
+              </div>
+            </div>
+          </div>
           <div class="pager">
             <button id="loadMore">Load older</button>
           </div>
@@ -165,9 +180,10 @@
 
           <!-- Empty or prompt state -->
           <div id="actionableEmpty" class="empty-state">
-            <div class="empty-state-title">No Active Troubleshooting Plan</div>
-            <div class="empty-state-sub">Select an anomaly from Insights or analyze your currently filtered logs to generate an actionable investigation plan.</div>
-            <button id="actionableAnalyzeLogsBtn" class="primary" style="margin-top: 1rem;">⚡ Analyze Filtered Logs</button>
+            <div class="empty-state-title">No Active Investigation</div>
+            <div class="empty-state-sub">
+              Select an anomaly from Insights or analyze the current logs to start an investigation.
+            </div>
           </div>
 
           <!-- Active Workspace container -->
@@ -176,7 +192,6 @@
             <div class="troubleshoot-card">
               <div class="troubleshoot-card-head">
                 <div class="troubleshoot-card-title">
-                  <span class="explain-icon">✦</span>
                   <span id="actionableSummaryTitle">Issue Summary</span>
                 </div>
                 <div id="actionableTags" class="troubleshoot-tags"></div>
@@ -194,7 +209,9 @@
                 </div>
                 <div class="actionable-steps-tools">
                   <button id="actionableRunNextBtn" class="primary actionable-next-btn">Run Next Step</button>
-                  <button id="actionableResetStepsBtn" class="ghost">Reset Statuses</button>
+                  <button id="actionableResetStepsBtn" class="ghost">
+  Reset Steps
+</button>
                 </div>
               </div>
 
@@ -211,18 +228,19 @@
   <dialog id="actionConfirmModal" class="confirm-modal">
     <form method="dialog" class="confirm-modal-box">
       <div class="confirm-modal-head">
-        <span class="confirm-modal-icon">⚠️</span>
-        <h3>Confirm State Mutation</h3>
+        <h3>Confirm action</h3>
       </div>
       <p id="confirmModalText" class="confirm-modal-text">
-        This action modifies cluster state (e.g. restart or rollback). Are you sure you want to execute it?
-      </p>
+  This action will modify the cluster state. Review the command before continuing.
+</p>
       <div class="confirm-modal-command">
         <code id="confirmModalCommand"></code>
       </div>
       <div class="confirm-modal-actions">
         <button id="confirmCancelBtn" type="button" class="ghost">Cancel</button>
-        <button id="confirmExecuteBtn" type="button" class="destructive-btn">Execute Action</button>
+       <button id="confirmExecuteBtn" type="button" class="destructive-btn">
+  Execute
+</button>
       </div>
     </form>
   </dialog>
@@ -259,7 +277,7 @@
           <div class="anomaly-time"></div>
         </div>
         <div class="anomaly-col anomaly-col-actions">
-          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab">⚡ Troubleshoot</button>
+          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab"> Troubleshoot</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
         </div>

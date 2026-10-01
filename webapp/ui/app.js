@@ -1,5 +1,7 @@
 const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 minutes
 const EXPLAIN_COOLDOWN_MS = 12000; // client-side cooldown after clicking Explain
+const CURRENT_LOG_LIMIT = 7;
+const OLDER_LOG_LIMIT = 50;
 
 const state = {
   filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
@@ -7,6 +9,12 @@ const state = {
   items: [],
   nextCursor: null,
   hasMore: false,
+  olderItems: [],
+  olderCursor: null,
+  olderHasMore: false,
+  olderLoading: false,
+  olderRequestId: 0,
+  olderOverlayOpen: false,
   liveCursor: null,
   liveTimer: null,
   lastUpdatedAt: null,
@@ -17,6 +25,11 @@ const state = {
   aiConfigured: false,
   explainCooldownUntil: 0,
   anomalies: [],
+  insightsLoaded: false,
+  insightsLoading: false,
+  insightsRequestId: 0,
+  logsRequestId: 0,
+  tailRequestId: 0,
   expandedAnomalies: new Set(),
   activeTab: 'logs',
   lineExplainState: new Map(), // rowId -> { status: 'idle'|'loading'|'done'|'error', summary, action, error }
@@ -53,8 +66,8 @@ function switchTab(name) {
   el('panelInsights').hidden = !isInsights;
   el('panelActionable').hidden = !isActionable;
 
-  if (isInsights && !state.anomalies.length) {
-    loadInsights().catch((err) => { el('health').textContent = err.message; });
+  if (isInsights && !state.insightsLoaded && !state.insightsLoading) {
+    loadInsights().catch(() => {});
   }
   if (isActionable) {
     updateActionableSourceOptions();
@@ -125,22 +138,37 @@ function queryFromFilters(extra = {}) {
 }
 
 async function fetchJson(url, options = {}) {
-  const res = await fetch(url, options);
+  let res;
+  try {
+    res = await fetch(url, options);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(`Network error: ${msg}`);
+  }
+
   if (!res.ok) {
     let msg = `${res.status} ${res.statusText}`;
     try {
       const data = await res.json();
-      if (data && data.error) {
+      if (data && typeof data.error === 'string' && data.error) {
         msg = data.error;
+      } else if (data && typeof data.message === 'string' && data.message) {
+        msg = data.message;
       }
     } catch (_) {}
     throw new Error(msg);
   }
+
   return res.json();
 }
 
 function optionList(items) {
-  return ['<option value="">All</option>'].concat(items.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.value)} (${item.count})</option>`)).join('');
+  return ['<option value="">All</option>'].concat(items.map((item) => {
+    const value = escapeHtml(item.value ?? '');
+    const count = Number(item.count ?? 0);
+    const safeCount = Number.isFinite(count) ? count : 0;
+    return `<option value="${value}">${value} (${safeCount})</option>`;
+  })).join('');
 }
 
 function escapeHtml(value) {
@@ -202,7 +230,10 @@ function buildCombobox(inputId, facetKey) {
     const parts = ['<button type="button" class="combobox-option" data-value="">All</button>'];
     for (const item of values) {
       const selected = item.value === input.value ? ' selected' : '';
-      parts.push(`<button type="button" class="combobox-option${selected}" data-value="${escapeHtml(item.value)}">${escapeHtml(item.value)} <span class="combobox-count">${item.count}</span></button>`);
+      const value = escapeHtml(item.value ?? '');
+      const count = Number(item.count ?? 0);
+      const safeCount = Number.isFinite(count) ? String(count) : '0';
+      parts.push(`<button type="button" class="combobox-option${selected}" data-value="${value}">${value} <span class="combobox-count">${safeCount}</span></button>`);
     }
     if (!values.length) parts.push('<div class="combobox-empty">No matches</div>');
     list.innerHTML = parts.join('');
@@ -287,6 +318,10 @@ function rowMarkup(item) {
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
   messageButton.title = 'Click row to expand full details';
+  if (state.aiConfigured) {
+    const explainBlock = lineExplainMarkup(String(item.id), item);
+    node.appendChild(explainBlock);
+  }
   return node;
 }
 
@@ -308,7 +343,7 @@ function addDetailBlock(wrap, label, text) {
 
 function lineExplainMarkup(rowId, item) {
   const box = document.createElement('div');
-  box.className = 'detail-block line-explain';
+  box.className = 'line-explain-row';
 
   const lineState = state.lineExplainState.get(rowId) || { status: 'idle' };
 
@@ -319,6 +354,7 @@ function lineExplainMarkup(rowId, item) {
   btn.disabled = lineState.status === 'loading';
   btn.addEventListener('click', (ev) => {
     ev.stopPropagation();
+    if (lineState.status === 'loading') return;
     explainLine(rowId, item);
   });
   box.appendChild(btn);
@@ -399,9 +435,6 @@ function detailMarkup(item, rowId) {
   if (item.output_fields && Object.keys(item.output_fields).length) {
     addDetailBlock(wrap, 'output_fields', JSON.stringify(item.output_fields, null, 2));
   }
-  if (state.aiConfigured) {
-    wrap.appendChild(lineExplainMarkup(rowId, item));
-  }
   return wrap;
 }
 
@@ -435,10 +468,13 @@ function renderRows(items, append = false) {
     return;
   }
   let collapsed = 0;
-  for (const group of buildGroups(items)) {
+  const visible = items.slice(0, CURRENT_LOG_LIMIT);
+  for (const group of buildGroups(visible)) {
     const representative = group.items[0];
     collapsed += group.items.length - 1;
     const node = rowMarkup(representative);
+    const rowId = String(representative.id);
+    node.dataset.rowId = rowId;
     if (group.items.length > 1) {
       const badge = node.querySelector('.badge');
       const count = document.createElement('span');
@@ -449,28 +485,35 @@ function renderRows(items, append = false) {
       node.classList.add('grouped');
       node.dataset.groupKey = groupKeyOf(representative);
       if (state.expandedGroups.has(node.dataset.groupKey)) {
+        node.classList.add('expanded');
         node.appendChild(timestampsMarkup(group));
       }
     }
-    const rowId = String(representative.id);
-    node.dataset.rowId = rowId;
     if (state.expandedRows.has(rowId)) {
       node.classList.add('expanded');
       node.appendChild(detailMarkup(representative, rowId));
     }
     node.addEventListener('click', () => {
-      if (group.items.length > 1 && !state.expandedRows.has(rowId)) {
+      if (group.items.length > 1) {
         const key = node.dataset.groupKey;
-        if (state.expandedGroups.has(key)) state.expandedGroups.delete(key);
-        else state.expandedGroups.add(key);
+        if (state.expandedRows.has(rowId)) {
+          state.expandedRows.delete(rowId);
+        }
+        if (state.expandedGroups.has(key)) {
+          state.expandedGroups.delete(key);
+        } else {
+          state.expandedGroups.add(key);
+        }
+      } else if (state.expandedRows.has(rowId)) {
+        state.expandedRows.delete(rowId);
+      } else {
+        state.expandedRows.add(rowId);
       }
-      if (state.expandedRows.has(rowId)) state.expandedRows.delete(rowId);
-      else state.expandedRows.add(rowId);
       renderAll();
     });
     rows.appendChild(node);
   }
-  const total = append ? state.items.length : items.length;
+  const total = append ? state.items.length : visible.length;
   const groupedNote = collapsed > 0 ? ` · ${collapsed} collapsed` : '';
   el('resultSummary').textContent = `${total} visible lines${groupedNote}`;
 }
@@ -497,7 +540,9 @@ function renderAnomalies() {
   const container = el('anomalyRows');
   container.innerHTML = '';
   const { anomalies } = state;
-  el('insightsEmpty').hidden = anomalies.length > 0;
+  const emptyEl = el('insightsEmpty');
+  emptyEl.textContent = 'No anomalies found for the selected filter.';
+  emptyEl.hidden = anomalies.length > 0;
   if (!anomalies.length) return;
 
   for (const anomaly of anomalies) {
@@ -636,22 +681,50 @@ async function patchAnomalyStatus(id, status, rowNode) {
   }
 }
 
+function showInsightsError(message) {
+  const emptyEl = el('insightsEmpty');
+  const container = el('anomalyRows');
+  container.innerHTML = '';
+  emptyEl.textContent = message;
+  emptyEl.hidden = false;
+}
+
 async function loadInsights() {
+  if (state.insightsLoading) return;
+
+  const requestId = ++state.insightsRequestId;
+  state.insightsLoading = true;
+  state.insightsLoaded = false;
   const statusValue = el('insightsStatusFilter').value;
   const params = new URLSearchParams();
   if (statusValue) params.set('status', statusValue);
   params.set('limit', '200');
-  const data = await fetchJson(`/api/anomalies?${params.toString()}`);
-  state.anomalies = data.items || [];
-  const newCount = state.anomalies.filter((a) => a.status === 'new').length;
-  const badge = el('insightsBadge');
-  if (newCount > 0) {
-    badge.textContent = String(newCount);
-    badge.hidden = false;
-  } else {
+
+  try {
+    const data = await fetchJson(`/api/anomalies?${params.toString()}`);
+    if (requestId !== state.insightsRequestId) return;
+    state.anomalies = data.items || [];
+    state.insightsLoaded = true;
+    const newCount = state.anomalies.filter((a) => a.status === 'new').length;
+    const badge = el('insightsBadge');
+    if (newCount > 0) {
+      badge.textContent = String(newCount);
+      badge.hidden = false;
+    } else {
+      badge.hidden = true;
+    }
+    renderAnomalies();
+  } catch (err) {
+    if (requestId !== state.insightsRequestId) return;
+    state.anomalies = [];
+    const badge = el('insightsBadge');
     badge.hidden = true;
+    showInsightsError(`Failed to load anomalies: ${err.message}`);
+  } finally {
+    if (requestId === state.insightsRequestId) {
+      state.insightsLoading = false;
+    }
   }
-  renderAnomalies();
 }
 
 // ─── Explain these logs (bulk, filtered view) ────────────────────────────────
@@ -911,10 +984,15 @@ function renderActionableWorkspace() {
 
     const titleGroup = document.createElement('div');
     titleGroup.className = 'step-title-group';
-    titleGroup.innerHTML = `
-      <span class="step-index-badge">${index + 1}</span>
-      <span>${escapeHtml(step.title || `Step ${index + 1}`)}</span>
-    `;
+
+    const indexBadge = document.createElement('span');
+    indexBadge.className = 'step-index-badge';
+    indexBadge.textContent = String(index + 1);
+    titleGroup.appendChild(indexBadge);
+
+    const titleText = document.createElement('span');
+    titleText.textContent = step.title || `Step ${index + 1}`;
+    titleGroup.appendChild(titleText);
 
     const badges = document.createElement('div');
     badges.className = 'step-badges';
@@ -943,7 +1021,16 @@ function renderActionableWorkspace() {
     if (step.explanation) {
       const exp = document.createElement('div');
       exp.className = 'step-explanation';
-      exp.innerHTML = `<span class="step-explanation-prefix">Checks:</span> ${escapeHtml(step.explanation)}`;
+
+      const prefix = document.createElement('span');
+      prefix.className = 'step-explanation-prefix';
+      prefix.textContent = 'Checks:';
+      exp.appendChild(prefix);
+
+      const text = document.createElement('span');
+      text.textContent = ` ${step.explanation}`;
+      exp.appendChild(text);
+
       body.appendChild(exp);
     }
 
@@ -1006,11 +1093,16 @@ function renderActionableWorkspace() {
       outMeta.className = 'step-output-meta';
 
       if (stepState.duration_ms !== undefined) {
-        outMeta.innerHTML += `<span>${stepState.duration_ms}ms</span>`;
+        const duration = document.createElement('span');
+        duration.textContent = `${stepState.duration_ms}ms`;
+        outMeta.appendChild(duration);
       }
       if (stepState.exit_code !== undefined) {
-        const codeClass = stepState.exit_code === 0 ? 'color: var(--ai)' : 'color: var(--error)';
-        outMeta.innerHTML += `<span style="${codeClass}; font-weight: 600;">Exit ${stepState.exit_code}</span>`;
+        const exitCode = document.createElement('span');
+        exitCode.style.color = stepState.exit_code === 0 ? 'var(--ai)' : 'var(--error)';
+        exitCode.style.fontWeight = '600';
+        exitCode.textContent = `Exit ${stepState.exit_code}`;
+        outMeta.appendChild(exitCode);
       }
 
       outHead.appendChild(outTitle);
@@ -1151,23 +1243,168 @@ function encodeCursor(item) {
   return btoa(JSON.stringify({ ts: item.timestamp, id: item.id })).replaceAll('=', '').replaceAll('+', '-').replaceAll('/', '_');
 }
 
+function resetOlderLogsState() {
+  state.olderItems = [];
+  state.olderCursor = null;
+  state.olderHasMore = false;
+  state.olderLoading = false;
+  state.olderRequestId += 1;
+  closeOlderLogsOverlay();
+  const loadMore = el('loadMore');
+  if (loadMore) {
+    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
+    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
+  }
+}
+
+function openOlderLogsOverlay(explicitUserAction = false) {
+  if (!explicitUserAction) {
+    closeOlderLogsOverlay();
+    return;
+  }
+  const hasOlder = Boolean(state.nextCursor || state.olderCursor || state.olderItems.length);
+  if (!hasOlder) {
+    closeOlderLogsOverlay();
+    return;
+  }
+  state.olderOverlayOpen = true;
+  const overlay = el('olderLogsOverlay');
+  if (overlay) {
+    overlay.hidden = false;
+    overlay.style.display = 'flex';
+  }
+  if (!state.olderItems.length) {
+    loadOlderLogsPage().catch((err) => {
+      el('health').textContent = err.message;
+    });
+  } else {
+    renderOlderLogs();
+  }
+}
+
+function closeOlderLogsOverlay() {
+  state.olderOverlayOpen = false;
+  const overlay = el('olderLogsOverlay');
+  if (overlay) {
+    overlay.hidden = true;
+    overlay.style.display = 'none';
+  }
+}
+
+function ensureOlderLogsClosed() {
+  closeOlderLogsOverlay();
+  const olderLoadMore = el('olderLogsLoadMore');
+  if (olderLoadMore) {
+    olderLoadMore.disabled = true;
+  }
+}
+
+function handleOlderOverlayOutsideClick(event) {
+  const overlay = el('olderLogsOverlay');
+  if (!overlay || overlay.hidden) return;
+  if (event.target === overlay) {
+    closeOlderLogsOverlay();
+  }
+}
+
+async function loadOlderLogsPage() {
+  if (state.olderLoading) return;
+  const cursor = state.olderCursor || state.nextCursor;
+  if (!cursor && !state.olderItems.length) {
+    closeOlderLogsOverlay();
+    return;
+  }
+
+  const requestId = ++state.olderRequestId;
+  state.olderLoading = true;
+  renderOlderLogs();
+
+  try {
+    const params = new URLSearchParams(queryFromFilters({ limit: String(OLDER_LOG_LIMIT), cursor }));
+    const data = await fetchJson(`/api/logs?${params.toString()}`);
+    if (requestId !== state.olderRequestId) return;
+
+    const items = Array.isArray(data.items) ? data.items : [];
+    if (items.length) {
+      state.olderItems = state.olderItems.concat(items);
+    }
+    state.olderCursor = data.next_cursor || null;
+    state.olderHasMore = Boolean(data.has_more);
+    if (!state.olderCursor && !state.olderHasMore && state.olderItems.length) {
+      state.nextCursor = null;
+    }
+  } catch (err) {
+    if (requestId === state.olderRequestId) {
+      closeOlderLogsOverlay();
+      el('health').textContent = err.message;
+    }
+    return;
+  } finally {
+    if (requestId === state.olderRequestId) {
+      state.olderLoading = false;
+      renderOlderLogs();
+    }
+  }
+}
+
+function renderOlderLogs() {
+  const container = el('olderLogsList');
+  if (!container) return;
+  container.innerHTML = '';
+
+  if (!state.olderItems.length) {
+    container.innerHTML = '<div class="empty-state">No older logs available for this filter.</div>';
+  } else {
+    for (const item of state.olderItems) {
+      const node = rowMarkup(item);
+      node.classList.add('older-log-row');
+      if (state.expandedRows.has(String(item.id))) {
+        node.classList.add('expanded');
+        node.appendChild(detailMarkup(item, String(item.id)));
+      }
+      container.appendChild(node);
+    }
+  }
+
+  const olderLoadMore = el('olderLogsLoadMore');
+  if (olderLoadMore) {
+    const hasMore = state.olderHasMore || Boolean(state.nextCursor && !state.olderItems.length);
+    olderLoadMore.disabled = state.olderLoading || !hasMore;
+    olderLoadMore.hidden = !hasMore && !state.olderItems.length;
+    olderLoadMore.textContent = state.olderLoading ? 'Loading…' : (hasMore ? 'Load older' : 'No more older logs');
+  }
+}
+
 async function loadLogs(reset = true) {
-  const params = new URLSearchParams(queryFromFilters({ limit: '200' }));
+  const requestId = ++state.logsRequestId;
+  const params = new URLSearchParams(queryFromFilters({ limit: String(CURRENT_LOG_LIMIT) }));
   if (!reset && state.nextCursor) params.set('cursor', state.nextCursor);
   const data = await fetchJson(`/api/logs?${params.toString()}`);
-  state.nextCursor = data.next_cursor;
+  if (requestId !== state.logsRequestId) return;
+  state.nextCursor = data.next_cursor || null;
   state.hasMore = Boolean(data.has_more);
   state.lastUpdatedAt = data.last_updated_at;
-  if (reset) state.items = data.items; else state.items = state.items.concat(data.items);
+  if (reset) {
+    state.items = Array.isArray(data.items) ? data.items.slice(0, CURRENT_LOG_LIMIT) : [];
+    state.olderItems = [];
+    state.olderCursor = null;
+    state.olderHasMore = false;
+    closeOlderLogsOverlay();
+  } else {
+    state.items = (Array.isArray(data.items) ? data.items : []).slice(0, CURRENT_LOG_LIMIT);
+  }
   state.expandedRows.clear();
   state.expandedGroups.clear();
   renderAll();
+  renderOlderLogs();
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
   const loadMore = el('loadMore');
-  loadMore.disabled = !state.hasMore;
-  loadMore.textContent = state.hasMore ? 'Load older' : 'End of results';
+  if (loadMore) {
+    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
+    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
+  }
   if (!el('health').textContent || !el('health').textContent.startsWith('Ingestion error')) {
-    el('health').textContent = data.has_more ? 'More rows available' : 'End of current page';
+    el('health').textContent = state.hasMore ? 'More older rows available' : 'End of current page';
   }
   if (reset && el('live').checked && state.items.length) state.liveCursor = encodeCursor(state.items[0]);
 }
@@ -1182,10 +1419,12 @@ function flashNewRows(count) {
 
 async function pollTail() {
   if (!el('live').checked || !state.liveCursor) return;
+  const requestId = ++state.tailRequestId;
   const params = new URLSearchParams(queryFromFilters({ limit: '200', cursor: state.liveCursor }));
   const data = await fetchJson(`/api/tail?${params.toString()}`);
+  if (requestId !== state.tailRequestId || !el('live').checked) return;
   if (data.items.length) {
-    state.items = data.items.concat(state.items);
+    state.items = data.items.concat(state.items).slice(0, CURRENT_LOG_LIMIT);
     state.liveCursor = encodeCursor(data.items[data.items.length - 1]);
     state.expandedRows.clear();
     state.expandedGroups.clear();
@@ -1202,6 +1441,7 @@ function syncFiltersFromUi() {
 
 function startTailPolling() {
   stopTailPolling();
+  state.tailRequestId += 1;
   state.liveTimer = window.setInterval(() => {
     pollTail().catch((err) => {
       el('health').textContent = err.message;
@@ -1213,11 +1453,13 @@ function startTailPolling() {
 function stopTailPolling() {
   if (state.liveTimer) window.clearInterval(state.liveTimer);
   state.liveTimer = null;
+  state.tailRequestId += 1;
 }
 
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
+  ensureOlderLogsClosed();
   setDefaultDateRange();
   buildCombobox('pod', 'pod');
   buildCombobox('container', 'container');
@@ -1241,14 +1483,48 @@ async function init() {
 
 el('apply').addEventListener('click', async () => {
   syncFiltersFromUi();
+  resetOlderLogsState();
   await loadLogs(true);
 });
-el('loadMore').addEventListener('click', async () => {
-  await loadLogs(false);
+el('loadMore').addEventListener('click', () => {
+  openOlderLogsOverlay(true);
+});
+
+const olderLogsLoadMore = el('olderLogsLoadMore');
+if (olderLogsLoadMore) {
+  olderLogsLoadMore.addEventListener('click', () => {
+    loadOlderLogsPage().catch((err) => {
+      el('health').textContent = err.message;
+    });
+  });
+}
+
+const olderLogsClose = el('olderLogsClose');
+if (olderLogsClose) {
+  olderLogsClose.addEventListener('click', (event) => {
+    event.stopPropagation();
+    closeOlderLogsOverlay();
+  });
+}
+
+const olderLogsOverlay = el('olderLogsOverlay');
+if (olderLogsOverlay) {
+  olderLogsOverlay.addEventListener('click', (event) => {
+    if (event.target === olderLogsOverlay) {
+      handleOlderOverlayOutsideClick(event);
+    }
+  });
+}
+
+window.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && state.olderOverlayOpen) {
+    closeOlderLogsOverlay();
+  }
 });
 el('todayShortcut').addEventListener('click', async () => {
   setDefaultDateRange();
   syncFiltersFromUi();
+  resetOlderLogsState();
   await loadLogs(true);
 });
 el('clearFilters').addEventListener('click', async () => {
@@ -1261,11 +1537,13 @@ el('clearFilters').addEventListener('click', async () => {
   el('rangePreset').value = 'today';
   setDefaultDateRange();
   syncFiltersFromUi();
+  resetOlderLogsState();
   await loadLogs(true);
 });
 el('securityShortcut').addEventListener('click', async () => {
   el('scope').value = 'security';
   syncFiltersFromUi();
+  resetOlderLogsState();
   await loadLogs(true);
 });
 el('rangePreset').addEventListener('change', async () => {
@@ -1273,6 +1551,7 @@ el('rangePreset').addEventListener('change', async () => {
   if (!preset) return;
   preset.apply();
   syncFiltersFromUi();
+  resetOlderLogsState();
   await loadLogs(true);
 });
 el('groupByRule').addEventListener('change', async () => {
@@ -1300,6 +1579,7 @@ document.addEventListener('click', async (event) => {
     el('start').value = `${start.getFullYear()}-${pad(start.getMonth() + 1)}-${pad(start.getDate())}T00:00`;
     el('end').value = `${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())}T23:59`;
     syncFiltersFromUi();
+    resetOlderLogsState();
     await loadLogs(true);
   }
 });
@@ -1313,10 +1593,13 @@ el('openInActionableBtn').addEventListener('click', () => {
   switchTab('actionable');
 });
 
-el('actionableAnalyzeLogsBtn').addEventListener('click', async () => {
-  await runExplain();
-  switchTab('actionable');
-});
+const actionableAnalyzeLogsBtn = el('actionableAnalyzeLogsBtn');
+if (actionableAnalyzeLogsBtn) {
+  actionableAnalyzeLogsBtn.addEventListener('click', async () => {
+    await runExplain();
+    switchTab('actionable');
+  });
+}
 
 el('actionableRefreshBtn').addEventListener('click', async () => {
   const selVal = el('actionableSourceSelect').value;
@@ -1328,6 +1611,10 @@ el('actionableRefreshBtn').addEventListener('click', async () => {
     await runExplain();
     switchTab('actionable');
   }
+});
+
+init().catch((err) => {
+  el('health').textContent = err.message;
 });
 
 el('actionableSourceSelect').addEventListener('change', () => {
