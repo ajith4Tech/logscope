@@ -271,6 +271,138 @@ class LogStorage:
             ).fetchall()
             out[field] = [{"value": row[0], "count": int(row[1])} for row in rows]
         return out
+
+    def query_dashboard(self, params: dict[str, Any]) -> dict[str, Any]:
+        where_sql, args = self._build_filters(params)
+        error_where_sql, error_args = self._build_filters({**params, "severity_bucket": "error"})
+
+        summary_row = self._conn.execute(
+            f"""
+            SELECT
+                COUNT(*) AS total_logs,
+                SUM(CASE WHEN severity_bucket = 'error' THEN 1 ELSE 0 END) AS error_count,
+                SUM(CASE WHEN severity_bucket = 'warning' THEN 1 ELSE 0 END) AS warning_count,
+                SUM(CASE WHEN severity_bucket = 'info' THEN 1 ELSE 0 END) AS info_count,
+                SUM(CASE WHEN severity_bucket = 'debug' THEN 1 ELSE 0 END) AS debug_count,
+                SUM(CASE WHEN severity_bucket = 'metrics' THEN 1 ELSE 0 END) AS metrics_count,
+                SUM(CASE WHEN scope = 'security' THEN 1 ELSE 0 END) AS security_count,
+                COUNT(DISTINCT namespace) AS unique_namespaces,
+                COUNT(DISTINCT pod) AS unique_pods
+            FROM records
+            WHERE {where_sql}
+            """,
+            args,
+        ).fetchone()
+
+        severity_rows = self._conn.execute(
+            f"""
+            SELECT severity_bucket AS value, COUNT(*) AS count
+            FROM records
+            WHERE {where_sql}
+            GROUP BY severity_bucket
+            ORDER BY count DESC, value ASC
+            """,
+            args,
+        ).fetchall()
+
+        namespace_rows = self._conn.execute(
+            f"""
+            SELECT namespace AS value, COUNT(*) AS count
+            FROM records
+            WHERE {where_sql}
+            GROUP BY namespace
+            ORDER BY count DESC, value ASC
+            """,
+            args,
+        ).fetchall()
+
+        error_namespace_rows = self._conn.execute(
+            f"""
+            SELECT namespace AS value, COUNT(*) AS count
+            FROM records
+            WHERE {error_where_sql}
+            GROUP BY namespace
+            ORDER BY count DESC, value ASC
+            """,
+            error_args,
+        ).fetchall()
+
+        error_pod_rows = self._conn.execute(
+            f"""
+            SELECT pod AS value, COUNT(*) AS count
+            FROM records
+            WHERE {error_where_sql}
+            GROUP BY pod
+            ORDER BY count DESC, value ASC
+            """,
+            error_args,
+        ).fetchall()
+
+        top_error_rows = self._conn.execute(
+            f"""
+            SELECT message AS value, COUNT(*) AS count
+            FROM records
+            WHERE {error_where_sql}
+            GROUP BY message
+            ORDER BY count DESC, value ASC
+            LIMIT 10
+            """,
+            error_args,
+        ).fetchall()
+
+        timeline_total_rows = self._conn.execute(
+            f"""
+            SELECT substr(timestamp, 1, 13) || ':00:00Z' AS bucket,
+                   COUNT(*) AS total_count
+            FROM records
+            WHERE {where_sql}
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """,
+            args,
+        ).fetchall()
+
+        timeline_error_rows = self._conn.execute(
+            f"""
+            SELECT substr(timestamp, 1, 13) || ':00:00Z' AS bucket,
+                   COUNT(*) AS error_count
+            FROM records
+            WHERE {error_where_sql}
+            GROUP BY bucket
+            ORDER BY bucket ASC
+            """,
+            error_args,
+        ).fetchall()
+
+        timeline_map: dict[str, dict[str, Any]] = {}
+        for row in timeline_total_rows:
+            bucket = str(row[0])
+            timeline_map[bucket] = {"timestamp": bucket, "total_logs": int(row[1] or 0), "error_logs": 0}
+        for row in timeline_error_rows:
+            bucket = str(row[0])
+            entry = timeline_map.setdefault(bucket, {"timestamp": bucket, "total_logs": 0, "error_logs": 0})
+            entry["error_logs"] = int(row[1] or 0)
+
+        return {
+            "summary": {
+                "total_logs": int(summary_row[0] or 0),
+                "error_count": int(summary_row[1] or 0),
+                "warning_count": int(summary_row[2] or 0),
+                "info_count": int(summary_row[3] or 0),
+                "debug_count": int(summary_row[4] or 0),
+                "metrics_count": int(summary_row[5] or 0),
+                "security_count": int(summary_row[6] or 0),
+                "unique_namespaces": int(summary_row[7] or 0),
+                "unique_pods": int(summary_row[8] or 0),
+            },
+            "severity": [{"value": row[0], "count": int(row[1] or 0)} for row in severity_rows],
+            "namespaces": [{"value": row[0], "count": int(row[1] or 0)} for row in namespace_rows],
+            "error_namespaces": [{"value": row[0], "count": int(row[1] or 0)} for row in error_namespace_rows],
+            "error_pods": [{"value": row[0], "count": int(row[1] or 0)} for row in error_pod_rows],
+            "top_errors": [{"value": row[0], "count": int(row[1] or 0)} for row in top_error_rows],
+            "timeline": [timeline_map[key] for key in sorted(timeline_map)],
+        }
+
     def get_record_by_id(self, record_id: int) -> dict[str, Any] | None:
         """Fetch a single record by its row id, for per-line explain.
         Re-derives from storage rather than trusting client-supplied text."""

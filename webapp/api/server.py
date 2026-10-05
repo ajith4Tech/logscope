@@ -108,6 +108,9 @@ class LogscopeHandler(SimpleHTTPRequestHandler):
         if parsed.path == "/api/facets":
             self._send_json(app.storage.query_facets(_query_params(params)))
             return
+        if parsed.path == "/api/dashboard":
+            self._send_json(app.api_dashboard(params))
+            return
         if parsed.path == "/api/logs":
             self._send_json(app.api_logs(params))
             return
@@ -265,6 +268,10 @@ class WebApp:
         }
         limit = _coerce_limit(_first(params, "limit"), self.cfg.webapp.page_size_default, self.cfg.webapp.page_size_max)
         return self.anomaly_store.query_anomalies(flat, limit=limit)
+
+    def api_dashboard(self, params: dict[str, list[str]]) -> dict:
+        flat = _query_params(params)
+        return self.storage.query_dashboard(flat)
 
     def api_explain(self, params: dict[str, list[str]]) -> dict:
         """Re-derive a bounded log sample from filters, summarize via AI.

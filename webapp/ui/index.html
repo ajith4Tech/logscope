@@ -54,6 +54,9 @@
       <section class="main-content">
         <!-- Tab bar -->
         <nav class="tab-bar" role="tablist" aria-label="Main views">
+          <button id="tabDashboard" class="tab" role="tab" aria-selected="false" aria-controls="panelDashboard">
+            <span class="tab-icon"></span> Dashboard
+          </button>
           <button id="tabLogs" class="tab active" role="tab" aria-selected="true" aria-controls="panelLogs">
             <span class="tab-icon"></span> Logs
           </button>
@@ -66,6 +69,79 @@
             <span id="actionableBadge" class="tab-badge" hidden></span>
           </button>
         </nav>
+
+        <!-- Dashboard panel -->
+        <div id="panelDashboard" class="panel dashboard-panel" role="tabpanel" hidden>
+          <div class="panel-head dashboard-head">
+            <div>
+              <h2>Kubernetes dashboard</h2>
+              <div id="dashboardContext" class="subtle">Overview for the current filter set</div>
+            </div>
+            <button id="refreshDashboard" class="ghost">Refresh</button>
+          </div>
+          <div id="dashboardLoading" class="dashboard-state" hidden>Loading dashboard…</div>
+          <div id="dashboardError" class="dashboard-state dashboard-state-error" hidden></div>
+          <div id="dashboardEmpty" class="empty-state" hidden>No log data found for the selected filters.</div>
+          <div id="dashboardContent" class="dashboard-grid" hidden>
+            <section class="dashboard-section dashboard-summary-section">
+              <div class="section-head">
+                <h3>Summary</h3>
+              </div>
+              <div id="dashboardSummaryCards" class="dashboard-summary-cards"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6">
+              <div class="section-head">
+                <h3>Severity breakdown</h3>
+              </div>
+              <div id="dashboardSeverityChart" class="dashboard-bars"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6">
+              <div class="section-head">
+                <h3>Logs by namespace</h3>
+              </div>
+              <div id="dashboardNamespaceChart" class="dashboard-bars"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6">
+              <div class="section-head">
+                <h3>Error volume over time</h3>
+              </div>
+              <div id="dashboardErrorVolumeChart" class="dashboard-timeline"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6">
+              <div class="section-head">
+                <h3>Total log volume over time</h3>
+              </div>
+              <div id="dashboardTotalVolumeChart" class="dashboard-timeline"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6">
+              <div class="section-head">
+                <h3>Top error messages</h3>
+              </div>
+              <div id="dashboardTopErrors" class="dashboard-list"></div>
+            </section>
+
+            <section class="dashboard-section dashboard-span-6 dashboard-source-section">
+              <div class="section-head">
+                <h3>Top error namespaces / pods</h3>
+              </div>
+              <div class="dashboard-source-grid">
+                <div>
+                  <div class="dashboard-subhead">Namespaces</div>
+                  <div id="dashboardErrorNamespaces" class="dashboard-list"></div>
+                </div>
+                <div>
+                  <div class="dashboard-subhead">Pods</div>
+                  <div id="dashboardErrorPods" class="dashboard-list"></div>
+                </div>
+              </div>
+            </section>
+          </div>
+        </div>
 
         <!-- Logs panel -->
         <div id="panelLogs" class="panel logs" role="tabpanel">

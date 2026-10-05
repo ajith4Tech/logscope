@@ -2,10 +2,18 @@ const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 min
 const EXPLAIN_COOLDOWN_MS = 12000; // client-side cooldown after clicking Explain
 const CURRENT_LOG_LIMIT = 7;
 const OLDER_LOG_LIMIT = 50;
+const COUNT_FORMATTER = new Intl.NumberFormat();
 
 const state = {
   filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
   facets: {},
+  dashboard: {
+    data: null,
+    loading: false,
+    error: '',
+    loaded: false,
+    requestId: 0,
+  },
   items: [],
   nextCursor: null,
   hasMore: false,
@@ -46,26 +54,55 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+function formatCount(value) {
+  const number = Number(value ?? 0);
+  return COUNT_FORMATTER.format(Number.isFinite(number) ? number : 0);
+}
+
+function dashboardLabel(value) {
+  return value ? String(value) : '—';
+}
+
+function dashboardContextText() {
+  const parts = [];
+  const filters = queryFromFilters();
+  if (filters.scope) parts.push(`scope=${filters.scope}`);
+  if (filters.namespace) parts.push(`namespace=${filters.namespace}`);
+  if (filters.pod) parts.push(`pod=${filters.pod}`);
+  if (filters.container) parts.push(`container=${filters.container}`);
+  if (filters.severity_bucket) parts.push(`severity=${filters.severity_bucket}`);
+  if (filters.q) parts.push(`search=${filters.q}`);
+  if (filters.start || filters.end) parts.push('time range applied');
+  return parts.length ? `Overview for ${parts.join(', ')}` : 'Overview for the current filter set';
+}
+
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
 function switchTab(name) {
   state.activeTab = name;
+  const isDashboard = name === 'dashboard';
   const isLogs = name === 'logs';
   const isInsights = name === 'insights';
   const isActionable = name === 'actionable';
 
+  el('tabDashboard').classList.toggle('active', isDashboard);
   el('tabLogs').classList.toggle('active', isLogs);
   el('tabInsights').classList.toggle('active', isInsights);
   el('tabActionable').classList.toggle('active', isActionable);
 
+  el('tabDashboard').setAttribute('aria-selected', isDashboard ? 'true' : 'false');
   el('tabLogs').setAttribute('aria-selected', isLogs ? 'true' : 'false');
   el('tabInsights').setAttribute('aria-selected', isInsights ? 'true' : 'false');
   el('tabActionable').setAttribute('aria-selected', isActionable ? 'true' : 'false');
 
+  el('panelDashboard').hidden = !isDashboard;
   el('panelLogs').hidden = !isLogs;
   el('panelInsights').hidden = !isInsights;
   el('panelActionable').hidden = !isActionable;
 
+  if (isDashboard && !state.dashboard.loaded && !state.dashboard.loading) {
+    loadDashboard().catch(() => {});
+  }
   if (isInsights && !state.insightsLoaded && !state.insightsLoading) {
     loadInsights().catch(() => {});
   }
@@ -75,6 +112,7 @@ function switchTab(name) {
   }
 }
 
+el('tabDashboard').addEventListener('click', () => switchTab('dashboard'));
 el('tabLogs').addEventListener('click', () => switchTab('logs'));
 el('tabInsights').addEventListener('click', () => switchTab('insights'));
 el('tabActionable').addEventListener('click', () => switchTab('actionable'));
@@ -177,6 +215,170 @@ function escapeHtml(value) {
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;');
+}
+
+function dashboardStateEls() {
+  return {
+    loading: el('dashboardLoading'),
+    error: el('dashboardError'),
+    empty: el('dashboardEmpty'),
+    content: el('dashboardContent'),
+  };
+}
+
+function dashboardChartRow(item, kind, maxCount) {
+  const value = item.value ?? '';
+  const count = Number(item.count ?? 0);
+  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
+  const clickable = value !== '' || kind === 'severity' || kind === 'security';
+  const action = kind === 'severity' ? 'severity' : kind === 'namespace' ? 'namespace' : kind === 'search' ? 'search' : kind;
+  const actionValue = kind === 'security' ? 'security' : value;
+  const cls = clickable ? 'dashboard-bar-row dashboard-action' : 'dashboard-bar-row';
+  return `
+    <button type="button" class="${cls}" data-dashboard-action="${escapeHtml(action)}" data-dashboard-value="${escapeHtml(actionValue)}" ${clickable ? '' : 'disabled'}>
+      <span class="dashboard-bar-label">${escapeHtml(dashboardLabel(value))}</span>
+      <span class="dashboard-bar-track"><span class="dashboard-bar-fill" style="width:${width}%"></span></span>
+      <span class="dashboard-bar-count">${formatCount(count)}</span>
+    </button>
+  `;
+}
+
+function dashboardTimelineRow(item, maxCount, action, actionValue, metricKey = 'total_logs') {
+  const label = item.timestamp ? formatTimestamp(item.timestamp) : '—';
+  const count = Number(item[metricKey] ?? 0);
+  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
+  return `
+    <button type="button" class="dashboard-bar-row dashboard-action" data-dashboard-action="${escapeHtml(action)}" data-dashboard-value="${escapeHtml(actionValue)}">
+      <span class="dashboard-bar-label dashboard-bar-label-wide">${escapeHtml(label)}</span>
+      <span class="dashboard-bar-track dashboard-bar-track-timeline"><span class="dashboard-bar-fill dashboard-bar-fill-alt" style="width:${width}%"></span></span>
+      <span class="dashboard-bar-count">${formatCount(count)}</span>
+    </button>
+  `;
+}
+
+function renderDashboardList(container, items, kind) {
+  if (!container) return;
+  if (!items.length) {
+    container.innerHTML = '<div class="empty-state dashboard-empty-inline">No data for the selected filters.</div>';
+    return;
+  }
+  const maxCount = Math.max(...items.map((item) => Number(item.count ?? 0)), 1);
+  container.innerHTML = items.map((item) => dashboardChartRow(item, kind, maxCount)).join('');
+}
+
+function renderDashboardSummary(summary) {
+  const cards = [
+    { label: 'Total Logs', value: summary.total_logs, action: 'logs' },
+    { label: 'Errors', value: summary.error_count, action: 'severity', actionValue: 'error' },
+    { label: 'Warnings', value: summary.warning_count, action: 'severity', actionValue: 'warning' },
+    { label: 'Info', value: summary.info_count, action: 'severity', actionValue: 'info' },
+    { label: 'Security', value: summary.security_count, action: 'security', actionValue: 'security' },
+    { label: 'Namespaces', value: summary.unique_namespaces },
+    { label: 'Pods', value: summary.unique_pods },
+  ];
+  const container = el('dashboardSummaryCards');
+  if (!container) return;
+  container.innerHTML = cards.map((card) => {
+    const clickable = Boolean(card.action);
+    const tag = clickable ? 'button' : 'div';
+    const attrs = clickable
+      ? `type="button" class="dashboard-summary-card dashboard-action" data-dashboard-action="${escapeHtml(card.action)}" data-dashboard-value="${escapeHtml(card.actionValue || '')}"`
+      : 'class="dashboard-summary-card"';
+    return `<${tag} ${attrs}><span class="dashboard-summary-label">${escapeHtml(card.label)}</span><span class="dashboard-summary-value">${formatCount(card.value)}</span></${tag}>`;
+  }).join('');
+}
+
+function renderDashboardContent(data) {
+  const summary = data.summary || {};
+  renderDashboardSummary(summary);
+  renderDashboardList(el('dashboardSeverityChart'), data.severity || [], 'severity');
+  renderDashboardList(el('dashboardNamespaceChart'), data.namespaces || [], 'namespace');
+  renderDashboardList(el('dashboardTopErrors'), data.top_errors || [], 'search');
+  renderDashboardList(el('dashboardErrorNamespaces'), data.error_namespaces || [], 'namespace');
+  renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod');
+
+  const totalTimeline = el('dashboardTotalVolumeChart');
+  if (totalTimeline) {
+    const items = Array.isArray(data.timeline) ? data.timeline : [];
+    if (!items.length) {
+      totalTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
+    } else {
+      const maxCount = Math.max(...items.map((item) => Number(item.total_logs ?? 0)), 1);
+      totalTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, 'logs', '', 'total_logs')).join('');
+    }
+  }
+
+  const errorTimeline = el('dashboardErrorVolumeChart');
+  if (errorTimeline) {
+    const items = Array.isArray(data.timeline) ? data.timeline : [];
+    if (!items.length) {
+      errorTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
+    } else {
+      const maxCount = Math.max(...items.map((item) => Number(item.error_logs ?? 0)), 1);
+      errorTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, 'severity', 'error', 'error_logs')).join('');
+    }
+  }
+}
+
+function renderDashboard() {
+  const { loading, error, empty, content } = dashboardStateEls();
+  const hasData = Boolean(state.dashboard.data);
+  const totalLogs = Number(state.dashboard.data?.summary?.total_logs ?? 0);
+  if (loading) loading.hidden = !state.dashboard.loading;
+  if (error) {
+    error.hidden = !state.dashboard.error;
+    error.textContent = state.dashboard.error || '';
+  }
+  if (empty) empty.hidden = !(hasData && !state.dashboard.loading && !state.dashboard.error && totalLogs === 0);
+  if (content) content.hidden = !hasData || state.dashboard.loading || totalLogs === 0;
+  if (hasData) renderDashboardContent(state.dashboard.data);
+  const ctx = el('dashboardContext');
+  if (ctx) ctx.textContent = dashboardContextText();
+}
+
+async function drillDownFromDashboard(action, value) {
+  if (action === 'logs') {
+    switchTab('logs');
+    await loadLogs(true);
+    return;
+  }
+  if (action === 'severity') {
+    el('severity_bucket').value = value;
+  } else if (action === 'namespace') {
+    el('namespace').value = value;
+  } else if (action === 'pod') {
+    el('pod').value = value;
+  } else if (action === 'security') {
+    el('scope').value = 'security';
+  } else if (action === 'search') {
+    el('q').value = value;
+  }
+  syncFiltersFromUi();
+  resetOlderLogsState();
+  switchTab('logs');
+  await loadLogs(true);
+}
+
+async function loadDashboard() {
+  const requestId = ++state.dashboard.requestId;
+  state.dashboard.loading = true;
+  state.dashboard.error = '';
+  renderDashboard();
+  try {
+    const params = new URLSearchParams(queryFromFilters());
+    const data = await fetchJson(`/api/dashboard?${params.toString()}`);
+    if (requestId !== state.dashboard.requestId) return;
+    state.dashboard.data = data;
+    state.dashboard.loaded = true;
+  } catch (err) {
+    if (requestId !== state.dashboard.requestId) return;
+    state.dashboard.error = `Failed to load dashboard: ${err.message}`;
+  } finally {
+    if (requestId === state.dashboard.requestId) {
+      state.dashboard.loading = false;
+      renderDashboard();
+    }
+  }
 }
 
 function renderFacets(facets) {
@@ -1407,6 +1609,9 @@ async function loadLogs(reset = true) {
     el('health').textContent = state.hasMore ? 'More older rows available' : 'End of current page';
   }
   if (reset && el('live').checked && state.items.length) state.liveCursor = encodeCursor(state.items[0]);
+  loadDashboard().catch((err) => {
+    el('health').textContent = err.message;
+  });
 }
 
 function flashNewRows(count) {
@@ -1565,8 +1770,23 @@ el('refreshInsights').addEventListener('click', async () => {
 el('insightsStatusFilter').addEventListener('change', async () => {
   await loadInsights();
 });
+el('refreshDashboard').addEventListener('click', () => {
+  loadDashboard().catch((err) => {
+    el('health').textContent = err.message;
+  });
+});
 document.addEventListener('click', async (event) => {
   const target = event.target;
+  const dashboardAction = target instanceof HTMLElement ? target.closest('[data-dashboard-action]') : null;
+  if (dashboardAction instanceof HTMLElement) {
+    event.preventDefault();
+    const action = dashboardAction.dataset.dashboardAction || '';
+    const value = dashboardAction.dataset.dashboardValue || '';
+    drillDownFromDashboard(action, value).catch((err) => {
+      el('health').textContent = err.message;
+    });
+    return;
+  }
   if (target instanceof HTMLElement && target.id === 'loadLatestCached') {
     const latest = state.lastStatus?.latest_record_timestamp;
     if (!latest) return;
@@ -1650,8 +1870,4 @@ el('confirmExecuteBtn').addEventListener('click', () => {
     state.actionable.pendingMutationIndex = null;
     executeActionableStep(idx, true);
   }
-});
-
-init().catch((err) => {
-  el('health').textContent = err.message;
 });
