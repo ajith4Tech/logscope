@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import functools
 import json
 import sqlite3
 import threading
@@ -11,6 +12,26 @@ from typing import Any
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+# Seconds a connection waits on another connection's lock (the records and
+# anomalies connections share one file) before raising "database is locked".
+# Callers do not retry: the ingest loop retries on its next poll (duplicates
+# are ignored by the UNIQUE keys) and HTTP requests return a logged 500.
+SQLITE_BUSY_TIMEOUT_SECS = 30
+
+
+def _locked(method):
+    """Serialize use of the shared connection. The HTTP worker threads, the
+    ingest loop and the insights job all use it, and concurrent use of one
+    sqlite3 connection fails intermittently (InterfaceError / IndexError)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 def _encode_cursor(ts: str, record_id: int) -> str:
@@ -30,7 +51,7 @@ def decode_cursor(cursor: str | None) -> tuple[str, int] | None:
 class LogStorage:
     def __init__(self, db_path: Path):
         db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self.fts_enabled = False
@@ -116,10 +137,12 @@ class LogStorage:
         row = self._conn.execute("SELECT value FROM app_state WHERE name = ?", (name,)).fetchone()
         return str(row[0]) if row else None
 
+    @_locked
     def get_prefix_cursor(self, prefix: str) -> str | None:
         row = self._conn.execute("SELECT last_key FROM prefix_state WHERE prefix = ?", (prefix,)).fetchone()
         return str(row[0]) if row else None
 
+    @_locked
     def set_prefix_cursor(self, prefix: str, last_key: str) -> None:
         self._conn.execute(
             """
@@ -129,6 +152,7 @@ class LogStorage:
             (prefix, last_key, _utc_now()),
         )
 
+    @_locked
     def object_seen(self, bucket: str, key: str, etag: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM ingested_objects WHERE bucket = ? AND key = ? AND etag = ?",
@@ -136,6 +160,7 @@ class LogStorage:
         ).fetchone()
         return row is not None
 
+    @_locked
     def mark_object(self, bucket: str, key: str, etag: str, last_modified: str, status: str, record_count: int) -> None:
         self._conn.execute(
             """
@@ -150,6 +175,7 @@ class LogStorage:
             (bucket, key, etag, last_modified, _utc_now(), status, record_count),
         )
 
+    @_locked
     def insert_records(self, records: list[dict[str, Any]]) -> int:
         if not records:
             return 0
@@ -190,6 +216,7 @@ class LogStorage:
         self._conn.commit()
         return inserted
 
+    @_locked
     def ingest_state(self, *, last_poll_at: str, last_successful_ingest_at: str | None, last_object_last_modified: str | None, last_error: str | None = None) -> None:
         self._set_state("last_polled_at", last_poll_at)
         if last_successful_ingest_at is not None:
@@ -198,7 +225,18 @@ class LogStorage:
             self._set_state("last_object_last_modified", last_object_last_modified)
         if last_error is not None:
             self._set_state("last_error", last_error)
+        else:
+            # A successful poll clears the previous failure.
+            self._conn.execute("DELETE FROM app_state WHERE name = 'last_error'")
         self._conn.commit()
+
+    def _check_fts_query(self, q: str) -> None:
+        """Reject malformed FTS5 query syntax as a client error, so real
+        database failures are not mistaken for bad input."""
+        try:
+            self._conn.execute("SELECT 1 FROM records_fts WHERE records_fts MATCH ? LIMIT 1", (q,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise ValueError(f"Invalid search query: {exc}") from None
 
     def _build_filters(self, params: dict[str, Any]) -> tuple[str, list[Any]]:
         clauses = ["1 = 1"]
@@ -219,6 +257,7 @@ class LogStorage:
         q = params.get("q")
         if q:
             if self.fts_enabled:
+                self._check_fts_query(q)
                 clauses.append("id IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)")
                 args.append(q)
             else:
@@ -227,6 +266,7 @@ class LogStorage:
                 args.extend([needle, needle])
         return " AND ".join(clauses), args
 
+    @_locked
     def query_logs(self, params: dict[str, Any], *, limit: int, cursor: tuple[str, int] | None = None, direction: str = "desc") -> dict[str, Any]:
         where_sql, args = self._build_filters(params)
         if cursor:
@@ -254,6 +294,7 @@ class LogStorage:
         next_cursor = _encode_cursor(items[-1]["timestamp"], int(items[-1]["id"])) if items else None
         return {"items": items, "next_cursor": next_cursor, "has_more": has_more}
 
+    @_locked
     def query_facets(self, params: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         where_sql, args = self._build_filters(params)
         fields = ["scope", "namespace", "pod", "container", "severity_bucket"]
@@ -272,6 +313,7 @@ class LogStorage:
             out[field] = [{"value": row[0], "count": int(row[1])} for row in rows]
         return out
 
+    @_locked
     def query_dashboard(self, params: dict[str, Any]) -> dict[str, Any]:
         where_sql, args = self._build_filters(params)
         error_where_sql, error_args = self._build_filters({**params, "severity_bucket": "error"})
@@ -403,6 +445,22 @@ class LogStorage:
             "timeline": [timeline_map[key] for key in sorted(timeline_map)],
         }
 
+    @_locked
+    def prune_records_before(self, cutoff: str) -> int:
+        """Delete cached records (and their FTS rows) older than cutoff. The S3
+        source objects past retention are expired by the bucket lifecycle rule,
+        so their ingest bookkeeping is dropped too. Returns records removed."""
+        if self.fts_enabled:
+            self._conn.execute(
+                "DELETE FROM records_fts WHERE rowid IN (SELECT id FROM records WHERE timestamp < ?)",
+                (cutoff,),
+            )
+        removed = self._conn.execute("DELETE FROM records WHERE timestamp < ?", (cutoff,)).rowcount
+        self._conn.execute("DELETE FROM ingested_objects WHERE last_modified < ?", (cutoff,))
+        self._conn.commit()
+        return int(removed)
+
+    @_locked
     def get_record_by_id(self, record_id: int) -> dict[str, Any] | None:
         """Fetch a single record by its row id, for per-line explain.
         Re-derives from storage rather than trusting client-supplied text."""
@@ -418,11 +476,35 @@ class LogStorage:
         if row is None:
             return None
         return dict(row)
+
     @property
     def conn(self) -> sqlite3.Connection:
-        """Read access to the shared records connection (used by InsightsJob)."""
+        """Read access to the shared records connection (used by InsightsJob).
+        Hold `lock` while using it from another thread."""
         return self._conn
 
+    @property
+    def lock(self) -> threading.RLock:
+        return self._lock
+
+    def ping(self, timeout: float = 2.0) -> bool:
+        """True when the connection answers. False when another thread holds
+        it for longer than `timeout` (busy, not necessarily broken); the
+        caller decides how long busy is acceptable. Errors propagate."""
+        if not self._lock.acquire(timeout=timeout):
+            return False
+        try:
+            self._conn.execute("SELECT 1").fetchone()
+            return True
+        finally:
+            self._lock.release()
+
+    @_locked
+    def get_state(self, name: str) -> str | None:
+        """One app_state value without get_status()'s full-table counts."""
+        return self._get_state(name)
+
+    @_locked
     def get_status(self) -> dict[str, Any]:
         last_polled_at = self._get_state("last_polled_at")
         last_successful_ingest_at = self._get_state("last_successful_ingest_at")

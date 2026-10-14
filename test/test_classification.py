@@ -79,7 +79,7 @@ def _event(message: str, pod: str, container: str, namespace: str) -> dict[str, 
 
 def test_starts_when_covers_fixture_formats():
     """Existing starts_when must match every first-line format in fixtures."""
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     rx = re.compile(cfg["multiline"]["starts_when"])
     samples = {
         "plain_timestamp.txt": _lines("plain_timestamp.txt")[0],
@@ -101,7 +101,7 @@ def test_starts_when_covers_fixture_formats():
 
 
 def test_stack_trace_merges_to_one_event():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     lines = _lines("stack_trace.txt")
     assert len(lines) > 1, "stack_trace fixture must be multi-line"
     events = [
@@ -119,7 +119,7 @@ def test_stack_trace_merges_to_one_event():
 
 def test_postgres_multiline_merges_to_one_event():
     """Column-0 DETAIL/HINT/STATEMENT must not split a Postgres error block."""
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     rx = re.compile(cfg["multiline"]["starts_when"])
     lines = _lines("postgres_multiline.txt")
     assert len(lines) > 1
@@ -146,7 +146,7 @@ def test_postgres_multiline_merges_to_one_event():
 
 
 def test_single_lines_not_merged():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     lines = _lines("single_lines.txt")
     events = [_event(ln, "api-7d9f", "api", "app") for ln in lines]
     out = reduce_multiline(events, cfg["multiline"]["starts_when"])
@@ -156,7 +156,7 @@ def test_single_lines_not_merged():
 
 def test_format_fixtures_stay_separate_events():
     """Adjacent plain/JSON/logfmt/klog lines must not glue together."""
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     bundles = [
         _lines("plain_timestamp.txt"),
         _lines("json_lines.txt"),
@@ -170,7 +170,7 @@ def test_format_fixtures_stay_separate_events():
 
 
 def test_group_by_keeps_interleaved_pods_apart():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     # Interleaved: pod-a stack fragment, pod-b line, pod-a continuation.
     events = [
         _event("ERROR: pod-a failure", "pod-a", "c1", "ns1"),
@@ -195,7 +195,7 @@ def test_group_by_keeps_interleaved_pods_apart():
 
 def test_rendered_values_include_multiline_reduce():
     """Both kits must carry the same reduce transform (shared config)."""
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     needle = (
         "match(string!(.message), r'"
         + R.vrl_escape_regex(cfg["multiline"]["starts_when"])
@@ -292,7 +292,7 @@ def classify_event(cfg: dict[str, Any], message: str, namespace: str) -> dict[st
 
 
 def test_falco_scope_security_overrides_infra():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     assert R.falco_enabled(cfg)
     ns = cfg["falco"]["namespace"]
     cfg["routing"]["infra_namespaces"] = list(cfg["routing"]["infra_namespaces"]) + [ns]
@@ -304,7 +304,7 @@ def test_falco_scope_security_overrides_infra():
 
 
 def test_falco_priority_map_and_dual_write():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     R.validate_cfg(cfg)
     pmap = R.falco_priority_map(cfg)
     ns = cfg["falco"]["namespace"]
@@ -328,7 +328,7 @@ def test_falco_priority_map_and_dual_write():
 
 
 def test_non_falco_fixtures_no_security_leakage():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     samples = [
         ("json_lines.txt", "app"),
         ("klog.txt", "kube-system"),
@@ -348,7 +348,7 @@ def test_non_falco_fixtures_no_security_leakage():
 def test_falco_disabled_falls_through():
     from copy import deepcopy
 
-    cfg = deepcopy(R.load_config(ROOT / "config.yaml"))
+    cfg = deepcopy(R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml"))
     cfg["falco"]["enabled"] = False
     ns = cfg["falco"]["namespace"]
     line = _lines("falco_alerts.txt")[0]
@@ -360,7 +360,7 @@ def test_falco_disabled_falls_through():
 
 
 def test_falco_json_starts_when():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     rx = re.compile(cfg["multiline"]["starts_when"])
     for line in _lines("falco_alerts.txt"):
         assert rx.search(line), f"Falco JSON should start an event: {line[:80]!r}"

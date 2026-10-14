@@ -1,0 +1,8 @@
+# Allowlist: the only image built from this repo is the web app
+# (docker build -f webapp/Dockerfile .). Everything else — config.yaml,
+# deploy/k3s/s3-secret.yaml, logs/, backups/, .state/, .git — stays out of the
+# build context so it can never be copied into an image.
+*
+!webapp/
+webapp/**/__pycache__
+webapp/**/*.py[cod]

@@ -1,0 +1,166 @@
+{{- if .Values.vector.enabled }}
+{{- $name := include "logscope.vector.fullname" . }}
+{{- $clusterName := include "logscope.vector.clusterName" . }}
+{{- $ns := include "logscope.namespace" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.vector.labels" . | nindent 4 }}
+---
+# kubernetes_logs enriches events with pod/namespace/node metadata: read-only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $clusterName }}
+  labels:
+    {{- include "logscope.vector.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces", "nodes", "pods"]
+    verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $clusterName }}
+  labels:
+    {{- include "logscope.vector.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $clusterName }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ $ns }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.vector.labels" . | nindent 4 }}
+data:
+  vector.yaml: |
+    {{- include "logscope.vector.config" . | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.vector.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "logscope.vector.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        {{- include "logscope.vector.labels" . | nindent 8 }}
+        # Vector never collects its own logs.
+        vector.dev/exclude: "true"
+      annotations:
+        checksum/config: {{ include "logscope.vector.config" . | sha256sum }}
+        # Roll the DaemonSet when its S3 credential settings change (hash only).
+        checksum/credentials: {{ include "logscope.vector.credentialsChecksum" . }}
+        {{- if .Values.vector.metrics.enabled }}
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8686"
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      {{- with .Values.vector.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.vector.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.vector.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.vector.image.pullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        - name: {{ . }}
+        {{- end }}
+      {{- end }}
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: vector
+          image: "{{ .Values.vector.image.repository }}:{{ .Values.vector.image.tag }}"
+          imagePullPolicy: {{ .Values.vector.image.pullPolicy }}
+          args: ["--config-dir", "/etc/vector/"]
+          env:
+            - name: VECTOR_LOG
+              value: info
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom: {fieldRef: {fieldPath: spec.nodeName}}
+            - name: VECTOR_SELF_POD_NAME
+              valueFrom: {fieldRef: {fieldPath: metadata.name}}
+            - name: VECTOR_SELF_POD_NAMESPACE
+              valueFrom: {fieldRef: {fieldPath: metadata.namespace}}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "logscope.vector.s3Secret" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "logscope.vector.s3Secret" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+          {{- if .Values.vector.metrics.enabled }}
+          ports:
+            - name: prometheus
+              containerPort: 8686
+              protocol: TCP
+          {{- end }}
+          resources:
+            {{- toYaml .Values.vector.resources | nindent 12 }}
+          # Root is required to read node log files (root-owned) and write the
+          # hostPath checkpoint dir; everything else is dropped.
+          securityContext:
+            runAsUser: 0
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector/
+              readOnly: true
+            - name: var-log
+              mountPath: /var/log/
+              readOnly: true
+            - name: var-lib
+              mountPath: /var/lib
+              readOnly: true
+            - name: data
+              mountPath: {{ .Values.vector.dataDir }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ $name }}-config
+        - name: var-log
+          hostPath: {path: /var/log/}
+        - name: var-lib
+          hostPath: {path: /var/lib/}
+        - name: data
+          hostPath:
+            path: {{ .Values.vector.dataDir }}
+            type: DirectoryOrCreate
+{{- end }}

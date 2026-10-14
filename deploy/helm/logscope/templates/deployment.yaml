@@ -1,0 +1,128 @@
+{{- include "logscope.validate" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "logscope.fullname" . }}
+  namespace: {{ include "logscope.namespace" . }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: 5
+  # Recreate: two pods must never open the same SQLite file / RWO volume.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "logscope.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "logscope.labels" . | nindent 8 }}
+      annotations:
+        # Config is read only at startup; roll the pod when it changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        # Roll the pod when its credential settings change (hash only).
+        checksum/credentials: {{ include "logscope.webapp.credentialsChecksum" . }}
+    spec:
+      serviceAccountName: {{ include "logscope.fullname" . }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: webapp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["--host", "0.0.0.0", "--port", "8000", "--config", "/etc/logscope/config.yaml"]
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: LOGSCOPE_WEBAPP_DB_PATH
+              value: /data/logscope.sqlite
+            # Fixed: the HTTP API has no authentication; never let it run kubectl.
+            - name: LOGSCOPE_ACTIONS_ENABLED
+              value: "false"
+            - name: LOGSCOPE_LOG_LEVEL
+              value: {{ .Values.webapp.logLevel | quote }}
+            - name: LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE
+              value: {{ .Values.ai.rateLimitPerMinute | int | quote }}
+            {{- with .Values.webapp.allowedOrigins }}
+            - name: LOGSCOPE_ALLOWED_ORIGINS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "logscope.webapp.s3Secret" . }}
+                  key: AWS_ACCESS_KEY_ID
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "logscope.webapp.s3Secret" . }}
+                  key: AWS_SECRET_ACCESS_KEY
+            {{- if include "logscope.aiEnabled" . }}
+            # Same variable for every provider; config.yaml names it in api_key_env.
+            - name: LOGSCOPE_AI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "logscope.aiSecret" . }}
+                  key: {{ include "logscope.aiSecretKey" . }}
+            {{- end }}
+            {{- with .Values.webapp.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          startupProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            {{- toYaml .Values.probes.startup | nindent 12 }}
+          readinessProbe:
+            # Local cache queryable. S3/AI outages surface in /api/status, not here.
+            httpGet:
+              path: /readyz
+              port: http
+            {{- toYaml .Values.probes.readiness | nindent 12 }}
+          livenessProbe:
+            # Process answers and the ingest loop is running.
+            httpGet:
+              path: /healthz
+              port: http
+            {{- toYaml .Values.probes.liveness | nindent 12 }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/logscope
+              readOnly: true
+            - name: data
+              mountPath: /data
+            # SQLite writes temp files here; the root filesystem is read-only.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "logscope.fullname" . }}-config
+        - name: data
+          {{- if .Values.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default (printf "%s-data" (include "logscope.fullname" .)) }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi

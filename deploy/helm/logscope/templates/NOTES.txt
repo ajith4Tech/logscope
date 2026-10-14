@@ -1,0 +1,35 @@
+Logscope installed in namespace {{ include "logscope.namespace" . }}.
+
+Web app ({{ .Values.image.repository }}:{{ .Values.image.tag }}):
+  kubectl -n {{ include "logscope.namespace" . }} rollout status deploy/{{ include "logscope.fullname" . }}
+  kubectl -n {{ include "logscope.namespace" . }} port-forward svc/{{ include "logscope.fullname" . }} 8000:{{ .Values.service.port }}
+  curl -s localhost:8000/api/status      # last_error should be null
+
+Vector:  {{ if .Values.vector.enabled }}chart-managed DaemonSet {{ include "logscope.vector.fullname" . }}{{ else }}not managed by this chart (existing install expected){{ end }}
+Falco:   {{ if .Values.falco.enabled }}chart-managed in namespace {{ .Values.falco.namespaceOverride | default .Release.Namespace }}{{ else }}not managed by this chart (existing install, if any){{ end }}
+AI:      {{ if include "logscope.aiEnabled" . }}{{ .Values.ai.provider }} / {{ .Values.ai.model }}{{ else }}disabled{{ end }}
+
+The web app has NO built-in authentication. Keep it internal or behind an
+authenticated, TLS-protected Ingress.
+{{- if not .Values.persistence.enabled }}
+
+WARNING: persistence.enabled=false — restarts lose anomaly triage state and re-download all logs from S3.
+{{- end }}
+{{- if or .Values.s3.credentials.webapp.accessKeyId .Values.s3.credentials.vector.accessKeyId .Values.ai.apiKey }}
+
+NOTE: credentials were supplied inline. They are stored in Kubernetes Secrets AND in
+this Helm release's record. Keep the values file out of Git (chmod 600).
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+Ingress: {{ ternary "https" "http" .Values.ingress.tls.enabled }}://{{ .Values.ingress.host }}/
+  The DNS record for {{ .Values.ingress.host }} must point at the ingress controller's
+  reachable address (README → "Exposing Logscope on a hostname"). Check with:
+  kubectl get ingress -n {{ include "logscope.namespace" . }}
+{{- if and .Values.ingress.tls.enabled (not .Values.ingress.tls.secretName) }}
+  NOTE: no ingress.tls.secretName — the controller's default (Traefik: self-signed) certificate is served.
+{{- end }}
+{{- if and .Values.ingress.externalAuth (not .Values.ingress.basicAuth.secretName) }}
+  WARNING: no basic auth from this chart (externalAuth=true). Authentication must be enforced in front of the Ingress.
+{{- end }}
+{{- end }}

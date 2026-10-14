@@ -51,7 +51,7 @@ def _buffer(text: str):
 
 
 def test_parser_skips_regular_falco_duplicate_and_accepts_security_copy():
-    cfg = load_app_config(ROOT / "config.yaml")
+    cfg = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     falco_fixture = json.loads((ROOT / "test" / "fixtures" / "falco_alerts.txt").read_text().splitlines()[0])
     falco_message = str(falco_fixture["output"])
     regular = make_record(
@@ -122,7 +122,7 @@ def test_storage_queries_and_facets():
 
 
 def test_ingest_once_tracks_prefix_state_and_skips_duplicate_falco_copy():
-    cfg = load_app_config(ROOT / "config.yaml")
+    cfg = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "webapp.sqlite"
         storage = LogStorage(db)
@@ -155,7 +155,7 @@ def test_ingest_once_tracks_prefix_state_and_skips_duplicate_falco_copy():
 
 
 def _make_webapp(db_path: Path) -> WebApp:
-    cfg = load_app_config(ROOT / "config.yaml")
+    cfg = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     cfg = replace(cfg, webapp=replace(cfg.webapp, db_path=db_path))
     return WebApp(cfg)
 

@@ -89,7 +89,7 @@ def make_job(store, summarizer=None, **overrides):
     from webapp.api.config import AiConfig, InsightsConfig
     from dataclasses import replace
 
-    base = load_app_config(ROOT / "config.yaml")
+    base = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     cfg = replace(
         base,
         insights=InsightsConfig(**defaults),
@@ -240,7 +240,7 @@ def test_openrouter_summarize_anomaly_uses_supported_parameters(monkeypatch, cap
         reasoning_effort="medium",
     )
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
-    monkeypatch.setattr("webapp.api.ai_summary._supported_parameters", lambda model: {"reasoning_effort", "response_format"})
+    monkeypatch.setattr("webapp.api.ai_summary._supported_parameters", lambda model, base_url=None: {"reasoning_effort", "response_format"})
 
     captured = {}
 
@@ -320,6 +320,33 @@ def test_openrouter_missing_model_logs_once(monkeypatch, caplog):
     assert summarize_anomaly(anomaly, cfg) is None
     warnings = [record.message for record in caplog.records if "no model is set" in record.message]
     assert len(warnings) == 1
+
+
+def test_persistent_ai_failure_is_recorded_after_bounded_retries(store):
+    """A provider that keeps failing for one anomaly must not hold the per-tick
+    quota forever: after the retry budget it is marked failed, and re-detection
+    keeps the recorded error."""
+    from webapp.api.insights import _MAX_AI_ATTEMPTS_PER_ANOMALY
+
+    job = make_job(store, summarizer=None)
+    upsert = dict(type="message_frequency", namespace="app", pod="", rule_key="boom",
+                  severity="error", detected_day="2026-09-07")
+    anomaly_id = store.upsert_anomaly(evidence={"current_count": 1}, **upsert)
+
+    def always_failing(anomaly):
+        raise RuntimeError("provider rejected the request")
+
+    job._summarizer = always_failing
+    for attempt in range(1, _MAX_AI_ATTEMPTS_PER_ANOMALY + 1):
+        assert job.summarize_pending() == 0
+        row = store._conn.execute("SELECT ai_summarized_at FROM anomalies WHERE id=?", (anomaly_id,)).fetchone()
+        assert (row["ai_summarized_at"] is None) == (attempt < _MAX_AI_ATTEMPTS_PER_ANOMALY)
+
+    assert store.pending_ai_anomalies(10) == []
+    store.upsert_anomaly(evidence={"current_count": 2}, **upsert)  # next detection tick
+    item = store.query_anomalies({}, limit=10)["items"][0]
+    assert item["evidence"]["current_count"] == 2
+    assert item["evidence"]["ai_error"] == "provider rejected the request"
 
 
 def test_ai_failure_keeps_anomaly_retryable(store):
@@ -537,7 +564,7 @@ def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
     # Create schema via LogStorage first
     storage = LogStorage(db_path)
 
-    base = load_app_config(ROOT / "config.yaml")
+    base = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     cfg = replace(
         base,
         ai=AiConfig(

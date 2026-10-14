@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,12 @@ DEFAULT_BACKEND = {
     "db_path": "/tmp/logscope-webapp.sqlite",
     "page_size_default": 200,
     "page_size_max": 1000,
+    # Re-list this much key time behind each prefix cursor to catch objects that
+    # Vector flushes after a later-named object (see ingest.lookback_start_after).
+    "s3_lookback_secs": 3600,
+    # Records older than this are pruned from the local cache. None = follow
+    # sinks.s3.retention_days (the source objects expire then anyway); 0 = keep forever.
+    "retention_days": None,
 }
 
 DEFAULT_INSIGHTS = {
@@ -34,6 +41,15 @@ DEFAULT_AI = {
     "api_key_env": "OPENROUTER_API_KEY",
     "max_anomalies_per_tick": 5,
     "reasoning_effort": "medium",
+    "base_url": "",
+}
+
+# Conventional key variable per provider when webapp.ai.api_key_env is not set.
+_DEFAULT_KEY_ENV = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
 }
 
 DEFAULT_MATTERMOST = {
@@ -52,6 +68,8 @@ class BackendConfig:
     db_path: Path
     page_size_default: int
     page_size_max: int
+    s3_lookback_secs: int = 3600
+    retention_days: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,6 +94,7 @@ class AiConfig:
     api_key_env: str
     max_anomalies_per_tick: int
     reasoning_effort: str
+    base_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -144,9 +163,19 @@ def load_app_config(config_path: Path) -> AppConfig:
     insights = dict(DEFAULT_INSIGHTS)
     insights.update(webapp.get("insights") or {})
     ai = dict(DEFAULT_AI)
-    ai.update(webapp.get("ai") or {})
+    ai_raw = webapp.get("ai") or {}
+    if "api_key_env" not in ai_raw:
+        ai["api_key_env"] = _DEFAULT_KEY_ENV.get(str(ai_raw.get("provider", "")).strip().lower(), DEFAULT_AI["api_key_env"])
+    ai.update(ai_raw)
     mattermost = dict(DEFAULT_MATTERMOST)
     mattermost.update(webapp.get("mattermost") or {})
+    # Container deployments mount persistent storage at a different path than
+    # the local-dev default; same LOGSCOPE_* override style as scripts/render.py.
+    if os.environ.get("LOGSCOPE_WEBAPP_DB_PATH"):
+        backend["db_path"] = os.environ["LOGSCOPE_WEBAPP_DB_PATH"]
+    retention_days = backend.get("retention_days")
+    if retention_days is None:
+        retention_days = s3_cfg.get("retention_days") or 0
     creds = _load_secret_credentials(config_path.parent / "deploy" / "k3s" / "s3-secret.yaml")
 
     if not s3_cfg.get("bucket"):
@@ -182,6 +211,8 @@ def load_app_config(config_path: Path) -> AppConfig:
             db_path=Path(str(backend["db_path"])).expanduser(),
             page_size_default=int(backend["page_size_default"]),
             page_size_max=int(backend["page_size_max"]),
+            s3_lookback_secs=int(backend["s3_lookback_secs"]),
+            retention_days=int(retention_days),
         ),
         insights=InsightsConfig(
             enabled=bool(insights["enabled"]),
@@ -199,9 +230,10 @@ def load_app_config(config_path: Path) -> AppConfig:
         ai=AiConfig(
             provider=str(ai.get("provider", "openrouter")),
             model=str(ai["model"]),
-            api_key_env=str(ai.get("api_key_env", "GEMINI_API_KEY" if str(ai.get("provider")) == "gemini" else "OPENROUTER_API_KEY")),
+            api_key_env=str(ai["api_key_env"]),
             max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
-            reasoning_effort=str(ai.get("reasoning_effort", "medium")),
+            reasoning_effort=str(ai.get("reasoning_effort") or ""),
+            base_url=str(ai.get("base_url") or ""),
         ),
         mattermost=MattermostConfig(
             enabled=bool(mattermost["enabled"]),

@@ -31,6 +31,8 @@ const state = {
   expandedGroups: new Set(),
   groupByRule: false,
   aiConfigured: false,
+  // Server capability from /api/status; the server enforces it (403) regardless.
+  actionsEnabled: false,
   explainCooldownUntil: 0,
   anomalies: [],
   insightsLoaded: false,
@@ -1256,25 +1258,32 @@ function renderActionableWorkspace() {
       copyBtn.textContent = 'Copy';
       copyBtn.addEventListener('click', () => copyToClipboard(step.command, copyBtn));
 
-      const runBtn = document.createElement('button');
-      runBtn.type = 'button';
-      runBtn.className = `step-btn-run ${risk !== 'read-only' ? 'mutating' : ''}`;
-      runBtn.disabled = stepState.status === 'running';
-
-      if (stepState.status === 'running') {
-        runBtn.textContent = 'Running…';
-      } else if (stepState.status === 'success' || stepState.status === 'failed') {
-        runBtn.textContent = 'Re-run';
-      } else if (risk !== 'read-only') {
-        runBtn.textContent = 'Confirm & Run';
-      } else {
-        runBtn.textContent = 'Run Step';
-      }
-
-      runBtn.addEventListener('click', () => executeActionableStep(index));
-
       tools.appendChild(copyBtn);
-      tools.appendChild(runBtn);
+
+      if (state.actionsEnabled) {
+        const runBtn = document.createElement('button');
+        runBtn.type = 'button';
+        runBtn.className = `step-btn-run ${risk !== 'read-only' ? 'mutating' : ''}`;
+        runBtn.disabled = stepState.status === 'running';
+
+        if (stepState.status === 'running') {
+          runBtn.textContent = 'Running…';
+        } else if (stepState.status === 'success' || stepState.status === 'failed') {
+          runBtn.textContent = 'Re-run';
+        } else if (risk !== 'read-only') {
+          runBtn.textContent = 'Confirm & Run';
+        } else {
+          runBtn.textContent = 'Run Step';
+        }
+
+        runBtn.addEventListener('click', () => executeActionableStep(index));
+        tools.appendChild(runBtn);
+      } else {
+        const note = document.createElement('span');
+        note.className = 'subtle';
+        note.textContent = 'Running commands is disabled on this server — copy and run it yourself.';
+        tools.appendChild(note);
+      }
       cmdBox.appendChild(code);
       cmdBox.appendChild(tools);
       body.appendChild(cmdBox);
@@ -1343,6 +1352,7 @@ function renderActionableWorkspace() {
 }
 
 async function executeActionableStep(index, confirmed = false) {
+  if (!state.actionsEnabled) return;
   const plan = state.actionable.plan;
   if (!plan || !plan.steps || !plan.steps[index]) return;
 
@@ -1671,6 +1681,7 @@ async function init() {
   const status = await fetchJson('/api/status');
   state.lastStatus = status;
   state.aiConfigured = Boolean(status.ai_configured);
+  state.actionsEnabled = status.actions_enabled === true;
   updateExplainButton();
   updateHealthFromStatus(status);
   if (status.last_successful_ingest_at) {

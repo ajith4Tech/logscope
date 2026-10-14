@@ -43,7 +43,40 @@ from .config import AiConfig
 
 logger = logging.getLogger(__name__)
 
-_OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+SUPPORTED_PROVIDERS = ("openrouter", "gemini", "openai", "anthropic")
+
+# Default API roots; webapp.ai.base_url overrides the one for the selected
+# provider (proxy, gateway, or a compatible self-hosted endpoint).
+_DEFAULT_BASE_URLS = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "gemini": "https://generativelanguage.googleapis.com",
+    "openai": "https://api.openai.com/v1",
+    "anthropic": "https://api.anthropic.com",
+}
+
+# Claude models that accept server-side refusal fallbacks ("default" mode).
+# Sent only to the default Anthropic endpoint; other platforms reject it.
+_ANTHROPIC_FALLBACK_MODELS = frozenset(
+    {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
+)
+# Per-attempt timeout (thinking is always on for current Claude models) and SDK
+# retries. Worst case ≈ 2 attempts × 90 s, comparable to the urllib providers'
+# 4 × 30 s, so one call cannot hold an HTTP request thread for many minutes.
+_ANTHROPIC_TIMEOUT_SECONDS = 90
+_ANTHROPIC_MAX_RETRIES = 1
+
+# Output budget for OpenAI Chat Completions. Reasoning models spend part of it
+# on reasoning tokens; an empty answer with finish_reason "length" is reported
+# explicitly instead of as an empty summary.
+_OPENAI_MAX_COMPLETION_TOKENS = 4096
+
+# OpenRouter's model index (used to decide which optional parameters a model
+# accepts) is cached per base URL instead of being fetched on every call.
+_OPENROUTER_INDEX_TTL_SECONDS = 3600
+_OPENROUTER_INDEX_FAILURE_TTL_SECONDS = 300
+_OPENROUTER_INDEX_MAX_ENTRIES = 8
+_openrouter_index_cache: dict[str, tuple[float, dict[str, dict[str, Any]]]] = {}
+_openrouter_index_lock = threading.Lock()
 
 # Retry transient provider/network failures only.
 _TRANSIENT_HTTP_STATUS_CODES = {
@@ -198,7 +231,7 @@ def explain_log_line(
     """
 
     provider = str(cfg.provider or "").strip().lower()
-    if provider not in ("openrouter", "gemini"):
+    if provider not in SUPPORTED_PROVIDERS:
         return None
 
     api_key = os.environ.get(cfg.api_key_env, "")
@@ -230,24 +263,7 @@ def explain_log_line(
         "message": record.get("message"),
     }
 
-    if provider == "openrouter":
-        return _summarize_openrouter(
-            payload,
-            model,
-            api_key,
-            cfg.reasoning_effort,
-            system_prompt=_EXPLAIN_LINE_SYSTEM_PROMPT,
-        )
-
-    if provider == "gemini":
-        return _summarize_gemini(
-            payload,
-            model,
-            api_key,
-            system_prompt=_EXPLAIN_LINE_SYSTEM_PROMPT,
-        )
-
-    return None
+    return _call_provider(provider, payload, model, api_key, cfg, _EXPLAIN_LINE_SYSTEM_PROMPT)
 
 
 def summarize_anomaly(
@@ -257,7 +273,7 @@ def summarize_anomaly(
     """Summarize an already-detected anomaly and generate troubleshooting steps."""
 
     provider = str(cfg.provider or "").strip().lower()
-    if provider not in ("openrouter", "gemini"):
+    if provider not in SUPPORTED_PROVIDERS:
         return None
 
     api_key = os.environ.get(cfg.api_key_env, "")
@@ -281,24 +297,7 @@ def summarize_anomaly(
 
     payload = build_prompt_payload(anomaly)
 
-    if provider == "openrouter":
-        return _summarize_openrouter(
-            payload,
-            model,
-            api_key,
-            cfg.reasoning_effort,
-            system_prompt=_SYSTEM_PROMPT,
-        )
-
-    if provider == "gemini":
-        return _summarize_gemini(
-            payload,
-            model,
-            api_key,
-            system_prompt=_SYSTEM_PROMPT,
-        )
-
-    return None
+    return _call_provider(provider, payload, model, api_key, cfg, _SYSTEM_PROMPT)
 
 
 def explain_logs(
@@ -313,7 +312,7 @@ def explain_logs(
     """
 
     provider = str(cfg.provider or "").strip().lower()
-    if provider not in ("openrouter", "gemini"):
+    if provider not in SUPPORTED_PROVIDERS:
         return None
 
     api_key = os.environ.get(cfg.api_key_env, "")
@@ -335,23 +334,37 @@ def explain_logs(
         )
         return None
 
+    return _call_provider(provider, payload, model, api_key, cfg, _EXPLAIN_SYSTEM_PROMPT)
+
+
+def _base_url(provider: str, cfg: AiConfig) -> str:
+    return (str(cfg.base_url or "").strip() or _DEFAULT_BASE_URLS[provider]).rstrip("/")
+
+
+def _call_provider(
+    provider: str,
+    payload: dict[str, Any],
+    model: str,
+    api_key: str,
+    cfg: AiConfig,
+    system_prompt: str,
+) -> dict[str, Any] | None:
+    base_url = _base_url(provider, cfg)
     if provider == "openrouter":
         return _summarize_openrouter(
-            payload,
-            model,
-            api_key,
-            cfg.reasoning_effort,
-            system_prompt=_EXPLAIN_SYSTEM_PROMPT,
+            payload, model, api_key, cfg.reasoning_effort,
+            system_prompt=system_prompt, base_url=base_url,
         )
-
     if provider == "gemini":
-        return _summarize_gemini(
-            payload,
-            model,
-            api_key,
-            system_prompt=_EXPLAIN_SYSTEM_PROMPT,
+        return _summarize_gemini(payload, model, api_key, system_prompt=system_prompt, base_url=base_url)
+    if provider == "openai":
+        return _summarize_openai(payload, model, api_key, system_prompt=system_prompt, base_url=base_url)
+    if provider == "anthropic":
+        return _summarize_anthropic(
+            payload, model, api_key, cfg.reasoning_effort,
+            system_prompt=system_prompt,
+            base_url=str(cfg.base_url or "").strip(),
         )
-
     return None
 
 
@@ -794,10 +807,25 @@ def _post_json(
 # OpenRouter
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _openrouter_models_index() -> dict[str, dict[str, Any]]:
+def _openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
+    now = time.monotonic()
+    with _openrouter_index_lock:
+        cached = _openrouter_index_cache.get(base_url)
+        if cached and cached[0] > now:
+            return cached[1]
+    index = _fetch_openrouter_models_index(base_url)
+    ttl = _OPENROUTER_INDEX_TTL_SECONDS if index else _OPENROUTER_INDEX_FAILURE_TTL_SECONDS
+    with _openrouter_index_lock:
+        if len(_openrouter_index_cache) >= _OPENROUTER_INDEX_MAX_ENTRIES:
+            _openrouter_index_cache.clear()
+        _openrouter_index_cache[base_url] = (now + ttl, index)
+    return index
+
+
+def _fetch_openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
     try:
         req = request.Request(
-            _OPENROUTER_MODELS_URL,
+            f"{base_url}/models",
             headers={
                 "Accept": "application/json",
                 "User-Agent": "logscope-webapp/1.0",
@@ -824,8 +852,8 @@ def _openrouter_models_index() -> dict[str, dict[str, Any]]:
     return out
 
 
-def _supported_parameters(model: str) -> set[str]:
-    item = _openrouter_models_index().get(model) or {}
+def _supported_parameters(model: str, base_url: str = _DEFAULT_BASE_URLS["openrouter"]) -> set[str]:
+    item = _openrouter_models_index(base_url).get(model) or {}
     params = item.get("supported_parameters") or []
 
     return {
@@ -840,8 +868,9 @@ def _summarize_openrouter(
     api_key: str,
     reasoning_effort: str,
     system_prompt: str = _SYSTEM_PROMPT,
+    base_url: str = _DEFAULT_BASE_URLS["openrouter"],
 ) -> dict[str, Any]:
-    params = _supported_parameters(model)
+    params = _supported_parameters(model, base_url)
 
     messages = [
         {
@@ -875,7 +904,7 @@ def _summarize_openrouter(
 
     data = _post_json(
         provider="OpenRouter",
-        url="https://openrouter.ai/api/v1/chat/completions",
+        url=f"{base_url}/chat/completions",
         body=body,
         headers={
             "Accept": "application/json",
@@ -916,11 +945,9 @@ def _summarize_gemini(
     model: str,
     api_key: str,
     system_prompt: str = _SYSTEM_PROMPT,
+    base_url: str = _DEFAULT_BASE_URLS["gemini"],
 ) -> dict[str, Any]:
-    url = (
-        "https://generativelanguage.googleapis.com/"
-        f"v1beta/models/{model}:generateContent"
-    )
+    url = f"{base_url}/v1beta/models/{model}:generateContent"
 
     body: dict[str, Any] = {
         "systemInstruction": {
@@ -988,4 +1015,133 @@ def _summarize_gemini(
             "Gemini summarization returned an empty summary"
         )
 
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenAI (Chat Completions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _summarize_openai(
+    payload: dict[str, Any],
+    model: str,
+    api_key: str,
+    system_prompt: str = _SYSTEM_PROMPT,
+    base_url: str = _DEFAULT_BASE_URLS["openai"],
+) -> dict[str, Any]:
+    # No temperature / reasoning_effort: OpenAI reasoning models reject a
+    # non-default temperature and non-reasoning models reject reasoning_effort.
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            },
+        ],
+        "max_completion_tokens": _OPENAI_MAX_COMPLETION_TOKENS,
+        "response_format": {"type": "json_object"},
+    }
+
+    data = _post_json(
+        provider="OpenAI",
+        url=f"{base_url}/chat/completions",
+        body=body,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "logscope-webapp/1.0",
+        },
+        api_key_to_redact=api_key,
+    )
+
+    choices = data.get("choices") or []
+    if not choices:
+        raise RuntimeError("OpenAI summarization returned no choices")
+    choice = choices[0] or {}
+    message = choice.get("message") or {}
+    if message.get("refusal"):
+        raise RuntimeError("OpenAI declined to summarize this content")
+    content = str(message.get("content") or "")
+    if not content.strip() and choice.get("finish_reason") == "length":
+        raise RuntimeError(
+            f"OpenAI used the whole max_completion_tokens budget ({_OPENAI_MAX_COMPLETION_TOKENS}) "
+            "without answer text; reasoning models can exhaust it on reasoning — choose a model "
+            "that answers within this budget"
+        )
+
+    result = _parse_summary_response(content)
+    if not result["summary"]:
+        raise RuntimeError("OpenAI summarization returned an empty summary")
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anthropic Claude (Messages API via the official SDK)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _summarize_anthropic(
+    payload: dict[str, Any],
+    model: str,
+    api_key: str,
+    reasoning_effort: str,
+    system_prompt: str = _SYSTEM_PROMPT,
+    base_url: str = "",
+) -> dict[str, Any]:
+    try:
+        import anthropic
+    except ImportError:
+        raise RuntimeError("The anthropic provider requires the 'anthropic' package") from None
+
+    # The SDK retries 408/409/429/5xx and connection errors itself.
+    client = anthropic.Anthropic(
+        api_key=api_key,
+        base_url=base_url or None,
+        timeout=_ANTHROPIC_TIMEOUT_SECONDS,
+        max_retries=_ANTHROPIC_MAX_RETRIES,
+    )
+    params: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 16000,
+        "system": system_prompt,
+        "messages": [
+            {
+                "role": "user",
+                "content": json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            }
+        ],
+    }
+    # Thinking is left at the model default (adaptive on current models);
+    # effort is the depth control. Set reasoning_effort to "" for older models
+    # that reject effort.
+    if reasoning_effort:
+        params["output_config"] = {"effort": reasoning_effort}
+
+    try:
+        if model in _ANTHROPIC_FALLBACK_MODELS and not base_url:
+            response = client.beta.messages.create(
+                betas=["server-side-fallback-2026-07-01"],
+                fallbacks="default",
+                **params,
+            )
+        else:
+            response = client.messages.create(**params)
+    except anthropic.APIStatusError as exc:
+        detail = _clean_error_message(str(getattr(exc, "message", "") or ""), api_key)
+        raise RuntimeError(
+            f"Anthropic summarization failed with HTTP {exc.status_code}: {detail}"
+        ) from None
+    except anthropic.APIConnectionError as exc:
+        detail = _clean_error_message(str(exc), api_key)
+        raise RuntimeError(f"Anthropic summarization network error: {detail}") from None
+
+    if response.stop_reason == "refusal":
+        raise RuntimeError("Anthropic declined to summarize this content (refusal)")
+
+    text = "".join(block.text for block in response.content if block.type == "text")
+    result = _parse_summary_response(text)
+    if not result["summary"]:
+        raise RuntimeError("Anthropic summarization returned an empty summary")
     return result
