@@ -201,6 +201,15 @@ falco:
 
 ## Backup
 
+File-sink installs only. The CronJob copies the node-local log files
+(`paths.host_path`, which must already exist on the node; its hostPath type is
+`Directory`). With an S3-only pipeline (`sinks.file.enabled: false`),
+`scripts/render.py` doesn't render it, because S3 and its lifecycle rule are
+the store. A CronJob left over from an earlier file-sink install keeps failing
+with `FailedMount`; remove it with
+`kubectl -n logging delete cronjob vector-log-backup` once you confirm nothing
+uses it.
+
 Byte-append, not rsync: skip a source whose last byte is not newline; if the
 backup is larger than the source, recopy; else append new bytes. Cadence is
 `backup.schedule` (default `*/30 * * * *`).
@@ -208,6 +217,13 @@ backup is larger than the source, recopy; else append new bytes. Cadence is
 ```bash
 kubectl -n logging create job --from=cronjob/vector-log-backup backup-manual
 ```
+
+## Web app
+
+`webapp/` is a log viewer with anomaly insights. It reads the S3 objects
+Vector writes (same `config.yaml`) and caches them in SQLite. Run it locally
+with `python3 -m webapp.api.server`. To run it in the cluster, see
+[`deploy/helm/logscope/README.md`](./deploy/helm/logscope/README.md).
 
 ## Notes
 

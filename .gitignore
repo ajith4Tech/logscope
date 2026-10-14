@@ -4,6 +4,12 @@ config.yaml
 # Filled S3 credentials — copy from deploy/k3s/s3-secret.example.yaml
 deploy/k3s/s3-secret.yaml
 
+# Operator Helm values for the web app (cluster-specific)
+deploy/helm/logscope/values.local.yaml
+
+# Scratch data from local container smoke tests
+.audit-tmp/
+
 # Runtime data — never commit scraped logs or offsets
 logs/
 backups/

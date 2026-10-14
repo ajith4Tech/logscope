@@ -1,0 +1,119 @@
+{{- if .Values.ingress.enabled }}
+{{- $ing := .Values.ingress }}
+{{- $host := required "ingress.host is required when ingress.enabled=true" $ing.host }}
+{{- if not (regexMatch "^([a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?\\.)+[a-z]{2,63}$" $host) }}
+{{- fail (printf "ingress.host %q must be a fully qualified lowercase DNS name (no scheme, port or path)" $host) }}
+{{- end }}
+{{- $traefik := eq $ing.controller "traefik" }}
+{{- if not (has $ing.controller (list "traefik" "other")) }}
+{{- fail "ingress.controller must be traefik or other" }}
+{{- end }}
+{{- $auth := $ing.basicAuth.secretName }}
+{{- if and $auth (not $traefik) }}
+{{- fail "ingress.basicAuth is implemented with a Traefik Middleware; with ingress.controller=other configure auth on your controller and set ingress.externalAuth=true" }}
+{{- end }}
+{{- if and (not $auth) (not $ing.externalAuth) }}
+{{- fail "ingress.enabled=true but Logscope has no built-in authentication: set ingress.basicAuth.secretName (Traefik), or ingress.externalAuth=true if auth is enforced in front of the Ingress" }}
+{{- end }}
+{{- if and (not $ing.tls.enabled) (not $ing.allowPlainHttp) }}
+{{- fail "ingress.tls.enabled=false would serve logs and credentials over plain HTTP: enable TLS, or set ingress.allowPlainHttp=true if TLS terminates in front of the controller" }}
+{{- end }}
+{{- $fullname := include "logscope.fullname" . }}
+{{- $ns := include "logscope.namespace" . }}
+{{- $middlewares := list }}
+{{- if $auth }}{{ $middlewares = append $middlewares (printf "%s-%s-auth@kubernetescrd" $ns $fullname) }}{{ end }}
+{{- $annotations := deepCopy ($ing.annotations | default dict) }}
+{{- if $traefik }}
+{{- $_ := set $annotations "traefik.ingress.kubernetes.io/router.entrypoints" (ternary "websecure" "web" $ing.tls.enabled) }}
+{{- if $ing.tls.enabled }}{{ $_ := set $annotations "traefik.ingress.kubernetes.io/router.tls" "true" }}{{ end }}
+{{- with $middlewares }}{{ $_ := set $annotations "traefik.ingress.kubernetes.io/router.middlewares" (join "," .) }}{{ end }}
+{{- end }}
+{{- if $auth }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-auth
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+spec:
+  basicAuth:
+    secret: {{ $auth }}
+---
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- if $ing.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ $host | quote }}
+      {{- with $ing.tls.secretName }}
+      secretName: {{ . }}
+      {{- end }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
+{{- if and $traefik $ing.tls.enabled $ing.httpsRedirect }}
+---
+# Plain-HTTP router for the same host that only redirects to HTTPS.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $fullname }}-https-redirect
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}-http-redirect
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: {{ printf "%s-%s-https-redirect@kubernetescrd" $ns $fullname }}
+spec:
+  {{- with $ing.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  rules:
+    - host: {{ $host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}
+                port:
+                  name: http
+{{- end }}
+{{- end }}

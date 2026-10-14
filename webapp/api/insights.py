@@ -10,9 +10,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .config import AppConfig, InsightsConfig
+from .storage import SQLITE_BUSY_TIMEOUT_SECS
 
 
 logger = logging.getLogger(__name__)
+
+# Consecutive summarization failures before an anomaly is marked failed
+# (shown as "AI error" in the UI) instead of being retried every tick, so a
+# persistently failing anomaly cannot block newer ones from the per-tick quota.
+_MAX_AI_ATTEMPTS_PER_ANOMALY = 3
 
 # Ports of the UI's message-normalization (webapp/ui/app.js ruleKeyOf) so the
 # grouping keys used for anomaly detection are identical to the ones used for
@@ -57,7 +63,7 @@ class AnomalyStore:
     untouched except for one additive index used by the windowed queries."""
 
     def __init__(self, db_path: Path):
-        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()
@@ -119,7 +125,10 @@ class AnomalyStore:
                                        detected_at, detected_day, updated_at, status)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
                 ON CONFLICT(type, namespace, pod, rule_key, detected_day) DO UPDATE SET
-                    evidence = excluded.evidence,
+                    evidence = CASE
+                        WHEN json_extract(anomalies.evidence, '$.ai_error') IS NULL THEN excluded.evidence
+                        ELSE json_set(excluded.evidence, '$.ai_error', json_extract(anomalies.evidence, '$.ai_error'))
+                    END,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -165,10 +174,11 @@ class AnomalyStore:
             self._conn.commit()
 
     def pending_ai_anomalies(self, limit: int) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            "SELECT * FROM anomalies WHERE ai_summarized_at IS NULL AND status='new' ORDER BY id LIMIT ?",
-            (limit,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM anomalies WHERE ai_summarized_at IS NULL AND status='new' ORDER BY id LIMIT ?",
+                (limit,),
+            ).fetchall()
         return [dict(row) for row in rows]
 
     def query_anomalies(self, params: dict[str, Any], *, limit: int) -> dict[str, Any]:
@@ -180,10 +190,11 @@ class AnomalyStore:
                 clauses.append(f"{field} = ?")
                 args.append(value)
         where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-        rows = self._conn.execute(
-            f"SELECT * FROM anomalies{where_sql} ORDER BY detected_at DESC, id DESC LIMIT ?",
-            (*args, limit + 1),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT * FROM anomalies{where_sql} ORDER BY detected_at DESC, id DESC LIMIT ?",
+                (*args, limit + 1),
+            ).fetchall()
         has_more = len(rows) > limit
         items = [dict(row) for row in rows[:limit]]
         for item in items:
@@ -217,9 +228,11 @@ class InsightsDetector:
     """Deterministic detection over the records table. All windows derive from
     a single `now` so the math is testable without sleeps or mocks."""
 
-    def __init__(self, conn: sqlite3.Connection, cfg: InsightsConfig):
+    def __init__(self, conn: sqlite3.Connection, cfg: InsightsConfig, lock: threading.RLock | None = None):
         self._conn = conn
         self.cfg = cfg
+        # The owner's lock when conn is shared with other threads (LogStorage.lock).
+        self._lock = lock or threading.RLock()
 
     def _hour_bounds(self, now: datetime) -> tuple[str, str]:
         hour_start = now.replace(minute=0, second=0, microsecond=0)
@@ -231,10 +244,11 @@ class InsightsDetector:
         return start.isoformat().replace("+00:00", "Z")
 
     def _window_rows(self, start: str, end: str, where: str = "") -> list[sqlite3.Row]:
-        return self._conn.execute(
-            f"SELECT timestamp, severity_bucket, namespace, pod, message FROM records WHERE timestamp >= ? AND timestamp < ?{where}",
-            (start, end),
-        ).fetchall()
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT timestamp, severity_bucket, namespace, pod, message FROM records WHERE timestamp >= ? AND timestamp < ?{where}",
+                (start, end),
+            ).fetchall()
 
     def _evidence(self, hour_start: str, hour_end: str, items: list, **extra: Any) -> dict[str, Any]:
         sample_messages: list[str] = []
@@ -302,10 +316,11 @@ class InsightsDetector:
         current_rows = self._window_rows(hour_start, hour_end, " AND scope='security'")
         if not current_rows:
             return []
-        prior_rows = self._conn.execute(
-            "SELECT message FROM records WHERE timestamp < ? AND scope='security'",
-            (hour_start,),
-        ).fetchall()
+        with self._lock:
+            prior_rows = self._conn.execute(
+                "SELECT message FROM records WHERE timestamp < ? AND scope='security'",
+                (hour_start,),
+            ).fetchall()
         prior_keys = {rule_key_of(row["message"]) for row in prior_rows}
         grouped: dict[str, list] = {}
         for row in current_rows:
@@ -432,15 +447,18 @@ class InsightsJob:
         records_conn: sqlite3.Connection,
         store: AnomalyStore,
         summarizer: Callable[[dict[str, Any]], dict[str, str] | None] | None = None,
+        records_lock: threading.RLock | None = None,
     ):
         self.cfg = cfg
         self.store = store
-        self.detector = InsightsDetector(records_conn, cfg.insights)
+        self.detector = InsightsDetector(records_conn, cfg.insights, records_lock)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self.last_run_at: str | None = None
         self.last_error: str | None = None
         self._summarizer = summarizer
+        # anomaly id -> consecutive failures; only ids still pending are kept.
+        self._ai_failures: dict[int, int] = {}
 
     def start(self) -> None:
         self._thread.start()
@@ -484,12 +502,27 @@ class InsightsJob:
     def summarize_pending(self) -> int:
         summarizer = self._summarizer or (lambda anomaly: None)
         count = 0
-        for anomaly in self.store.pending_ai_anomalies(self.cfg.ai.max_anomalies_per_tick):
+        pending = self.store.pending_ai_anomalies(self.cfg.ai.max_anomalies_per_tick)
+        pending_ids = {int(a["id"]) for a in pending}
+        self._ai_failures = {k: v for k, v in self._ai_failures.items() if k in pending_ids}
+        for anomaly in pending:
+            anomaly_id = int(anomaly["id"])
             try:
                 result = summarizer(anomaly)
             except Exception as exc:
-                logger.warning("AI summarization failed for anomaly %s: %s", anomaly["id"], exc)
+                failures = self._ai_failures.get(anomaly_id, 0) + 1
+                logger.warning(
+                    "AI summarization failed for anomaly %s (attempt %d/%d): %s",
+                    anomaly_id, failures, _MAX_AI_ATTEMPTS_PER_ANOMALY, exc,
+                )
+                if failures >= _MAX_AI_ATTEMPTS_PER_ANOMALY:
+                    # Provider error messages are already key-redacted.
+                    self.store.record_ai_failure(anomaly_id, str(exc)[:500])
+                    self._ai_failures.pop(anomaly_id, None)
+                else:
+                    self._ai_failures[anomaly_id] = failures
                 continue
+            self._ai_failures.pop(anomaly_id, None)
             if result:
                 self.store.save_ai_summary(
                     int(anomaly["id"]),

@@ -1,0 +1,267 @@
+# Logscope — the ONE file operators edit. See README.md for the full guide.
+#
+# SECURITY: if you put credentials in this file (s3.credentials.*, ai.apiKey),
+# the populated copy is a plaintext secret:
+#   - never commit it (keep it as values.local.yaml, which is gitignored);
+#   - chmod 600 it;
+#   - Helm also stores supplied values in the release record (a Secret of type
+#     helm.sh/release.v1 in the release namespace), readable by anyone allowed
+#     to read Secrets there.
+# Prefer the existingSecret options to keep credentials out of values entirely.
+
+# Namespace for Logscope's own resources. Empty = the Helm release namespace.
+namespace: ""
+
+# ---------------------------------------------------------------------------
+# S3 — where Vector writes classified logs and the web app reads them.
+# ---------------------------------------------------------------------------
+s3:
+  bucket: ""              # REQUIRED, e.g. my-cluster-logs
+  region: ""              # REQUIRED, e.g. eu-north-1
+  # Object key layout. Must stay as-is unless every reader/writer changes too.
+  keyPrefix: "k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
+  # Days of logs the web app keeps cached (match your bucket lifecycle rule;
+  # apply that rule once with scripts/apply_s3_lifecycle.py). 0 = keep forever.
+  retentionDays: 30
+  credentials:
+    # Read-only (s3:ListBucket + s3:GetObject on the prefix) — used by the web app.
+    webapp:
+      existingSecret: ""   # Secret with keys AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+      accessKeyId: ""      # or inline values (chart creates a Secret)
+      secretAccessKey: ""
+    # Write (s3:PutObject + s3:AbortMultipartUpload) — used only when vector.enabled.
+    vector:
+      existingSecret: ""   # e.g. logscope-s3-creds from the existing Vector install
+      accessKeyId: ""
+      secretAccessKey: ""
+
+# ---------------------------------------------------------------------------
+# AI summaries and explanations (optional, disabled by default). Called only
+# for detected anomalies and operator-requested explanations. When enabled,
+# RAW log content (messages, pod/namespace/container names, timestamps; up to
+# 50 lines per explanation) is sent unredacted to the selected provider and is
+# subject to that provider's retention policy. Logscope does not redact.
+# ---------------------------------------------------------------------------
+ai:
+  provider: none          # none | anthropic | gemini | openai | openrouter
+  model: ""               # required when provider != none, e.g.:
+                          #   anthropic: claude-opus-5-5   gemini: <gemini model id>
+                          #   openai: <openai model id>    openrouter: <vendor/model>
+  # API root override (proxy/gateway/compatible endpoint). Empty = provider default:
+  #   anthropic https://api.anthropic.com | gemini https://generativelanguage.googleapis.com
+  #   openai https://api.openai.com/v1    | openrouter https://openrouter.ai/api/v1
+  baseUrl: ""
+  # low | medium | high. Sent to Anthropic (output_config.effort) and to
+  # OpenRouter models that support it; ignored for Gemini and OpenAI.
+  # Set "" for older Claude models that reject effort.
+  reasoningEffort: medium
+  maxAnomaliesPerTick: 5
+  apiKey: ""              # inline key (chart creates a Secret), or:
+  existingSecret: ""      # existing Secret holding the key
+  existingSecretKey: AI_API_KEY
+  # Operator-triggered AI calls (explain / explain-line) allowed per minute
+  # across all users; cached answers don't count. Excess requests get HTTP 429.
+  # In-memory, per web app pod. 0 disables the limit.
+  rateLimitPerMinute: 10
+
+# ---------------------------------------------------------------------------
+# Log classification — shared by chart-managed Vector and the web app.
+# With an EXISTING Vector install, keep these identical to the config.yaml it
+# was rendered from (scripts/render.py), or the web app misreads its output.
+# ---------------------------------------------------------------------------
+logscope:
+  routing:
+    # Exact names or globs (* ?) treated as infrastructure namespaces.
+    infra_namespaces: [default, kube-public, kube-node-lease, kube-system]
+  # Falco integration: recognise Falco's JSON stdout by namespace and route it
+  # to scope "security". Works with an existing Falco or the chart-managed one.
+  falco:
+    enabled: true
+    namespace: falco      # namespace where Falco pods run
+    priority_map:         # all 8 Falco priorities → a severity bucket name
+      emergency: error
+      alert: error
+      critical: error
+      error: error
+      warning: warning
+      notice: info
+      informational: info
+      debug: debug
+  multiline:
+    enabled: true
+    starts_when: "^(\\d{4}-\\d{2}-\\d{2}[T ]\\d{2}:\\d{2}:\\d{2}|[EWIF]\\d{4}\\s|\\{|level=|(?:INFO|WARN(?:ING)?|ERROR|FATAL|DEBUG|TRACE|CRITICAL|PANIC):\\s)"
+    timeout_ms: 1000
+  severity:
+    default: info
+    text_fields: [message, msg, log, event, reason, description]
+    structured_fields: [level, lvl, Level, LEVEL, severity, severityText, loglevel, log_level, logLevel]
+    json_level_keys: [level, lvl, severity]
+    logfmt_level: true
+    buckets:
+      - name: error
+        level_equals: [err]
+        level_contains: [error, fatal, panic, critical, emerg, alert]
+        klog: "E"
+        keywords: [error, failed, failure, exception, traceback, panic, fatal, critical, emerg, segmentation fault]
+      - name: warning
+        level_contains: [warn]
+        klog: "W"
+        keywords: [warn]
+      - name: debug
+        level_contains: [debug, trace]
+        keywords: [debug, "trace:"]
+      - name: info
+        level_contains: [info, notice]
+        klog: "I"
+      - name: metrics
+        prometheus: true
+    extra_patterns: []    # e.g. [{pattern: '(?i)deadlock detected', bucket: error}]
+
+# ---------------------------------------------------------------------------
+# Web app (UI + API): Deployment, Service, PVC, ConfigMap, NetworkPolicy.
+# ---------------------------------------------------------------------------
+image:
+  repository: logscope-webapp   # or <registry>/<project>/logscope-webapp
+  tag: ""                       # REQUIRED, immutable (e.g. git SHA). Never "latest".
+  pullPolicy: IfNotPresent
+  pullSecrets: []               # existing docker-registry Secret names
+
+# 0 or 1 only: single-writer SQLite on a ReadWriteOnce volume.
+replicaCount: 1
+
+resources:
+  requests: {cpu: 50m, memory: 128Mi}
+  limits: {cpu: "1", memory: 512Mi}
+
+# SQLite cache + anomaly triage state. Disabled = emptyDir (state lost on restart).
+persistence:
+  enabled: true
+  size: 2Gi
+  storageClass: ""    # empty = cluster default
+  existingClaim: ""
+
+webapp:
+  logLevel: INFO
+  extraEnv: []        # e.g. HTTPS_PROXY / NO_PROXY. Not for secrets.
+  # POST/PATCH requests from browsers must come from the page's own origin (the
+  # Host the request was sent to). Add exact origins here only if a proxy in
+  # front rewrites the Host header, e.g. [https://logscope.example.com].
+  allowedOrigins: []
+  backend:
+    poll_interval_secs: 30
+    page_size_default: 200
+    page_size_max: 1000
+    s3_lookback_secs: 3600
+  insights:
+    enabled: true     # any other webapp.insights key from config.example.yaml may be added
+  # kubectl actions are always disabled (LOGSCOPE_ACTIONS_ENABLED=false): the
+  # API is unauthenticated, the image has no kubectl, the pod has no API token.
+
+service:
+  port: 8000
+
+probes:
+  startup: {periodSeconds: 5, timeoutSeconds: 5, failureThreshold: 24}
+  readiness: {periodSeconds: 10, timeoutSeconds: 5, failureThreshold: 3}
+  liveness: {periodSeconds: 20, timeoutSeconds: 5, failureThreshold: 3}
+
+# Only these peers may reach the web app (port-forward is unaffected).
+# Default: Traefik in kube-system (k3s default). Adjust for other controllers.
+networkPolicy:
+  enabled: true
+  ingressFrom:
+    - namespaceSelector:
+        matchLabels: {kubernetes.io/metadata.name: kube-system}
+      podSelector:
+        matchLabels: {app.kubernetes.io/name: traefik}
+
+# Access through a DNS hostname (README → "Exposing Logscope on a hostname").
+# Disabled by default. The app has NO authentication of its own, so rendering
+# fails unless the Ingress is protected: basic auth (Traefik) or externalAuth.
+# HTTPS is required unless allowPlainHttp is set (basic-auth passwords would
+# otherwise cross the network in clear text).
+ingress:
+  enabled: false
+  host: ""                 # REQUIRED when enabled, e.g. logscope.example.com (dedicated; no sub-path)
+  className: ""            # "" = the cluster's default IngressClass ("traefik" on this k3s)
+  # traefik: the chart adds Traefik entrypoint/TLS/middleware annotations and
+  #          can create the basic-auth and HTTPS-redirect Middlewares.
+  # other:   only a plain Ingress is rendered; add your controller's TLS/auth
+  #          annotations below and set externalAuth: true. Also adjust
+  #          networkPolicy.ingressFrom to your controller's pods.
+  controller: traefik
+  tls:
+    enabled: true
+    # kubernetes.io/tls Secret in the release namespace holding the certificate
+    # for `host`. "" = the controller's default certificate (Traefik: its
+    # self-signed certificate, browsers will warn).
+    secretName: ""
+  basicAuth:
+    # Traefik only. Existing Secret in the release namespace, key "users",
+    # htpasswd format (see README).
+    secretName: ""
+  # true only when authentication is enforced in front of this Ingress
+  # (SSO proxy, controller auth annotations). Never set it to "just make it work".
+  externalAuth: false
+  # Traefik only: plain-HTTP requests to `host` get a permanent redirect to
+  # HTTPS (nothing is served over HTTP).
+  httpsRedirect: true
+  # Must be true to render without TLS (e.g. TLS terminates on an external
+  # load balancer in front of Traefik).
+  allowPlainHttp: false
+  annotations: {}          # extra Ingress annotations (e.g. cert-manager.io/cluster-issuer)
+
+# ---------------------------------------------------------------------------
+# Vector agent (optional). Disabled by default: an existing Vector install
+# (scripts/render.py + vector/vector Helm release) keeps shipping logs.
+# Enable only after removing the existing install — see README.
+# ---------------------------------------------------------------------------
+vector:
+  enabled: false
+  image:
+    repository: docker.io/timberio/vector
+    tag: 0.57.0-debian
+    pullPolicy: IfNotPresent
+    pullSecrets: []   # only if Vector's image comes from a private registry
+  # Host directory for read checkpoints and the S3 disk buffer (up to ~2.5 GiB).
+  # Reusing /var/lib/vector continues from the existing install's checkpoints.
+  dataDir: /var/lib/vector
+  metrics:
+    enabled: true     # Prometheus exporter on :8686 (Vector internal metrics)
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    limits: {cpu: 500m, memory: 512Mi}
+  priorityClassName: system-node-critical
+  tolerations:
+    - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+    - {key: node-role.kubernetes.io/master, operator: Exists, effect: NoSchedule}
+  nodeSelector: {}
+  # Install fails if a DaemonSet with this name, not owned by this release,
+  # exists in the namespace (prevents double shipping). "" disables the check.
+  conflictCheck:
+    daemonSetName: vector
+
+# ---------------------------------------------------------------------------
+# Falco (optional) — the official falcosecurity/falco chart 9.1.0, vendored.
+# Disabled by default: an existing Falco install is used as-is. When enabled,
+# every key below is passed to the Falco chart unchanged.
+# ---------------------------------------------------------------------------
+falco:
+  enabled: false
+  # Must equal logscope.falco.namespace, must exist before install, and must
+  # NOT carry the vector.dev/exclude=true label (Vector would skip it).
+  namespaceOverride: falco
+  # Install fails if a DaemonSet with this name, not owned by this release,
+  # exists in that namespace (an existing Falco). "" disables the check.
+  # (Logscope-only key; the Falco chart ignores it.)
+  conflictCheck:
+    daemonSetName: falco
+  resources:
+    requests: {cpu: 100m, memory: 512Mi}
+    limits: {cpu: 1000m, memory: 1024Mi}
+  # JSON on stdout is what Logscope's Vector pipeline reads.
+  falco:
+    json_output: true
+    json_include_output_property: true
+    stdout_output:
+      enabled: true

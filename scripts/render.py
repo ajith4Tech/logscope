@@ -967,7 +967,9 @@ def main() -> int:
     write(out / "values-local.yaml", helm_values(cfg, mode="local"))
     write(out / "values-agent.yaml", helm_values(cfg, mode="agent"))
     write(out / "namespace.yaml", namespace_yaml(cfg))
-    if cfg["backup"].get("enabled"):
+    # The CronJob mirrors the file sink's output; with an S3-only pipeline
+    # (sinks.file.enabled: false) there is nothing on the node to back up.
+    if cfg["backup"].get("enabled") and cfg["sinks"]["file"].get("enabled"):
         write(out / "backup-cronjob.yaml", backup_cronjob(cfg))
     else:
         stale = out / "backup-cronjob.yaml"

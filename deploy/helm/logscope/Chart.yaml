@@ -1,0 +1,18 @@
+apiVersion: v2
+name: logscope
+description: Logscope — Kubernetes log classification (Vector → S3) with a web viewer, anomaly insights and optional AI summaries
+type: application
+version: 0.2.0
+dependencies:
+  # Official Falco chart, vendored in charts/ (sha256 2a767d6a… from
+  # falcosecurity.github.io/charts index) so installs need no network.
+  # Disabled by default: an existing Falco install is used as-is.
+  # There is deliberately no Chart.lock: helm install/upgrade/template use the
+  # vendored archive directly, and the exact version is pinned above. Do not
+  # run `helm dependency update/build` (they re-download). To upgrade Falco:
+  # helm pull falcosecurity/falco --version <v>, verify its digest against the
+  # repo index, replace charts/falco-*.tgz and bump `version` here.
+  - name: falco
+    version: 9.1.0
+    repository: https://falcosecurity.github.io/charts
+    condition: falco.enabled

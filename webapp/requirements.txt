@@ -1,0 +1,27 @@
+# Pinned runtime dependencies for the web app container image (webapp/Dockerfile).
+# Resolved together on python:3.12-slim-trixie (S3: boto3; config: PyYAML;
+# AI provider "anthropic": the official anthropic SDK and its dependencies).
+# To upgrade: bump versions here, rebuild, run the test suite, then redeploy.
+annotated-types==0.8.0
+anthropic==1.13.0
+anyio==4.15.1
+boto3==1.43.113
+botocore==1.43.113
+docstring_parser==0.18.0
+h11==0.16.0
+httpcore2==2.13.1
+httpx2==2.13.1
+idna==3.20
+jiter==0.17.0
+jmespath==1.1.0
+pydantic==2.14.1
+pydantic_core==2.50.1
+python-dateutil==2.9.0.post0
+PyYAML==6.0.3
+s3transfer==0.19.2
+six==1.17.0
+sniffio==1.3.1
+truststore==0.10.5
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.8.0

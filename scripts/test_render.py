@@ -62,7 +62,7 @@ def test_falco_priority_map_validation():
 
 
 def test_falco_rendered_into_both_kits():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     R.validate_cfg(cfg)
     ns_needle = f'if ns == "{cfg["falco"]["namespace"]}"'
     for name in ("values-local.yaml", "values-agent.yaml"):
@@ -87,7 +87,7 @@ def test_falco_rendered_into_both_kits():
 
 
 def test_falco_pipeline_dual_write_not_exclusive():
-    cfg = R.load_config(ROOT / "config.yaml")
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     doc = R.vector_config_dict(cfg, include_file=True, include_s3=False)
     assert doc["sinks"]["log_files"]["inputs"] == ["classify_and_scope"]
     assert doc["transforms"]["falco_security"]["inputs"] == ["classify_and_scope"]

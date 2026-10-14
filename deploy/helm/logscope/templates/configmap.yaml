@@ -1,0 +1,26 @@
+{{- /* The web app's config.yaml. No secrets: the AI key arrives via env. */ -}}
+{{- $buckets := list -}}
+{{- range .Values.logscope.severity.buckets }}{{ $buckets = append $buckets (dict "name" .name) }}{{ end -}}
+{{- $ai := dict
+  "provider" (lower (toString .Values.ai.provider))
+  "model" (toString .Values.ai.model)
+  "api_key_env" "LOGSCOPE_AI_API_KEY"
+  "base_url" (toString .Values.ai.baseUrl)
+  "reasoning_effort" (toString .Values.ai.reasoningEffort)
+  "max_anomalies_per_tick" (int .Values.ai.maxAnomaliesPerTick) -}}
+{{- $config := dict
+  "sinks" (dict "s3" (dict "bucket" .Values.s3.bucket "region" .Values.s3.region "key_prefix" .Values.s3.keyPrefix "retention_days" (int .Values.s3.retentionDays)))
+  "routing" (dict "infra_namespaces" .Values.logscope.routing.infra_namespaces)
+  "falco" (dict "enabled" .Values.logscope.falco.enabled "namespace" .Values.logscope.falco.namespace)
+  "severity" (dict "buckets" $buckets)
+  "webapp" (dict "backend" .Values.webapp.backend "insights" .Values.webapp.insights "ai" $ai) -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "logscope.fullname" . }}-config
+  namespace: {{ include "logscope.namespace" . }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+data:
+  config.yaml: |
+    {{- toYaml $config | nindent 4 }}
