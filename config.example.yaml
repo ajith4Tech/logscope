@@ -185,6 +185,8 @@ webapp:
     frequency_min_count: 30
     detect_per_pod: false          # also spike-check per pod (not just namespace)
     sample_timestamps_max: 10      # sample timestamps kept in evidence
+    min_baseline_hours: 24         # history needed before detectors fire ("learning" until then)
+    min_partial_window_minutes: 15 # evaluate the current hour once this much of it has passed
   # AI summarization (stage 2). Only invoked for newly-detected anomalies.
   # 'none' disables AI calls; keys come from the env var below, never from files.
   # OpenRouter: POST https://openrouter.ai/api/v1/chat/completions (Bearer ${OPENROUTER_API_KEY}).
@@ -196,3 +198,15 @@ webapp:
     api_key_env: OPENROUTER_API_KEY # key itself NEVER in config, env var only (e.g. OPENROUTER_API_KEY or GEMINI_API_KEY)
     max_anomalies_per_tick: 5
     reasoning_effort: medium        # low|medium|high — only passed to models that support it; ignored otherwise, don't error
+  # Optional Mattermost notifications for Insights anomalies (off by default).
+  # Sent once per anomaly occurrence at or above min_urgency; a recurrence of the
+  # same anomaly is suppressed for renotify_after_hours. Urgency per type:
+  # new_falco_rule error=urgent/warning=high, error_rate_spike=high, rising
+  # error share=high, message_frequency=medium (see webapp/api/notify.py).
+  mattermost:
+    enabled: false
+    webhook_url_env: MATTERMOST_WEBHOOK_URL  # the URL is a credential: env var only
+    min_urgency: high                        # low | medium | high | urgent
+    link_base_url: ""                        # e.g. https://logscope.example.com for links in messages
+    renotify_after_hours: 6
+    max_age_hours: 6                         # never send occurrences older than this
