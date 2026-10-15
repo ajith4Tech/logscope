@@ -47,6 +47,11 @@ spec:
           env:
             - name: LOGSCOPE_WEBAPP_DB_PATH
               value: /data/logscope.sqlite
+            # SQLite spills large sorts and index builds to temp files. Keep them
+            # on the PVC: on the /tmp emptyDir (sizeLimit) an index build on a
+            # large database could get the pod evicted.
+            - name: SQLITE_TMPDIR
+              value: /data
             # Fixed: the HTTP API has no authentication; never let it run kubectl.
             - name: LOGSCOPE_ACTIONS_ENABLED
               value: "false"
@@ -58,6 +63,10 @@ spec:
             - name: LOGSCOPE_ALLOWED_ORIGINS
               value: {{ join "," . | quote }}
             {{- end }}
+            # Host names the app answers to (DNS-rebinding guard); IP literals
+            # and localhost (kubectl port-forward) are always accepted.
+            - name: LOGSCOPE_TRUSTED_HOSTS
+              value: {{ include "logscope.trustedHosts" . | quote }}
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:
@@ -75,6 +84,14 @@ spec:
                 secretKeyRef:
                   name: {{ include "logscope.aiSecret" . }}
                   key: {{ include "logscope.aiSecretKey" . }}
+            {{- end }}
+            {{- if .Values.mattermost.enabled }}
+            # Webhook URL for anomaly notifications; config.yaml names this variable.
+            - name: LOGSCOPE_MATTERMOST_WEBHOOK_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.mattermost.existingSecret | default (printf "%s-credentials" (include "logscope.fullname" .)) }}
+                  key: {{ if .Values.mattermost.existingSecret }}{{ .Values.mattermost.existingSecretKey }}{{ else }}MATTERMOST_WEBHOOK_URL{{ end }}
             {{- end }}
             {{- with .Values.webapp.extraEnv }}
             {{- toYaml . | nindent 12 }}

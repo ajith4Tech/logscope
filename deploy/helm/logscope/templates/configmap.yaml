@@ -1,4 +1,4 @@
-{{- /* The web app's config.yaml. No secrets: the AI key arrives via env. */ -}}
+{{- /* The web app's config.yaml. No secrets: the AI key and the Mattermost webhook URL arrive via env. */ -}}
 {{- $buckets := list -}}
 {{- range .Values.logscope.severity.buckets }}{{ $buckets = append $buckets (dict "name" .name) }}{{ end -}}
 {{- $ai := dict
@@ -8,12 +8,19 @@
   "base_url" (toString .Values.ai.baseUrl)
   "reasoning_effort" (toString .Values.ai.reasoningEffort)
   "max_anomalies_per_tick" (int .Values.ai.maxAnomaliesPerTick) -}}
+{{- $mm := dict
+  "enabled" (and .Values.mattermost.enabled true)
+  "webhook_url_env" "LOGSCOPE_MATTERMOST_WEBHOOK_URL"
+  "min_urgency" (lower (toString .Values.mattermost.minUrgency))
+  "link_base_url" (toString .Values.mattermost.linkBaseUrl)
+  "renotify_after_hours" .Values.mattermost.renotifyAfterHours
+  "max_age_hours" .Values.mattermost.maxAgeHours -}}
 {{- $config := dict
   "sinks" (dict "s3" (dict "bucket" .Values.s3.bucket "region" .Values.s3.region "key_prefix" .Values.s3.keyPrefix "retention_days" (int .Values.s3.retentionDays)))
   "routing" (dict "infra_namespaces" .Values.logscope.routing.infra_namespaces)
   "falco" (dict "enabled" .Values.logscope.falco.enabled "namespace" .Values.logscope.falco.namespace)
   "severity" (dict "buckets" $buckets)
-  "webapp" (dict "backend" .Values.webapp.backend "insights" .Values.webapp.insights "ai" $ai) -}}
+  "webapp" (dict "backend" .Values.webapp.backend "insights" .Values.webapp.insights "ai" $ai "mattermost" $mm) -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

@@ -297,3 +297,28 @@ def test_vector_pull_secrets_rbac_names_and_webapp_env():
     assert env["LOGSCOPE_ALLOWED_ORIGINS"] == "https://logs.example.com"
     assert env["LOGSCOPE_ACTIONS_ENABLED"] == "false"
 
+
+
+@pytest.mark.parametrize("name", ["LOGSCOPE_ACTIONS_ENABLED", "LOGSCOPE_TRUSTED_HOSTS", "LOGSCOPE_WEBAPP_DB_PATH", "SQLITE_TMPDIR",
+                                  "AWS_SECRET_ACCESS_KEY"])
+def test_extra_env_cannot_override_chart_managed_variables(name):
+    _, err = _helm(_merge(BASE, {"webapp": {"extraEnv": [{"name": name, "value": "x"}]}}), expect_ok=False)
+    assert f"webapp.extraEnv must not set {name}" in err
+
+
+def test_trusted_hosts_and_fixed_action_kill_switch():
+    docs, _ = _helm(_merge(BASE, {
+        "ingress": {"enabled": True, "host": "logs.example.internal", "basicAuth": {"secretName": "auth"}},
+        "webapp": {"trustedHosts": ["*.corp.example"], "extraEnv": [{"name": "HTTPS_PROXY", "value": "http://p:3128"}]},
+    }))
+    env = _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]["containers"][0]["env"]
+    names = [e["name"] for e in env]
+    assert names.count("LOGSCOPE_ACTIONS_ENABLED") == 1
+    values = {e["name"]: e.get("value") for e in env}
+    assert values["LOGSCOPE_ACTIONS_ENABLED"] == "false" and values["HTTPS_PROXY"] == "http://p:3128"
+    # SQLite temp files on the PVC, not the size-limited /tmp emptyDir.
+    assert values["SQLITE_TMPDIR"] == "/data"
+    assert values["LOGSCOPE_TRUSTED_HOSTS"].split(",") == [
+        "logscope-webapp", "logscope-webapp.logging", "logscope-webapp.logging.svc",
+        "logscope-webapp.logging.svc.cluster.local", "logs.example.internal", "*.corp.example",
+    ]

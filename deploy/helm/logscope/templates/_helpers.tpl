@@ -17,7 +17,7 @@
      an existingSecret is not visible to Helm; restart the workload instead. */}}
 {{- define "logscope.webapp.credentialsChecksum" -}}
 {{- $c := .Values.s3.credentials.webapp -}}
-{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey | toJson | sha256sum -}}
+{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey .Values.mattermost.enabled .Values.mattermost.existingSecret .Values.mattermost.existingSecretKey .Values.mattermost.webhookUrl | toJson | sha256sum -}}
 {{- end -}}
 
 {{- define "logscope.vector.credentialsChecksum" -}}
@@ -79,7 +79,35 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- end -}}
 
 {{/* Fails rendering with an actionable message. Never echoes secret values. */}}
+{{/*
+Comma-separated LOGSCOPE_TRUSTED_HOSTS: the in-cluster Service names, the
+Ingress host when enabled, and webapp.trustedHosts.
+*/}}
+{{- define "logscope.trustedHosts" -}}
+{{- $svc := include "logscope.fullname" . -}}
+{{- $ns := include "logscope.namespace" . -}}
+{{- $hosts := list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) -}}
+{{- if and .Values.ingress.enabled .Values.ingress.host -}}
+{{- $hosts = append $hosts .Values.ingress.host -}}
+{{- end -}}
+{{- range .Values.webapp.trustedHosts -}}
+{{- $hosts = append $hosts . -}}
+{{- end -}}
+{{- join "," $hosts -}}
+{{- end -}}
+
+{{/* Variables the chart sets itself; webapp.extraEnv must not override them. */}}
+{{- define "logscope.reservedEnv" -}}
+LOGSCOPE_WEBAPP_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVEL LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE LOGSCOPE_ALLOWED_ORIGINS LOGSCOPE_TRUSTED_HOSTS LOGSCOPE_AI_API_KEY LOGSCOPE_MATTERMOST_WEBHOOK_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+{{- end -}}
+
 {{- define "logscope.validate" -}}
+{{- $reserved := splitList " " (include "logscope.reservedEnv" .) -}}
+{{- range .Values.webapp.extraEnv -}}
+{{- if has (toString .name) $reserved -}}
+{{- fail (printf "webapp.extraEnv must not set %s: the chart sets it, and a duplicate entry would silently override the chart's value (LOGSCOPE_ACTIONS_ENABLED is always false; use webapp.trustedHosts / webapp.allowedOrigins / webapp.logLevel instead)" .name) -}}
+{{- end -}}
+{{- end -}}
 {{- if gt (int .Values.replicaCount) 1 -}}
 {{- fail "replicaCount must be 0 or 1: the web app uses a single-writer SQLite database on a ReadWriteOnce volume" -}}
 {{- end -}}
@@ -99,6 +127,15 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version }}
 {{- $_ := required "ai.model is required when ai.provider is not none" .Values.ai.model -}}
 {{- if not (or .Values.ai.apiKey .Values.ai.existingSecret) -}}
 {{- fail "ai.apiKey or ai.existingSecret is required when ai.provider is not none" -}}
+{{- end -}}
+{{- end -}}
+{{- if .Values.mattermost.enabled -}}
+{{- if not (or .Values.mattermost.webhookUrl .Values.mattermost.existingSecret) -}}
+{{- fail "mattermost.webhookUrl or mattermost.existingSecret is required when mattermost.enabled is true" -}}
+{{- end -}}
+{{- $urgencies := list "low" "medium" "high" "urgent" -}}
+{{- if not (has (lower (toString .Values.mattermost.minUrgency)) $urgencies) -}}
+{{- fail "mattermost.minUrgency must be one of low, medium, high, urgent" -}}
 {{- end -}}
 {{- end -}}
 {{- $buckets := list -}}

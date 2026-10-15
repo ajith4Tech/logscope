@@ -31,16 +31,17 @@ s3:
       secretAccessKey: ""
     # Write (s3:PutObject + s3:AbortMultipartUpload) — used only when vector.enabled.
     vector:
-      existingSecret: ""   # e.g. logscope-s3-creds from the existing Vector install
+      existingSecret: ""   # e.g. the existing Vector install's Secret: sinks.s3.secret_name in its config.yaml (default vector-s3-creds)
       accessKeyId: ""
       secretAccessKey: ""
 
 # ---------------------------------------------------------------------------
 # AI summaries and explanations (optional, disabled by default). Called only
 # for detected anomalies and operator-requested explanations. When enabled,
-# RAW log content (messages, pod/namespace/container names, timestamps; up to
-# 50 lines per explanation) is sent unredacted to the selected provider and is
-# subject to that provider's retention policy. Logscope does not redact.
+# log content (messages, pod/namespace/container names, timestamps; up to 50
+# lines per explanation) is sent to the selected provider and is subject to
+# its retention policy. Common secrets and email addresses are redacted first;
+# redaction is pattern-based and not complete (see DEPLOYMENT.md).
 # ---------------------------------------------------------------------------
 ai:
   provider: none          # none | anthropic | gemini | openai | openrouter
@@ -63,6 +64,24 @@ ai:
   # across all users; cached answers don't count. Excess requests get HTTP 429.
   # In-memory, per web app pod. 0 disables the limit.
   rateLimitPerMinute: 10
+
+# ---------------------------------------------------------------------------
+# Optional Mattermost notifications for Insights anomalies (off by default).
+# One message per anomaly occurrence at or above minUrgency; recurrences of
+# the same anomaly are suppressed for renotifyAfterHours. Delivery status is
+# shown in /api/status and on the UI's Pipeline tab.
+# ---------------------------------------------------------------------------
+mattermost:
+  enabled: false
+  webhookUrl: ""          # incoming-webhook URL (a credential; chart creates a Secret), or:
+  existingSecret: ""      # existing Secret holding the URL
+  existingSecretKey: MATTERMOST_WEBHOOK_URL
+  minUrgency: high        # low | medium | high | urgent (see webapp/api/notify.py)
+  # Public URL of the Logscope UI for "open investigation" links, e.g.
+  # https://logscope.example.com. Empty = messages carry no links.
+  linkBaseUrl: ""
+  renotifyAfterHours: 6
+  maxAgeHours: 6
 
 # ---------------------------------------------------------------------------
 # Log classification — shared by chart-managed Vector and the web app.
@@ -142,11 +161,18 @@ persistence:
 
 webapp:
   logLevel: INFO
-  extraEnv: []        # e.g. HTTPS_PROXY / NO_PROXY. Not for secrets.
+  # e.g. HTTPS_PROXY / NO_PROXY. Not for secrets. Variables the chart sets
+  # itself (LOGSCOPE_ACTIONS_ENABLED, LOGSCOPE_TRUSTED_HOSTS, ...) are refused.
+  extraEnv: []
   # POST/PATCH requests from browsers must come from the page's own origin (the
   # Host the request was sent to). Add exact origins here only if a proxy in
   # front rewrites the Host header, e.g. [https://logscope.example.com].
   allowedOrigins: []
+  # The app only answers requests whose Host header is trusted (DNS-rebinding
+  # guard). Always trusted: IP addresses, localhost (kubectl port-forward), this
+  # release's Service names and ingress.host. Add any other name users reach
+  # it by, e.g. [logs.internal.example.com] or ["*.example.com"].
+  trustedHosts: []
   backend:
     poll_interval_secs: 30
     page_size_default: 200
@@ -223,7 +249,8 @@ vector:
     tag: 0.57.0-debian
     pullPolicy: IfNotPresent
     pullSecrets: []   # only if Vector's image comes from a private registry
-  # Host directory for read checkpoints and the S3 disk buffer (up to ~2.5 GiB).
+  # Host directory for read checkpoints and the S3 disk buffers: 2.5 GiB per
+  # S3 sink, so up to 5 GiB with logscope.falco.enabled (adds falco_security_s3).
   # Reusing /var/lib/vector continues from the existing install's checkpoints.
   dataDir: /var/lib/vector
   metrics:

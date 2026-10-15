@@ -225,6 +225,15 @@ Vector writes (same `config.yaml`) and caches them in SQLite. Run it locally
 with `python3 -m webapp.api.server`. To run it in the cluster, see
 [`deploy/helm/logscope/README.md`](./deploy/helm/logscope/README.md).
 
+- Running suggested `kubectl` steps from the UI is off unless you start the
+  server with `LOGSCOPE_ACTIONS_ENABLED=true` (they run with your kubeconfig;
+  the API has no authentication).
+- The server answers only to trusted `Host` names: IP addresses, `localhost`
+  and the `--host` name. Reach it by any other name? Add it to
+  `LOGSCOPE_TRUSTED_HOSTS` (comma-separated; `*.example.com` allowed).
+- Back up the SQLite cache with `python -m webapp.api.dbtool backup <file>`
+  (see the chart README for restore).
+
 ## Notes
 
 - Image pin: chart **0.57.0** → `timberio/vector:0.57.0-debian` (not in YAML config).

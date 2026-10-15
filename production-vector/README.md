@@ -7,10 +7,12 @@ local file sink:
 <date> - <namespace> - <pod>/<container> - <message>
 ```
 
-S3 key layout (from config `sinks.s3.key_prefix`):
+S3 key layout (from config `sinks.s3.key_prefix`; shown with the default
+`k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_`):
 
 ```
-s3://$BUCKET/cluster-logs/logs/{error|warning|info|debug|metrics}/%Y/%m/%d/<batch>.log.gz
+s3://$BUCKET/k3s-logs/logs/{error|warning|info|debug|metrics}/%Y/%m/%d/%H_%M_%S_<batch>.log.gz
+s3://$BUCKET/k3s-logs/logs/security/<severity>/%Y/%m/%d/%H_%M_%S_<batch>.log.gz   # Falco copy, when enabled
 ```
 
 Helm values and Vector config are rendered from the repo-root `config.yaml`
@@ -26,7 +28,8 @@ only has empty examples.
 | Env `AWS_REGION` / `S3_BUCKET` + Secret keys, or IRSA annotation | No AWS env |
 
 **Not previously tested against live S3 in this repo.** Batch size (50MB),
-timeout (600s), gzip, disk buffer (~2.5GB), and `when_full: block` are copied
+timeout (600s), gzip, disk buffer (2.5 GiB per S3 sink, so 5 GiB with Falco
+enabled, which adds the `falco_security_s3` sink), and `when_full: block` are copied
 from the old `values-agent.yaml` / `vector.toml` and are **not** YAML-config
 (operational pins). Confirm region, bucket, IAM, and a first object before
 trusting the pipeline.
@@ -82,7 +85,7 @@ kubectl -n "$NS" logs ds/vector --tail=20 | grep -i s3
 Secret name defaults to `vector-s3-creds` (`sinks.s3.secret_name`).
 
 **EC2 instance profile:** attach `s3:PutObject` / `s3:AbortMultipartUpload` on
-`arn:aws:s3:::BUCKET/cluster-logs/*`, set `irsa_role_arn` empty, and do not
+`arn:aws:s3:::BUCKET/<key_prefix root>/*` (default `k3s-logs/*`), set `irsa_role_arn` empty, and do not
 create the Secret — then edit `deploy/values-agent.yaml` to drop the `env` key refs, or
 leave keys unset so the SDK uses IMDS. **Flag:** render still emits
 `secretKeyRef` when IRSA is empty. For IMDS-only, set a dummy secret or we

@@ -83,7 +83,9 @@ Vector and Falco keep running unchanged.
 4. Vector batches events (up to 50 MB or 10 minutes), gzips them, and uploads
    objects under `<keyPrefix>/<severity>/YYYY/MM/DD/…` ⚙. The default
    `keyPrefix` is `k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_`. If S3 is
-   unreachable, events wait in a disk buffer on the node (up to about 2.5 GiB).
+   unreachable, events wait in a disk buffer on the node: 2.5 GiB per S3
+   sink, so up to 5 GiB when Falco routing is on (its `security/` copy is a
+   second sink).
 5. The **web app**:
    - lists new objects every 30 s ⚙, re-checking the last hour so late uploads aren't missed;
    - downloads, decompresses and parses them into its SQLite cache on the PVC;
@@ -101,9 +103,14 @@ Vector and Falco keep running unchanged.
   lines or one log line.
 - Responses (summary plus suggested read-only diagnostic steps) are cached and
   shown in the UI. Suggested commands are **not executed** by Logscope.
-- **Consequence: AI calls send log content outside the cluster, unredacted.**
-  That includes anything applications wrote into their logs (tokens, emails,
-  personal data), and the provider's retention terms apply. AI is off unless
+- **Consequence: AI calls send log content outside the cluster.** Before
+  sending, the app removes common credential and personal-data patterns
+  (passwords and other `key=value` secrets, bearer/basic credentials, JWTs, AWS
+  key IDs, well-known API tokens, URL passwords, private keys, email
+  addresses) and caps each value at 2,000 characters and each request at about
+  48,000. This is pattern-based and not complete: anything else applications
+  log (names, customer IDs, IP addresses, unusual secret formats) is sent, and
+  the provider's retention terms apply. AI is off unless
   `ai.provider` is set ⚙.
 - Operator-triggered AI calls are rate-limited (`ai.rateLimitPerMinute` ⚙,
   default 10/min, in memory per pod).
@@ -114,7 +121,7 @@ Vector and Falco keep running unchanged.
 |---|---|---|
 | **S3 bucket** | Bucket and region. Retention lifecycle rule applied once (`scripts/apply_s3_lifecycle.py`) | `s3.bucket`, `s3.region`, `s3.keyPrefix` ⚙. With the existing Vector, these must match the `config.yaml` it was rendered from |
 | **S3 credentials: web app** | Read-only IAM key: `s3:ListBucket` (prefix-scoped) + `s3:GetObject` on `<bucket>/<prefix root>/*` | `s3.credentials.webapp` (existing Secret or inline) ⚙ |
-| **S3 credentials: Vector** | Write IAM key: `s3:PutObject`, `s3:AbortMultipartUpload`. The existing Vector uses Secret `logscope-s3-creds` | `s3.credentials.vector`, only if the chart manages Vector ⚙ |
+| **S3 credentials: Vector** | Write IAM key: `s3:PutObject`, `s3:AbortMultipartUpload`. An existing Vector install reads it from the Secret named by `sinks.s3.secret_name` in its `config.yaml` (default `vector-s3-creds`) | `s3.credentials.vector`, only if the chart manages Vector ⚙ |
 | **AI API key** | Key for the chosen provider, plus an explicit model ID | `ai.provider`, `ai.model`, `ai.apiKey` or `ai.existingSecret`, optional `ai.baseUrl` ⚙ |
 | **Image distribution** | Web app image built from `webapp/Dockerfile` with an immutable tag | `image.repository`, `image.tag` ⚙. Single node: import into k3s. Multi-node: push to a registry all nodes can pull from (+ `image.pullSecrets`) |
 | **Outbound network** | DNS and HTTPS 443 from the nodes to S3 and the AI provider | Cluster or network firewall ⚙ |

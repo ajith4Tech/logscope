@@ -125,7 +125,7 @@ vector:
 s3:
   credentials:
     vector:
-      existingSecret: logscope-s3-creds       # existing write Secret (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
+      existingSecret: vector-s3-creds         # existing write Secret (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY): sinks.s3.secret_name of the existing install
 ```
 
 Every key is documented inline in `values.yaml`. Rendering fails with a clear
@@ -320,6 +320,11 @@ setting up.
 
 These apply however the UI is reached:
 
+- **Trusted hosts (DNS-rebinding guard).** Requests whose `Host` header is not
+  trusted get `421`. Trusted: IP addresses, `localhost` (port-forward), this
+  release's Service names and `ingress.host`; add other names users reach the
+  app by in `webapp.trustedHosts` (exact names or `*.example.com`). `/healthz`
+  and `/readyz` are exempt.
 - **CSRF.** `POST`/`PATCH` from a browser must carry an `Origin` equal to the
   host the request was sent to; anything else gets `403`.
   - Requests without `Origin` are rejected only when `Sec-Fetch-Site` marks
@@ -372,7 +377,7 @@ kubectl -n logging get pods -l app.kubernetes.io/instance=logscope
 kubectl -n logging port-forward svc/logscope-webapp 8000:8000     # UI: http://127.0.0.1:8000
 curl -s localhost:8000/healthz     # liveness: process up, ingest loop running
 curl -s localhost:8000/readyz      # readiness: SQLite cache queryable
-curl -s localhost:8000/api/status  # last_error, last_successful_ingest_at, total_objects, ai_configured
+curl -s localhost:8000/api/status  # ingest.state, last_error, failing_objects, insights.last_error, ai_configured
 kubectl -n logging logs deploy/logscope-webapp --tail=100 -f
 kubectl -n logging logs ds/logscope-vector --tail=50 | grep -i -E "error|s3"   # chart-managed Vector
 kubectl -n logging port-forward ds/logscope-vector 8686:8686   # Vector metrics: component_errors_total, component_discarded_events_total
@@ -382,6 +387,27 @@ kubectl -n falco logs ds/logscope-falco --tail=20              # chart-managed F
 S3 and AI outages don't make the web app unready; they appear in
 `/api/status` and the logs. Vector excludes its own namespace, so read the
 app's and Vector's logs with `kubectl logs`.
+
+`/api/status` → `ingest.state` is the signal to alert on:
+
+| State | Meaning |
+|---|---|
+| `ok` | Polls succeed |
+| `degraded` | Polls run, but a prefix or some objects fail (`failing_objects`, `latest_failure`); failed objects are retried with backoff (next poll, then 1 min doubling to 1 h) without blocking others |
+| `stale` | No successful poll for `stale_after_secs` (5 poll intervals, at least 5 min) — usually S3 credentials, network or bucket problems (`last_error`) |
+| `stalled` | The poll loop itself has not completed a poll in that time |
+
+Anomaly detection compares the previous complete hour (re-checked on every
+run of the following hour, so late uploads count) and the current hour once
+15 minutes of it have passed, each against the same duration of baseline. The
+baseline uses the history actually stored, up to `baseline_window_days`; until
+there are `min_baseline_hours` (24) of history, detection is **learning** and
+raises nothing (`insights.learning: true`), so a new install is quiet for its
+first day. Both settings go under `webapp.insights`.
+
+`insights` reports the detection job: `last_run_at`, `last_duration_ms`,
+`last_counts` (created / updated / recurred / summarized) and `last_error`;
+failures are also logged with a traceback.
 
 ## Troubleshooting
 
@@ -403,7 +429,8 @@ app's and Vector's logs with `kubectl logs`.
 | `502 Bad Gateway` / `504` | Web app pod not Ready, or `networkPolicy.ingressFrom` doesn't match the controller's pods |
 | `401` with the right password | Secret key isn't `users`, or the entry isn't htpasswd format. Recreate the Secret |
 | Browser certificate warning | No `ingress.tls.secretName` (self-signed default), or the certificate doesn't cover the host |
-| OOMKilled | Raise `resources.limits.memory` (Insights loads 7 days of rows) or `vector.resources` |
+| `421 Untrusted Host header` | The app is reached by a host name it doesn't know: add it to `webapp.trustedHosts` |
+| OOMKilled | Raise `resources.limits.memory` or `vector.resources` |
 
 ## Limitations
 
@@ -421,10 +448,34 @@ app's and Vector's logs with `kubectl logs`.
   IRSA wiring in the chart, and no file-sink mode in the chart.
 - **Vector runs as root with host log mounts**; Falco is privileged (upstream
   chart defaults). This is inherent to node agents.
-- **AI.** Log content leaves the cluster unredacted: messages, namespace, pod
-  and container names, timestamps, and up to 50 lines per explanation. That
-  can include tokens, emails or other personal data that applications logged.
-  The provider's retention terms apply.
+- **AI.** Log content leaves the cluster: messages, namespace, pod and
+  container names, timestamps, and up to 50 lines per explanation. Before
+  anything is sent (on every provider path, including anomaly summaries) the
+  app redacts: private-key blocks, JWTs, `Bearer`/`Basic` credentials, whole
+  `Authorization` and `Cookie`/`Set-Cookie` header values, AWS key IDs,
+  common vendor tokens (OpenAI/Anthropic/OpenRouter, GitHub, GitLab, Slack,
+  Google API and OAuth, Stripe, npm, Hugging Face), Slack/Discord/`/hooks/`
+  webhook URLs, passwords and tokens in URLs, values of keys such as
+  `password`, `*_pass`, `secret`, `token`, `api_key`, `access_key`,
+  `client_secret`, `session_id`, `credentials`, `signature` (also quoted,
+  JSON-escaped or multi-word), and email addresses. Provider error messages
+  are redacted the same way before they are logged, returned or stored.
+  Redaction is pattern-based and cannot be complete: a secret with no
+  recognisable prefix or key name (e.g. a bare random string, a password in
+  free text), other personal data (names, phone numbers, card numbers) and
+  IP addresses are sent as logged. The provider's retention terms apply.
+  - Log text is sent as data and the model is told never to follow
+    instructions inside it. That reduces prompt injection but cannot rule it
+    out: a crafted log line can still bias or falsify a summary. The model
+    cannot run anything or lower a risk rating — every suggested command is
+    re-parsed and risk-rated by the server, and only an exact match to a
+    registered kubectl action can run: shell syntax, unknown flags, flags that
+    change the target cluster or identity (`--context`, `--as`, ...), extra
+    arguments, and state-changing commands carrying any flag the server would
+    have to drop (`--dry-run`, `--to-revision`, ...) are refused. A
+    state-changing action additionally needs a single-use confirmation token
+    that the server issues for that exact command when it is shown to the
+    person (the chart keeps actions disabled regardless).
   - Only the four providers above are supported (Azure OpenAI and Bedrock
     aren't). `baseUrl` only works with endpoints that speak the selected
     provider's own API.
@@ -436,4 +487,87 @@ app's and Vector's logs with `kubectl logs`.
     proxy timeout in front of the app must allow that.
   - An anomaly whose summary fails 3 times in a row is marked "AI error" and
     not retried.
+- **Mattermost notifications** (`mattermost.*`, off by default). The webhook
+  URL is a credential: it is passed as a Secret-backed environment variable
+  and never logged or shown in the API/UI. One message per anomaly occurrence
+  (anomaly + detection hour) at or above `minUrgency`; refreshed counts of the
+  same occurrence send nothing, and a recurrence of the same anomaly within
+  `renotifyAfterHours` is recorded as suppressed. Occurrences older than
+  `maxAgeHours` are never sent, so enabling it does not replay history.
+  Messages carry identifiers and counts only (no sample log lines or AI
+  text); set `linkBaseUrl` to include links back to the UI. Delivery runs on
+  its own thread (10 s timeout, up to 5 attempts with backoff) and its state
+  is shown in `/api/status` → `notifications` and on the Pipeline tab. The
+  pod needs egress to the Mattermost server.
 - **Backups.** Only anomaly triage state on the PVC can't be rebuilt from S3.
+  Nothing backs it up automatically; see
+  [Backup and restore](#backup-and-restore-of-the-web-app-database).
+
+## Backup and restore of the web app database
+
+The web app's SQLite file (`/data/logscope.sqlite` on the PVC) holds the log
+cache, ingest bookkeeping and the anomaly triage state. It is separate from
+Vector's file-sink backup CronJob. Cached records can be re-read from S3 while
+they are within the bucket's retention; anomaly status and AI summaries exist
+only here.
+
+Backup (online — the app keeps running; uses SQLite's backup API, so the copy
+is consistent). It needs free space on the PVC about the size of the live data
+(the command checks first and refuses an existing destination file):
+
+```bash
+POD=$(kubectl -n logging get pod -l app.kubernetes.io/instance=logscope -o name | head -1)
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+kubectl -n logging exec $POD -- python -m webapp.api.dbtool backup /data/backup-$STAMP.sqlite
+kubectl -n logging cp ${POD#pod/}:/data/backup-$STAMP.sqlite ./logscope-$STAMP.sqlite
+kubectl -n logging exec $POD -- rm /data/backup-$STAMP.sqlite
+python -m webapp.api.dbtool verify ./logscope-$STAMP.sqlite      # integrity check + row counts
+```
+
+Restore (the app must be stopped; nothing is deleted or overwritten). The
+backup is first copied and integrity-checked beside the database
+(`logscope.sqlite.restore-partial`, needs free space about the backup's size);
+only then is the current database kept as
+`/data/logscope.sqlite.pre-restore-<timestamp>[-N]` and the copy swapped in
+atomically. If anything fails before the swap (e.g. a full disk), the current
+database is left as it was. After a restore, ingest resumes from the backup's
+S3 cursors and re-reads newer objects still in the bucket; anomaly triage
+changes made after the backup are lost:
+
+```bash
+kubectl -n logging scale deploy/logscope-webapp --replicas=0
+# Start a pod from the same image that mounts the PVC (claim logscope-webapp-data),
+# copy the backup into /data, then inside it:
+python -m webapp.api.dbtool --db /data/logscope.sqlite restore /data/logscope-<stamp>.sqlite --app-stopped
+kubectl -n logging scale deploy/logscope-webapp --replicas=1
+```
+
+`python -m webapp.api.dbtool --db /data/logscope.sqlite compact --app-stopped`
+(app stopped; free space ≈ twice the live data, because VACUUM writes a copy
+and, in WAL mode, the WAL as well — the command checks first) rewrites a database created by an
+older version so that pruning returns space to the filesystem; new databases
+do this automatically.
+
+**Upgrading from an earlier version.** On first start the app moves the
+full-text search index to a layout that no longer stores a second copy of
+every log line. This runs in the background in small batches (search keeps
+working, progress survives restarts); `/api/status` → `storage.fts_layout`
+reads `migrating` until it finishes and `external` afterwards. While both
+indexes exist the file grows by roughly 15% (measured on synthetic logs);
+afterwards about 35–40% of it is free space that new data reuses. The file
+does not shrink by itself; run `compact` (above) to return that space to the
+volume. Take a backup first. If a step fails (e.g. the disk fills), search
+keeps using the old index and the migration retries with backoff (1 to 30
+minutes); `storage.fts_migration` in `/api/status` shows the rows remaining
+and the last error.
+
+**Disk space.** `/api/status` → `storage` reports the database size, WAL size,
+reusable free pages and free space on the volume; `disk_low` (less than
+256 MiB or 5% free) turns the ingest state to `degraded`. When the volume
+fills, writes fail and are rolled back: ingest stops advancing its S3 cursors
+(nothing is skipped, it resumes when space is freed) and the failure shows in
+`last_error`. SQLite's temporary files go to the PVC (`SQLITE_TMPDIR=/data`)
+rather than the size-limited `/tmp` emptyDir, so size the PVC for the
+database plus headroom for one copy of it (backup, compaction) — the 2Gi
+default suits small clusters only; check `db_bytes` after the first days of
+retention.
