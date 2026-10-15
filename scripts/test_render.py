@@ -1,13 +1,28 @@
 #!/usr/bin/env python3
 """Sanity checks for the renderer (no Vector binary required)."""
 
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import render as R  # noqa: E402
+
+TEST_CONFIG = ROOT / "test" / "fixtures" / "config.test.yaml"
+
+
+def render_kits(cfg_path: Path) -> dict[str, str]:
+    """Run render.py on cfg_path into a temp dir; return {filename: text}."""
+    with tempfile.TemporaryDirectory() as td:
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "render.py"), "--config", str(cfg_path), "--out", td],
+            check=True,
+            capture_output=True,
+        )
+        return {p.name: p.read_text() for p in Path(td).iterdir()}
 
 
 def test_glob():
@@ -62,23 +77,24 @@ def test_falco_priority_map_validation():
 
 
 def test_falco_rendered_into_both_kits():
-    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
+    cfg = R.load_config(TEST_CONFIG)
     R.validate_cfg(cfg)
+    rendered = render_kits(TEST_CONFIG)
     ns_needle = f'if ns == "{cfg["falco"]["namespace"]}"'
     for name in ("values-local.yaml", "values-agent.yaml"):
-        text = (ROOT / "deploy" / name).read_text()
+        text = rendered[name]
         assert ns_needle in text
         assert 'scope = "security"' in text
         assert 'fpl == "critical"' in text
         assert 'bkt = "error"' in text
-    local = (ROOT / "deploy" / "values-local.yaml").read_text()
+    local = rendered["values-local.yaml"]
     assert "falco_security:" in local
     assert "type: filter" in local
     assert ".falco == true" in local
     assert "falco_security_log:" in local
     assert '{{`{{ scope }}`}}.log' in local
     # File dual-write is local-kit only; classify VRL is shared (agent still tags).
-    agent = (ROOT / "deploy" / "values-agent.yaml").read_text()
+    agent = rendered["values-agent.yaml"]
     assert '"falco": falco_hit' in agent
     assert "falco_security:" in agent
     assert "falco_security_s3:" in agent
