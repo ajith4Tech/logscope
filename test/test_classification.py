@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -195,14 +197,21 @@ def test_group_by_keeps_interleaved_pods_apart():
 
 def test_rendered_values_include_multiline_reduce():
     """Both kits must carry the same reduce transform (shared config)."""
-    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
+    cfg_path = FIXTURES / "config.test.yaml"
+    cfg = R.load_config(cfg_path)
     needle = (
         "match(string!(.message), r'"
         + R.vrl_escape_regex(cfg["multiline"]["starts_when"])
         + "')"
     )
-    for name in ("values-local.yaml", "values-agent.yaml"):
-        text = (ROOT / "deploy" / name).read_text()
+    with tempfile.TemporaryDirectory() as td:
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "render.py"), "--config", str(cfg_path), "--out", td],
+            check=True,
+            capture_output=True,
+        )
+        rendered = {name: (Path(td) / name).read_text() for name in ("values-local.yaml", "values-agent.yaml")}
+    for name, text in rendered.items():
         assert "multiline:" in text
         assert "type: reduce" in text
         assert "kubernetes.pod_name" in text

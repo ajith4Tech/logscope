@@ -88,13 +88,6 @@ FALCO_PRIORITIES = (
 )
 
 
-def deep_get(d: dict, dotted: str) -> Any:
-    cur: Any = d
-    for part in dotted.split("."):
-        cur = cur[part]
-    return cur
-
-
 def deep_set(d: dict, dotted: str, value: Any) -> None:
     parts = dotted.split(".")
     cur = d
