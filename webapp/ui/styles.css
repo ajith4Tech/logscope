@@ -1847,8 +1847,7 @@ button.ghost:hover {
   letter-spacing: 0.04em;
 }
 
-.badge-risk-read-only,
-.badge-risk-readonly {
+.badge-risk-read-only {
   background: rgba(56, 189, 248, 0.12);
   color: #38bdf8;
   border: 1px solid rgba(56, 189, 248, 0.3);
@@ -2069,10 +2068,6 @@ button.ghost:hover {
   margin: 0;
   font-size: 16px;
   color: var(--warn);
-}
-
-.confirm-modal-icon {
-  font-size: 20px;
 }
 
 .confirm-modal-text {
