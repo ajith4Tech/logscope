@@ -101,15 +101,9 @@ def make_job(store, summarizer=None, **overrides):
             reasoning_effort="medium",
         ),
     )
-    detector = InsightsDetector(store._conn, cfg.insights)
-    job = InsightsJob.__new__(InsightsJob)
-    job.cfg = cfg
-    job.store = store
-    job.detector = detector
-    job._summarizer = summarizer
-    job.last_run_at = None
-    job.last_error = None
-    return job
+    # The real constructor (the thread is created but never started), so state
+    # added to __init__ is always present in tests.
+    return InsightsJob(cfg, store._conn, store, summarizer=summarizer)
 
 
 # --- Normalization parity with the UI dedupe feature -----------------------
@@ -254,7 +248,7 @@ def test_openrouter_summarize_anomaly_uses_supported_parameters(monkeypatch, cap
         def __init__(self, payload):
             self._payload = payload
 
-        def read(self):
+        def read(self, *args):
             return json.dumps(self._payload).encode("utf-8")
 
     def fake_urlopen(req, timeout=0):
@@ -393,6 +387,7 @@ def test_ai_failure_keeps_anomaly_retryable(store):
 
 def test_evidence_includes_sample_messages_for_spikes_and_frequency(store):
     conn = store._conn
+    _history_marker(conn)  # detection needs min_baseline_hours of stored history
     # Insert 15 error records with 3 distinct log messages
     msgs = ["Connection timeout to db-1", "HTTP 502 Bad Gateway", "Disk quota exceeded"]
     for i in range(15):
@@ -467,7 +462,7 @@ def test_gemini_summarize_anomaly_uses_correct_headers(monkeypatch):
         def __exit__(self, exc_type, exc, tb):
             return False
 
-        def read(self):
+        def read(self, *args):
             return json.dumps(
                 {
                     "candidates": [
@@ -611,3 +606,273 @@ def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
     assert result2["cached"] is True
     assert result2["summary"] == "Test summary."
     assert call_count[0] == 1  # still 1 — AI was not called a second time
+
+
+# --- Audit P1 fixes ------------------------------------------------------------
+
+import itertools  # noqa: E402
+
+_seq = itertools.count()
+
+
+def _bulk(conn, rows):
+    """rows: iterable of (timestamp, namespace, severity_bucket, message[, scope]).
+    Each row gets a unique source key (unlike insert_record, which keys on time)."""
+    conn.executemany(
+        """
+        INSERT INTO records (timestamp, severity_bucket, scope, namespace, pod, container,
+                             message, raw_line, source_key, source_etag, line_number, is_falco)
+        VALUES (?, ?, ?, ?, 'web-0', 'c', ?, ?, ?, 'e', 1, ?)
+        """,
+        [
+            (ts, sev, (rest[0] if rest else f"namespaces/{ns}"), ns, msg, f"{ts} - {ns} - web-0/c - {msg}",
+             f"bulk/{next(_seq)}", 1 if rest and rest[0] == "security" else 0)
+            for ts, ns, sev, msg, *rest in rows
+        ],
+    )
+    conn.commit()
+
+
+def _history_marker(conn):
+    """One old record in an unrelated namespace: the store has history, so
+    detection runs, while the baseline of the groups under test stays empty."""
+    _bulk(conn, [(_iso(HOUR_START - timedelta(days=8)), "history-marker", "info", "old")])
+
+
+def _spread(start, hours, count):
+    """`count` timestamps spread over `hours` hours from `start`."""
+    step = timedelta(hours=hours) / max(count, 1)
+    return [_iso(start + step * i) for i in range(count)]
+
+
+def test_severity_shift_compares_each_namespace_with_its_own_baseline(store):
+    conn = store._conn
+    job = make_job(store)
+    # A busy namespace dominates total volume; a small one has a stable 50/50 mix.
+    _bulk(conn, [(ts, "big", "info", "ok") for ts in _spread(BASELINE_START, 24 * 7 - 1, 5000)])
+    small_baseline = _spread(BASELINE_START, 24 * 7 - 1, 40)
+    _bulk(conn, [(ts, "small", "error" if i % 2 else "info", "m") for i, ts in enumerate(small_baseline)])
+    current = _spread(HOUR_START, 0.5, 50)
+    _bulk(conn, [(ts, "small", "error" if i % 2 else "info", "m") for i, ts in enumerate(current)])
+
+    # Same mix as its own history: no shift. (Dividing by every namespace's
+    # baseline made small's baseline share ~0 and flagged both buckets.)
+    assert job.detector.detect_severity_shift(NOW) == []
+
+    # A real shift in the small namespace is still detected.
+    _bulk(conn, [(ts, "small", "error", "m") for ts in _spread(HOUR_START + timedelta(minutes=1), 0.45, 60)])
+    shifts = {a["severity"]: a for a in job.detector.detect_severity_shift(NOW)}
+    # Error share rose 0.5 -> 0.77 and info fell 0.5 -> 0.23; both moves are >= 0.25.
+    assert {(a["namespace"], sev) for sev, a in shifts.items()} == {("small", "error"), ("small", "info")}
+    evidence = shifts["error"]["evidence"]
+    assert evidence["baseline_total"] == 40 and evidence["baseline_share"] == 0.5
+    assert evidence["current_count"] == 85 and evidence["current_share"] == round(85 / 110, 3)
+
+
+def test_severity_shift_skips_namespace_without_baseline(store):
+    _bulk(store._conn, [(ts, "other", "info", "ok") for ts in _spread(BASELINE_START, 24, 30)])
+    _bulk(store._conn, [(ts, "brand-new", "error", "x") for ts in _spread(HOUR_START, 0.5, 30)])
+    assert make_job(store).detector.detect_severity_shift(NOW) == []
+
+
+def test_evidence_counts_come_from_sql_not_from_the_sample(store):
+    job = make_job(store, spike_min_count=10, sample_timestamps_max=10)
+    _history_marker(store._conn)
+    _bulk(store._conn, [(ts, "app", "error", f"failure {i % 7}") for i, ts in enumerate(_spread(HOUR_START, 0.5, 900))])
+    [spike] = job.detector.detect_error_spikes(NOW)
+    evidence = spike["evidence"]
+    assert evidence["current_count"] == 900                     # more rows than the sample reads
+    assert len(evidence["sample_timestamps"]) == 10
+    assert evidence["sample_timestamps"] == sorted(evidence["sample_timestamps"])
+    assert len(evidence["sample_messages"]) == 5
+
+
+def test_new_falco_rule_lookback_is_bounded_by_the_baseline_window(store):
+    job = make_job(store)
+    rule = "Terminal shell in container"
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=5)), "falco", "warning", rule, "security")])
+    # Seen 10 days ago: outside the 7-day window, so it counts as new again.
+    _bulk(store._conn, [(_iso(HOUR_START - timedelta(days=10)), "falco", "warning", rule, "security")])
+    assert [a["rule_key"] for a in job.detector.detect_new_falco_rules(NOW)] == [rule]
+    # Seen 2 days ago: not new.
+    _bulk(store._conn, [(_iso(HOUR_START - timedelta(days=2)), "falco", "warning", rule, "security")])
+    assert job.detector.detect_new_falco_rules(NOW) == []
+
+
+def test_recurrence_clears_stale_ai_summary_and_counts_are_accurate(store):
+    job = make_job(store, spike_min_count=10)
+    _bulk(store._conn, [(ts, "app", "error", "boom") for ts in _spread(HOUR_START, 0.5, 20)])
+    _history_marker(store._conn)
+
+    first = job.run_once(NOW)
+    assert first["anomalies_created"] >= 1 and first["anomalies_updated"] == 0
+    second = job.run_once(NOW + timedelta(minutes=5))           # same hour, next tick
+    assert second["anomalies_created"] == 0 and second["anomalies_updated"] == first["anomalies_created"]
+
+    spike = next(a for a in store.query_anomalies({}, limit=10)["items"] if a["type"] == "error_rate_spike")
+    store.save_ai_summary(spike["id"], "Errors at 12:00", "Check web", [{"title": "t", "command": "kubectl get pods"}])
+    store.record_ai_failure(spike["id"], "old failure")
+
+    # Same occurrence: the summary stays.
+    _, outcome = store.record_detection(type="error_rate_spike", namespace="app", pod="", rule_key="",
+                                        severity="error", evidence={**spike["evidence"], "current_count": 30},
+                                        detected_day=spike["detected_day"])
+    assert outcome == "updated"
+    row = store.query_anomalies({}, limit=10)["items"][0]
+    assert row["ai_summary"] == "Errors at 12:00" and row["evidence"]["ai_error"] == "old failure"
+
+    # A later hour of the same day replaces the evidence: the old summary,
+    # steps and AI error no longer describe it and are cleared for re-summary.
+    later = {**spike["evidence"], "window_start": "2026-09-07T15:00:00Z", "window_end": "2026-09-07T16:00:00Z"}
+    _, outcome = store.record_detection(type="error_rate_spike", namespace="app", pod="", rule_key="",
+                                        severity="error", evidence=later, detected_day=spike["detected_day"])
+    assert outcome == "recurred"
+    row = next(a for a in store.query_anomalies({}, limit=10)["items"] if a["id"] == spike["id"])
+    assert row["ai_summary"] is None and row["ai_steps"] == [] and row["ai_summarized_at"] is None
+    assert "ai_error" not in row["evidence"] and row["evidence"]["window_start"] == "2026-09-07T15:00:00Z"
+    assert spike["id"] in [a["id"] for a in store.pending_ai_anomalies(10)]
+
+
+def test_stored_plan_risk_is_recomputed_and_never_lower_than_the_command(store):
+    anomaly_id = store.upsert_anomaly(type="message_frequency", namespace="app", pod="", rule_key="x",
+                                      severity="error", evidence={"current_count": 1}, detected_day="2026-09-07")
+    store.save_ai_summary(anomaly_id, "s", "a", [
+        {"title": "a", "command": "kubectl delete namespace prod", "risk": "read-only"},
+        {"title": "b", "command": "kubectl rollout restart deployment/web -n app", "risk": "read-only"},
+        {"title": "c", "command": "kubectl get pods -n app", "risk": "high"},
+        {"title": "d", "command": "kubectl get pods -n app", "risk": "read-only"},
+    ])
+    steps = store.query_anomalies({}, limit=10)["items"][0]["ai_steps"]
+    assert [s["risk"] for s in steps] == ["high", "medium", "high", "read-only"]
+
+
+# --- C9: baseline history, partial hours, completed-hour re-check ------------
+
+def _hourly(start, hours, per_hour, namespace="app", severity="error", message="boom"):
+    """`per_hour` rows in each of `hours` consecutive hours from `start`."""
+    rows = []
+    for h in range(hours):
+        base = start + timedelta(hours=h)
+        rows += [(_iso(base + timedelta(minutes=m * 60 // per_hour)), namespace, severity, message)
+                 for m in range(per_hour)]
+    return rows
+
+
+def test_new_install_is_learning_and_raises_nothing(store):
+    job = make_job(store, spike_min_count=10)
+    # 30 minutes of data in total, all of it errors: no baseline to compare with.
+    _bulk(store._conn, [(ts, "app", "error", "boom") for ts in _spread(HOUR_START, 0.4, 50)])
+    counts = job.run_once(NOW)
+    assert counts["anomalies_created"] == 0
+    status = job.status()
+    assert status["learning"] is True and status["history_hours"] == 0.0
+    # Once enough history exists, the same data is evaluated.
+    _bulk(store._conn, [(_iso(HOUR_START - timedelta(hours=30)), "app", "info", "started")])
+    assert job.run_once(NOW)["anomalies_created"] >= 1
+    assert job.status()["learning"] is False and job.status()["history_hours"] == 30.0
+
+
+def test_baseline_divides_by_available_history_not_the_full_window(store):
+    """Two days of history at 10 errors/hour, then an hour with 20 (2x): not a
+    3x spike. Dividing by 7 days would have made the baseline 2.9/hour and
+    flagged it."""
+    job = make_job(store, spike_min_count=10, spike_multiplier=3.0)
+    first = HOUR_START - timedelta(hours=48)
+    _bulk(store._conn, _hourly(first, 47, 10))                                  # 47 complete hours
+    _bulk(store._conn, _hourly(HOUR_START - timedelta(hours=1), 1, 20))          # previous hour: 20
+    at = HOUR_START + timedelta(minutes=10)                                     # open hour too young
+    assert job.detector.detect_error_spikes(at) == []
+    # 31 in the previous hour is a real 3x spike against the true 10/hour.
+    _bulk(store._conn, _hourly(HOUR_START - timedelta(hours=1), 1, 11, message="boom2"))
+    [spike] = job.detector.detect_error_spikes(at)
+    ev = spike["evidence"]
+    assert ev["window_start"] == _iso(HOUR_START - timedelta(hours=1)) and ev["window_complete"] is True
+    assert ev["baseline_hours"] == 47.0 and ev["baseline_avg_per_hour"] == 10.0
+    assert ev["current_count"] == 31 and ev["expected_count"] == 10.0
+
+
+def test_open_hour_is_compared_with_the_same_duration_of_baseline(store):
+    job = make_job(store, spike_min_count=10, spike_multiplier=3.0)
+    _bulk(store._conn, _hourly(BASELINE_START, 24 * 7, 12))                     # 12/hour for a week
+    # 12 errors in the first 20 minutes = 36/hour: three times the usual rate.
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=m)), "app", "error", "burst") for m in range(12)])
+    at = HOUR_START + timedelta(minutes=20)
+    [spike] = job.detector.detect_error_spikes(at)
+    ev = spike["evidence"]
+    assert ev["window_complete"] is False and ev["observed_minutes"] == 20.0
+    assert ev["current_count"] == 12 and ev["expected_count"] == 4.0
+    # Before min_partial_window_minutes the open hour is not judged at all.
+    assert job.detector.detect_error_spikes(HOUR_START + timedelta(minutes=10)) == []
+    # Rows stamped after `now` (clock skew) are not counted yet.
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=50)), "app", "error", "future")])
+    assert job.detector.detect_error_spikes(at)[0]["evidence"]["current_count"] == 12
+
+
+def test_completed_hour_is_rechecked_so_late_rows_are_not_missed(store):
+    job = make_job(store, spike_min_count=10)
+    _bulk(store._conn, _hourly(BASELINE_START, 24 * 7, 1))                      # 1/hour baseline
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=m)), "app", "error", "x") for m in range(8)])
+    late_tick = HOUR_START + timedelta(minutes=58)
+    assert job.run_once(late_tick)["anomalies_created"] == 0                     # 8 < floor of 10
+    # The rest of the hour's rows arrive after the hour ended (late S3 batch).
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=50 + m)), "app", "error", "y") for m in range(8)])
+    counts = job.run_once(HOUR_START + timedelta(hours=1, minutes=5))
+    assert counts["anomalies_created"] == 1
+    [anomaly] = store.query_anomalies({}, limit=10)["items"]
+    assert anomaly["evidence"]["window_start"] == _iso(HOUR_START)
+    assert anomaly["evidence"]["current_count"] == 16 and anomaly["evidence"]["window_complete"] is True
+
+
+def test_previous_hour_after_midnight_belongs_to_the_previous_day(store):
+    job = make_job(store, spike_min_count=10)
+    day_start = HOUR_START.replace(hour=0)
+    _bulk(store._conn, _hourly(day_start - timedelta(days=7), 24 * 7 - 1, 1))
+    _bulk(store._conn, [(_iso(day_start - timedelta(minutes=50) + timedelta(minutes=m)), "app", "error", "x")
+                        for m in range(20)])                                  # 23:10–23:29 the day before
+    job.run_once(day_start + timedelta(minutes=5))
+    [anomaly] = store.query_anomalies({}, limit=10)["items"]
+    assert anomaly["detected_day"] == (day_start - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def test_newest_flagged_window_wins_and_evidence_never_moves_back(store):
+    job = make_job(store, spike_min_count=10)
+    _bulk(store._conn, _hourly(BASELINE_START, 24 * 7, 1))
+    prev = HOUR_START - timedelta(hours=1)
+    _bulk(store._conn, [(_iso(prev + timedelta(minutes=m)), "app", "error", "p") for m in range(30)])
+    _bulk(store._conn, [(_iso(HOUR_START + timedelta(minutes=m)), "app", "error", "c") for m in range(30)])
+    at = HOUR_START + timedelta(minutes=40)
+    [spike] = job.detector.detect_error_spikes(at)                             # one per group
+    assert spike["evidence"]["window_start"] == _iso(HOUR_START)
+    job.run_once(at)
+    # A later run where only the previous hour still qualifies does not
+    # replace the newer occurrence (no flip-flop, no needless re-summary).
+    _, outcome = store.record_detection(type="error_rate_spike", namespace="app", pod="", rule_key="",
+                                        severity="error", evidence={"window_start": _iso(prev), "current_count": 31},
+                                        detected_day=HOUR_START.strftime("%Y-%m-%d"))
+    assert outcome == "unchanged"
+    [anomaly] = store.query_anomalies({"type": "error_rate_spike"}, limit=10)["items"]
+    assert anomaly["evidence"]["window_start"] == _iso(HOUR_START)
+
+
+# --- Second hardening pass: gap visibility and future timestamps -------------
+
+def test_evidence_reports_baseline_hours_without_data(store):
+    job = make_job(store, spike_min_count=10, spike_multiplier=3.0)
+    first = HOUR_START - timedelta(hours=48)
+    _bulk(store._conn, _hourly(first, 10, 10))                                   # 10 hours of data...
+    _bulk(store._conn, _hourly(first + timedelta(hours=40), 7, 10))              # ...a 30-hour gap, 7 more
+    _bulk(store._conn, _hourly(HOUR_START - timedelta(hours=1), 1, 60))          # 60 in the previous hour
+    [spike] = job.detector.detect_error_spikes(HOUR_START + timedelta(minutes=10))
+    ev = spike["evidence"]
+    assert ev["baseline_hours"] == 47.0 and ev["baseline_hours_with_data"] == 17
+
+
+def test_future_dated_records_are_counted_not_evaluated(store):
+    job = make_job(store, spike_min_count=1)
+    _bulk(store._conn, _hourly(BASELINE_START, 24 * 7, 1, severity="info"))
+    _bulk(store._conn, [(_iso(NOW + timedelta(hours=3)), "app", "error", "skewed clock")] * 1)
+    _bulk(store._conn, [(_iso(NOW + timedelta(minutes=2)), "app", "info", "slight skew")])
+    counts = job.run_once(NOW)
+    assert job.status()["future_dated_records"] == 1                        # beyond the 5-minute tolerance
+    assert all(a["evidence"]["current_count"] >= 0 for a in store.query_anomalies({}, limit=10)["items"])
+    assert counts["anomalies_created"] == 0
