@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -16,12 +17,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse, urlsplit
 
-from .actions import SUPPORTED_ACTIONS, execute_action, parse_command_to_action
+from .actions import (
+    ActionBusy,
+    ActionGate,
+    ConfirmationTokens,
+    confirmation_response,
+    describe_action,
+    resolve_action,
+    run_described_action,
+)
 from .ai_summary import SUPPORTED_PROVIDERS, explain_log_line, explain_logs, summarize_anomaly
 from .config import AppConfig, load_app_config
 from .ingest import S3Ingestor
 from .insights import AnomalyStore, InsightsJob
-from .storage import LogStorage, decode_cursor
+from .notify import MattermostNotifier
+from .storage import MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
 
 _EXPLAIN_CACHE_TTL = 300  # seconds — reuse cached answer for same filter set
 _EXPLAIN_SAMPLE_SIZE = 50  # max log lines sent to the AI
@@ -31,6 +41,27 @@ _PRUNE_INTERVAL_SECS = 3600
 _DB_BUSY_GRACE_SECS = 60  # readiness tolerates the shared DB connection being busy this long
 _DEFAULT_AI_RATE_LIMIT_PER_MINUTE = 10
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+# Host names always accepted in the Host header (see _host_trusted). IP
+# literals are accepted too: DNS rebinding needs an attacker-controlled name.
+_DEFAULT_TRUSTED_HOSTS = ("localhost",)
+# Probes are answered whatever the Host header says (kubelet sends the pod IP).
+_HOST_CHECK_EXEMPT_PATHS = frozenset({"/healthz", "/readyz"})
+# Ingestion counts as stale when no poll has succeeded for this many poll
+# intervals (and at least _INGEST_STALE_MIN_SECS).
+_INGEST_STALE_POLLS = 5
+_INGEST_STALE_MIN_SECS = 300
+_FTS_MIGRATION_PAUSE_SECS = 0.05
+# After a failed migration step (e.g. disk full) the backfill retries with
+# this backoff instead of waiting for a restart.
+_FTS_MIGRATION_RETRY_SECS = 60
+_FTS_MIGRATION_RETRY_MAX_SECS = 1800
+# Filter values longer than this are rejected (400); searches are short.
+_MAX_QUERY_PARAM_CHARS = 1000
+# Cached AI answers kept per cache (oldest dropped first).
+_EXPLAIN_CACHE_MAX_ENTRIES = 256
+# HTTP requests handled at once; more get an immediate 503 instead of a
+# thread each (ThreadingHTTPServer has no limit of its own).
+_DEFAULT_MAX_CONCURRENT_REQUESTS = 64
 
 # Applied to every response. The UI loads only same-origin script/CSS and calls
 # same-origin APIs (fetch); 'unsafe-inline' is limited to styles because
@@ -137,6 +168,55 @@ def _normalize_netloc(netloc: str, scheme: str) -> str | None:
     return f"{host}:{port if port is not None else _DEFAULT_PORTS[scheme]}"
 
 
+def _parse_trusted_hosts(raw: str) -> tuple[frozenset[str], tuple[str, ...], bool]:
+    """LOGSCOPE_TRUSTED_HOSTS: comma-separated host names, "*.example.com"
+    suffix wildcards, or "*" to accept any Host (disables the check).
+    Returns (exact names, wildcard suffixes, allow_any)."""
+    exact: set[str] = set(_DEFAULT_TRUSTED_HOSTS)
+    suffixes: list[str] = []
+    allow_any = False
+    for item in raw.split(","):
+        name = item.strip().lower().rstrip(".")
+        if not name:
+            continue
+        if name == "*":
+            allow_any = True
+        elif name.startswith("*."):
+            suffixes.append(name[1:])  # ".example.com"
+        else:
+            exact.add(name)
+    return frozenset(exact), tuple(suffixes), allow_any
+
+
+def _host_name(host_header: str) -> str | None:
+    """Lower-cased host part of a Host header, or None if unparseable."""
+    try:
+        host = urlsplit(f"//{host_header.strip()}").hostname
+    except ValueError:
+        return None
+    return host.lower().rstrip(".") if host else None
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+def _seconds_since(iso: str | None) -> float | None:
+    if not iso:
+        return None
+    try:
+        then = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=timezone.utc)
+    return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+
+
 def _coerce_limit(raw: str | None, default: int, maximum: int) -> int:
     if raw is None:
         return default
@@ -145,9 +225,37 @@ def _coerce_limit(raw: str | None, default: int, maximum: int) -> int:
 
 
 class AppHTTPServer(ThreadingHTTPServer):
-    def __init__(self, server_address, RequestHandlerClass, app):
+    daemon_threads = True
+
+    def __init__(self, server_address, RequestHandlerClass, app, *, max_concurrent: int | None = None):
         super().__init__(server_address, RequestHandlerClass)
         self.app = app
+        limit = max_concurrent or _env_int("LOGSCOPE_MAX_CONCURRENT_REQUESTS", _DEFAULT_MAX_CONCURRENT_REQUESTS)
+        self._slots = threading.BoundedSemaphore(max(1, limit))
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
+                    b"Retry-After: 1\r\nConnection: close\r\nContent-Length: 30\r\n\r\n"
+                    b'{"error":"Server busy; retry"}'
+                )
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 class LogscopeHandler(BaseHTTPRequestHandler):
@@ -218,6 +326,21 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         expected = _normalize_netloc(self.headers.get("Host") or "", parts.scheme)
         return actual is not None and actual == expected
 
+    def _host_trusted(self) -> bool:
+        """DNS-rebinding guard. A page on an attacker's domain that resolves to
+        this server sends its own name as Host, and its Origin matches that Host,
+        so the Origin check alone cannot tell it apart. Only names in
+        LOGSCOPE_TRUSTED_HOSTS (plus localhost and IP literals) are served."""
+        app = self.server.app
+        if app.trust_any_host or urlparse(self.path).path in _HOST_CHECK_EXEMPT_PATHS:
+            return True
+        host = _host_name(self.headers.get("Host") or "")
+        if not host:
+            return False
+        if host in app.trusted_hosts or _is_ip_literal(host):
+            return True
+        return any(host.endswith(suffix) for suffix in app.trusted_host_suffixes)
+
     def _read_body_json(self) -> dict:
         length = int(self.headers.get("Content-Length", 0))
         if length <= 0:
@@ -250,6 +373,12 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         """Turn bad input into a JSON 4xx and unexpected failures into a logged
         JSON 500, instead of dropping the connection with a stderr traceback."""
         try:
+            if not self._host_trusted():
+                self._send_json(
+                    {"error": "Untrusted Host header; add this host name to LOGSCOPE_TRUSTED_HOSTS"},
+                    status=421,
+                )
+                return
             if state_changing and not self._origin_allowed():
                 self._send_json({"error": "Cross-origin request rejected"}, status=403)
                 return
@@ -315,10 +444,7 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._serve_asset(UI_DIR / "styles.css", "text/css; charset=utf-8")
             return
         if parsed.path == "/api/status":
-            status = app.storage.get_status()
-            status["ai_configured"] = app.ai_configured()
-            status["actions_enabled"] = app.actions_enabled
-            self._send_json(status)
+            self._send_json(app.status())
             return
         if parsed.path == "/api/facets":
             self._send_json(app.storage.query_facets(_query_params(params)))
@@ -328,6 +454,9 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/logs":
             self._send_json(app.api_logs(params))
+            return
+        if parsed.path == "/api/logs/context":
+            self._send_json(app.api_log_context(params))
             return
         if parsed.path == "/api/tail":
             self._send_json(app.api_tail(params))
@@ -349,34 +478,48 @@ class LogscopeHandler(BaseHTTPRequestHandler):
                 )
                 return
             body = self._read_body_json()
-            confirmed = bool(body.get("confirmed", False))
             try:
-                res = execute_action(body, confirmed=confirmed)
-                self._send_json(res)
+                described = describe_action(resolve_action(body))
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
-            except Exception as exc:
-                self._send_json({"error": str(exc)}, status=500)
+                return
+            if described["is_mutating"] and not (
+                body.get("confirmed") is True
+                and app.confirmations.consume(body.get("confirm_token"), described["argv"])
+            ):
+                # The token proves the person saw exactly this command; a
+                # missing, stale, reused or mismatched one gets a fresh prompt.
+                self._send_json(confirmation_response(described, app.confirmations.issue(described["argv"])))
+                return
+            try:
+                with app.action_gate.slot(described["argv"]):
+                    res = run_described_action(described)
+            except ActionBusy as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._send_json(res)
             return
         if parsed.path == "/api/actions/validate":
+            # Read-only: resolves a suggested step to the exact registered
+            # action and kubectl line, so the UI can confirm what will run.
             body = self._read_body_json()
-            cmd = str(body.get("command") or "").strip()
-            parsed_action = parse_command_to_action(cmd) if cmd else None
-            if parsed_action:
-                act = parsed_action["action"]
-                spec = SUPPORTED_ACTIONS.get(act, {})
-                self._send_json({
-                    "valid": True,
-                    "action": act,
-                    "risk": spec.get("risk", "read-only"),
-                    "is_mutating": spec.get("is_mutating", False),
-                    "parsed": parsed_action,
-                })
-            else:
-                self._send_json({
-                    "valid": False,
-                    "error": "Unsupported or unparseable command",
-                }, status=400)
+            try:
+                described = describe_action(resolve_action(body))
+            except ValueError as exc:
+                self._send_json({"valid": False, "error": str(exc)}, status=400)
+                return
+            payload = {
+                "valid": True,
+                "action": described["action"],
+                "structured": described["structured"],
+                "command": described["command"],
+                "risk": described["risk"],
+                "is_mutating": described["is_mutating"],
+                "ignored_args": described["ignored_args"],
+            }
+            if described["is_mutating"] and app.actions_enabled:
+                payload["confirm_token"] = app.confirmations.issue(described["argv"])
+            self._send_json(payload)
             return
         if parsed.path == "/api/explain":
             try:
@@ -406,7 +549,7 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         parts = parsed.path.strip("/").split("/")
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "anomalies":
             try:
-                anomaly_id = int(parts[2])
+                anomaly_id = _bounded_int(parts[2], "anomaly id")
             except ValueError:
                 self._send_json({"error": "Invalid anomaly id"}, status=400)
                 return
@@ -430,35 +573,74 @@ class LogscopeHandler(BaseHTTPRequestHandler):
 
 def _query_params(params: dict[str, list[str]]) -> dict[str, str]:
     out: dict[str, str] = {}
-    for key in ("scope", "namespace", "pod", "container", "severity_bucket", "start", "end", "q"):
+    for key in ("scope", "namespace", "pod", "container", "severity_bucket", "start", "end", "before", "q"):
         value = _first(params, key)
         if value:
+            if len(value) > _MAX_QUERY_PARAM_CHARS:
+                raise ValueError(f"'{key}' is longer than {_MAX_QUERY_PARAM_CHARS} characters")
             out[key] = value
     return out
 
 
+def _bounded_int(raw, name: str) -> int:
+    """A non-negative integer SQLite can store; ValueError (400) otherwise."""
+    if isinstance(raw, bool):
+        raise ValueError(f"Invalid '{name}'")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid '{name}'") from None
+    if not 0 <= value <= MAX_SQLITE_INT:
+        raise ValueError(f"'{name}' is out of range")
+    return value
+
+
+def _cache_put(cache: dict, key, value) -> None:
+    """Insert into a bounded cache: expired entries go first, then the oldest."""
+    now = time.monotonic()
+    for stale in [k for k, (_, expiry) in cache.items() if expiry <= now]:
+        del cache[stale]
+    while len(cache) >= _EXPLAIN_CACHE_MAX_ENTRIES:
+        del cache[next(iter(cache))]
+    cache[key] = value
+
+
 class WebApp:
-    def __init__(self, cfg: AppConfig):
+    def __init__(self, cfg: AppConfig, *, extra_trusted_hosts: tuple[str, ...] = ()):
         self.cfg = cfg
-        self.storage = LogStorage(cfg.webapp.db_path)
+        self.storage = LogStorage(
+            cfg.webapp.db_path, journal_mode=os.environ.get("LOGSCOPE_SQLITE_JOURNAL_MODE", "wal")
+        )
         self.ingestor = S3Ingestor(cfg, self.storage)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._ingest_loop, daemon=True)
+        self._fts_thread = threading.Thread(target=self._fts_migration_loop, daemon=True)
+        self._started_at = time.monotonic()
+        self._last_poll_finished: float | None = None
         self.anomaly_store = AnomalyStore(cfg.webapp.db_path)
+        # Detection reads through its own connection: with WAL it neither waits
+        # for nor blocks the shared connection used by ingest and HTTP queries.
         self.insights = InsightsJob(
             cfg,
-            self.storage.conn,
+            open_connection(cfg.webapp.db_path),
             self.anomaly_store,
             summarizer=lambda anomaly: summarize_anomaly(anomaly, cfg.ai),
-            records_lock=self.storage.lock,
         )
+        # Optional Mattermost notifications; own thread and connection, so a
+        # slow webhook never delays ingestion or detection.
+        self.notifier = MattermostNotifier(cfg, cfg.webapp.db_path)
         # Server-side explain caches: filter-set explain and per-line explain
         self._explain_cache: dict[str, tuple[dict, float]] = {}
         self._explain_line_cache: dict[int, tuple[dict, float]] = {}
         self._explain_lock = threading.Lock()
-        # kubectl actions run with this pod's credentials and the HTTP API has no
-        # auth, so deployments that expose the UI should set this to false.
-        self.actions_enabled = _env_flag("LOGSCOPE_ACTIONS_ENABLED", True)
+        # kubectl actions run with this process's credentials and the HTTP API
+        # has no auth of its own, so they are opt-in: LOGSCOPE_ACTIONS_ENABLED=true.
+        self.actions_enabled = _env_flag("LOGSCOPE_ACTIONS_ENABLED", False)
+        self.confirmations = ConfirmationTokens()
+        self.action_gate = ActionGate(max_concurrent=_env_int("LOGSCOPE_MAX_CONCURRENT_ACTIONS", 2))
+        self.trusted_hosts, self.trusted_host_suffixes, self.trust_any_host = _parse_trusted_hosts(
+            ",".join([os.environ.get("LOGSCOPE_TRUSTED_HOSTS", ""), *extra_trusted_hosts])
+        )
         # Extra origins accepted for POST/PATCH besides the request's own Host
         # (e.g. when a proxy rewrites Host). Exact "scheme://host[:port]" values.
         self.allowed_origins = frozenset(
@@ -476,14 +658,20 @@ class WebApp:
 
     def start(self) -> None:
         self._thread.start()
+        if self.storage.fts_layout == "migrating":
+            self._fts_thread.start()
         if self.cfg.insights.enabled:
             self.insights.start()
+        self.notifier.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
+        if self._fts_thread.is_alive():
+            self._fts_thread.join(timeout=5)
         if self.cfg.insights.enabled:
             self.insights.stop()
+        self.notifier.stop()
 
     def _ingest_loop(self) -> None:
         while not self._stop.is_set():
@@ -492,7 +680,31 @@ class WebApp:
                 self._maybe_prune()
             except Exception:
                 logger.exception("Ingest loop iteration failed")
+            self._last_poll_finished = time.monotonic()
             self._stop.wait(self.cfg.webapp.poll_interval_secs)
+
+    def _fts_migration_loop(self) -> None:
+        """Move a database created by an older version to the smaller
+        full-text index in the background. Searches keep using the old index
+        until the swap; progress is committed per batch, so a restart resumes.
+        A failed step (e.g. disk full) is retried with backoff and reported
+        in /api/status storage.fts_migration.last_error."""
+        logger.info("Migrating the full-text index to external content (runs in the background)")
+        retry = _FTS_MIGRATION_RETRY_SECS
+        while not self._stop.is_set():
+            try:
+                if self.storage.migrate_fts_step():
+                    self.storage.fts_migration_error = None
+                    return
+            except sqlite3.Error as exc:
+                self.storage.fts_migration_error = f"{type(exc).__name__}: {exc}"[:300]
+                logger.warning("Full-text index migration paused (%s); retrying in %ds", exc, retry)
+                self._stop.wait(retry)
+                retry = min(retry * 2, _FTS_MIGRATION_RETRY_MAX_SECS)
+                continue
+            self.storage.fts_migration_error = None
+            retry = _FTS_MIGRATION_RETRY_SECS
+            self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
 
     def _maybe_prune(self) -> None:
         days = self.cfg.webapp.retention_days
@@ -508,7 +720,67 @@ class WebApp:
             logger.info("Pruned %d cached records older than %s", removed, cutoff)
 
     def healthy(self) -> bool:
+        # Liveness stays "the ingest loop is running": S3 or AI outages must not
+        # restart the pod. Staleness is reported by /api/status instead.
         return self._thread.is_alive()
+
+    def ingest_health(self, status: dict) -> dict:
+        """How current the cache is. state: ok | degraded (some objects or a
+        prefix failing, still polling) | stale (no successful poll recently) |
+        stalled (the loop has not finished a poll recently) | starting | stopped."""
+        poll = self.cfg.webapp.poll_interval_secs
+        stale_after = max(_INGEST_STALE_POLLS * poll, _INGEST_STALE_MIN_SECS)
+        now = time.monotonic()
+        since_success = _seconds_since(status.get("last_successful_ingest_at"))
+        since_loop = None if self._last_poll_finished is None else now - self._last_poll_finished
+        failures = self.storage.object_failure_summary()
+        if not self._thread.is_alive():
+            state = "stopped"
+        elif since_loop is None:
+            state = "starting" if now - self._started_at < stale_after else "stalled"
+        elif since_loop > stale_after + poll:
+            state = "stalled"
+        elif since_success is None or since_success > stale_after:
+            state = "stale"
+        elif (
+            status.get("last_error")
+            or failures["failing_objects"]
+            or (status.get("storage") or {}).get("disk_low")
+        ):
+            state = "degraded"
+        else:
+            state = "ok"
+        return {
+            "state": state,
+            "poll_interval_secs": poll,
+            "stale_after_secs": stale_after,
+            "seconds_since_last_success": None if since_success is None else int(since_success),
+            "seconds_since_last_poll": None if since_loop is None else int(since_loop),
+            **failures,
+        }
+
+    def status(self) -> dict:
+        """Never fails because the database does: a locked or broken database
+        is reported in `database_error` (with the ingest state it implies)
+        instead of turning the whole status endpoint into a 500."""
+        try:
+            status = self.storage.get_status()
+            status["ingest"] = self.ingest_health(status)
+        except sqlite3.Error as exc:
+            logger.warning("Status query failed: %s", exc)
+            status = {
+                "database_error": f"{type(exc).__name__}: {exc}"[:300],
+                "ingest": {"state": "unknown", "poll_interval_secs": self.cfg.webapp.poll_interval_secs},
+            }
+        status["ai_configured"] = self.ai_configured()
+        status["actions_enabled"] = self.actions_enabled
+        status["insights"] = self.insights.status()
+        try:
+            status["notifications"] = self.notifier.status()
+        except sqlite3.Error as exc:
+            status["notifications"] = {"enabled": bool(self.cfg.mattermost.enabled),
+                                       "status_error": f"{type(exc).__name__}"}
+        return status
 
     def ready(self) -> tuple[bool, bool]:
         """(ready, busy). A connection busy with a long query is still working;
@@ -593,7 +865,7 @@ class WebApp:
             "cached": False,
         }
         with self._explain_lock:
-            self._explain_cache[cache_key] = (response, now + _EXPLAIN_CACHE_TTL)
+            _cache_put(self._explain_cache, cache_key, (response, now + _EXPLAIN_CACHE_TTL))
         return response
 
     def api_explain_line(self, body: dict) -> dict:
@@ -604,10 +876,7 @@ class WebApp:
         record_id = body.get("id")
         if record_id is None:
             raise ValueError("Missing 'id' field")
-        try:
-            record_id = int(record_id)
-        except (TypeError, ValueError):
-            raise ValueError("Invalid 'id' field")
+        record_id = _bounded_int(record_id, "id")
 
         now = time.monotonic()
         with self._explain_lock:
@@ -627,7 +896,7 @@ class WebApp:
             raise RuntimeError("AI summarization returned no result")
         response = {**result, "cached": False}
         with self._explain_lock:
-            self._explain_line_cache[record_id] = (response, now + _EXPLAIN_LINE_CACHE_TTL)
+            _cache_put(self._explain_line_cache, record_id, (response, now + _EXPLAIN_LINE_CACHE_TTL))
         return response
 
     def api_logs(self, params: dict[str, list[str]]) -> dict:
@@ -638,11 +907,38 @@ class WebApp:
         result["last_updated_at"] = self.storage.get_state("last_successful_ingest_at")
         return result
 
+    def api_log_context(self, params: dict[str, list[str]]) -> dict:
+        """Entries around one record of the same namespace/pod/container
+        (see LogStorage.query_context). `start` / `before` optionally limit
+        it to the active time range."""
+        raw_id = _first(params, "id")
+        if raw_id is None:
+            raise ValueError("Missing 'id'")
+        record_id = _bounded_int(raw_id, "id")
+        lines_before = _bounded_int(_first(params, "lines_before", "10"), "lines_before")
+        lines_after = _bounded_int(_first(params, "lines_after", "10"), "lines_after")
+        bounds = _query_params(params)
+        result = self.storage.query_context(
+            record_id,
+            lines_before=lines_before,
+            lines_after=lines_after,
+            start=bounds.get("start"),
+            before=bounds.get("before"),
+        )
+        if result is None:
+            raise ValueError("Log record not found (it may have aged out of the cache)")
+        return result
+
     def api_tail(self, params: dict[str, list[str]]) -> dict:
+        """New records since `after_id` (the `last_id` of the previous call, or
+        `max_id` from /api/logs). Omit after_id to get the current position."""
         flat = _query_params(params)
         limit = _coerce_limit(_first(params, "limit"), self.cfg.webapp.page_size_default, self.cfg.webapp.page_size_max)
-        cursor = decode_cursor(_first(params, "cursor"))
-        result = self.storage.query_logs(flat, limit=limit, cursor=cursor, direction="asc")
+        raw_after = _first(params, "after_id")
+        after_id = None
+        if raw_after is not None:
+            after_id = _bounded_int(raw_after, "after_id")
+        result = self.storage.query_tail(flat, after_id=after_id, limit=limit)
         result["last_updated_at"] = self.storage.get_state("last_successful_ingest_at")
         return result
 
@@ -667,9 +963,12 @@ def main() -> None:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         logger.error("Invalid configuration in %s: %s", args.config, exc)
         sys.exit(2)
+    # A host name given to --host is how this server is reached; trust it.
+    bind_host = args.host.strip().lower()
+    extra_hosts = () if bind_host in ("", "0.0.0.0", "::") or _is_ip_literal(bind_host) else (bind_host,)
     try:
-        app = WebApp(cfg)
-    except (OSError, sqlite3.Error) as exc:
+        app = WebApp(cfg, extra_trusted_hosts=extra_hosts)
+    except (OSError, sqlite3.Error, ValueError) as exc:
         logger.error("Cannot open database %s: %s", cfg.webapp.db_path, exc)
         sys.exit(2)
     app.start()
