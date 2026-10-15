@@ -374,3 +374,358 @@ def test_ingest_corrupt_deflate_marked_and_transport_error_retried_without_dupli
             "SELECT COUNT(*), COUNT(DISTINCT line_number) FROM records WHERE source_key = ?", (flaky_key,)
         ).fetchone()
         assert tuple(rows) == (5000, 5000)                          # complete, no duplicates
+
+
+# --- Audit P1 fixes ------------------------------------------------------------
+
+import base64  # noqa: E402
+import logging  # noqa: E402
+import sqlite3  # noqa: E402
+import time  # noqa: E402
+import types  # noqa: E402
+
+from botocore.exceptions import ClientError  # noqa: E402
+
+from webapp.api.storage import decode_cursor  # noqa: E402
+
+_BASE_RECORD = {"severity_bucket": "info", "scope": "infra", "namespace": "ns", "pod": "p",
+                "container": "c", "source_etag": "e", "line_number": 1, "is_falco": 0}
+
+
+def _record(ts: str, message: str, key: str, **extra) -> dict:
+    return {**_BASE_RECORD, "timestamp": ts, "message": message, "raw_line": f"{ts} - ns - p/c - {message}",
+            "source_key": key, **extra}
+
+
+def _b64(payload: str) -> str:
+    return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+
+def test_malformed_cursor_is_a_client_error():
+    for bad in (_b64("{}"), _b64("[1, 2]"), _b64('{"ts": "x"}'), _b64('{"ts": "x", "id": true}'),
+                _b64('{"ts": 5, "id": 1}'), "%%%not-base64", _b64("not json")):
+        try:
+            decode_cursor(bad)
+        except ValueError as exc:
+            assert str(exc) == "Invalid cursor", bad
+        else:
+            raise AssertionError(f"accepted {bad!r}")
+    assert decode_cursor(_b64('{"ts": "2026-09-07T00:00:00Z", "id": 3}')) == ("2026-09-07T00:00:00Z", 3)
+
+    with tempfile.TemporaryDirectory() as td:
+        server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
+        try:
+            status, payload = _request(server, "GET", f"/api/logs?cursor={_b64('{}')}")
+            assert status == 400 and payload["error"] == "Invalid request: Invalid cursor"
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_tail_follows_ingest_order_so_late_records_are_not_missed():
+    with tempfile.TemporaryDirectory() as td:
+        storage = LogStorage(Path(td) / "webapp.sqlite")
+        storage.insert_records([_record("2026-09-07T10:00:00Z", "first", "k1"),
+                                _record("2026-09-07T10:05:00Z", "second", "k2")])
+        position = storage.query_logs({}, limit=10)["max_id"]
+        assert storage.query_tail({}, after_id=None, limit=10) == {"items": [], "last_id": position, "truncated": False}
+
+        # A late object: older event time than rows already shown, newer row id.
+        storage.insert_records([_record("2026-09-07T09:00:00Z", "late", "k3"),
+                                _record("2026-09-07T10:10:00Z", "newest", "k4", namespace="other")])
+        tail = storage.query_tail({}, after_id=position, limit=10)
+        assert [r["message"] for r in tail["items"]] == ["newest", "late"]   # newest ingested first
+        assert tail["last_id"] == position + 2 and tail["truncated"] is False
+        # Filters still apply, and the position advances past non-matching rows.
+        filtered = storage.query_tail({"namespace": "ns"}, after_id=position, limit=10)
+        assert [r["message"] for r in filtered["items"]] == ["late"] and filtered["last_id"] == position + 2
+        # More new rows than the limit: the newest are kept and the response says so.
+        capped = storage.query_tail({}, after_id=position, limit=1)
+        assert [r["message"] for r in capped["items"]] == ["newest"] and capped["truncated"] is True
+        assert storage.query_tail({}, after_id=tail["last_id"], limit=10)["items"] == []
+
+    with tempfile.TemporaryDirectory() as td:
+        app = _make_webapp(Path(td) / "webapp.sqlite")
+        app.storage.insert_records([_record("2026-09-07T10:00:00Z", "a", "k1")])
+        server = _serve(app)
+        try:
+            status, logs = _request(server, "GET", "/api/logs?limit=5")
+            assert status == 200 and logs["max_id"] == 1
+            app.storage.insert_records([_record("2026-09-07T08:00:00Z", "late", "k2")])
+            status, tail = _request(server, "GET", f"/api/tail?after_id={logs['max_id']}")
+            assert status == 200 and [r["message"] for r in tail["items"]] == ["late"] and tail["last_id"] == 2
+            assert _request(server, "GET", "/api/tail?after_id=-1")[0] == 400
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_writes_commit_promptly_and_database_uses_wal():
+    with tempfile.TemporaryDirectory() as td:
+        db = Path(td) / "webapp.sqlite"
+        storage = LogStorage(db)
+        assert storage.journal_mode == "wal"
+        assert storage.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+        storage.set_prefix_cursor("p/", "p/k1")
+        assert not storage.conn.in_transaction
+        storage.mark_object("b", "p/k1", "e", "2026-09-07T00:00:00Z", status="ok", record_count=0)
+        assert not storage.conn.in_transaction
+        storage.record_object_failure("b", "p/k2", "e", prefix="p/", last_modified="x", error="boom")
+        assert not storage.conn.in_transaction
+
+        # Another connection (the anomaly writer) is not blocked by ingest state.
+        other = sqlite3.connect(db, timeout=0.1)
+        other.execute("CREATE TABLE IF NOT EXISTS probe (x)")
+        other.execute("INSERT INTO probe VALUES (1)")
+        other.commit()
+        other.close()
+
+
+class _S3WithFailures(FakeS3):
+    """FakeS3 whose get_object raises for keys in `failing` and whose listing
+    raises for prefixes in `failing_prefixes`."""
+
+    def __init__(self, objects, bodies):
+        super().__init__(objects, bodies)
+        self.failing: dict[str, Exception] = {}
+        self.failing_prefixes: set[str] = set()
+        self.reads: list[str] = []
+
+    def get_paginator(self, name):
+        inner = super().get_paginator(name)
+        failing_prefixes = self.failing_prefixes
+
+        class _Paginator:
+            def paginate(self, **kwargs):
+                if kwargs["Prefix"] in failing_prefixes:
+                    raise ConnectionError("listing timed out")
+                yield from inner.paginate(**kwargs)
+
+        return _Paginator()
+
+    def get_object(self, Bucket, Key):
+        self.reads.append(Key)
+        if Key in self.failing:
+            raise self.failing[Key]
+        return super().get_object(Bucket, Key)
+
+
+def test_failing_object_or_prefix_does_not_block_other_ingest_and_is_retried_with_backoff():
+    cfg = load_app_config(CONFIG)
+    with tempfile.TemporaryDirectory() as td:
+        storage = LogStorage(Path(td) / "webapp.sqlite")
+        bad = "k3s-logs/logs/error/2026/09/07/00_00_00_bad.gz"
+        after_bad = "k3s-logs/logs/error/2026/09/07/00_00_01_ok.gz"
+        other_prefix = "k3s-logs/logs/info/2026/09/07/00_00_00_ok.gz"
+        objects = [{"Key": k, "ETag": f'"{i}"', "LastModified": "2026-09-07T00:00:00Z"}
+                   for i, k in enumerate((bad, after_bad, other_prefix))]
+        bodies = {k: _gz(f"2026-09-07T00:00:00Z - app - web-0/nginx - from {k}") for k in (bad, after_bad, other_prefix)}
+        s3 = _S3WithFailures(objects, bodies)
+        s3.failing[bad] = PermissionError("AccessDenied (KMS)")
+        ingestor = S3Ingestor(cfg, storage)
+        ingestor.client = s3
+
+        first = ingestor.ingest_once()
+        assert first.records_ingested == 2 and first.objects_failed == 1        # others still ingested
+        assert "AccessDenied" in first.error
+        failure = storage.get_object_failure(cfg.s3_bucket, bad, "0")
+        assert failure["attempts"] == 1
+        status = storage.get_status()
+        assert status["last_successful_ingest_at"] is not None                  # not a pipeline outage
+        assert storage.get_prefix_cursor("k3s-logs/logs/error/") == after_bad    # cursor not pinned
+
+        # First retry is on the next poll; after that the object backs off.
+        assert ingestor.ingest_once().objects_failed == 1
+        assert storage.get_object_failure(cfg.s3_bucket, bad, "0")["attempts"] == 2
+        reads_before = len(s3.reads)
+        third = ingestor.ingest_once()
+        assert third.objects_failed == 0 and third.objects_deferred == 1
+        assert bad not in s3.reads[reads_before:]                               # no retry storm
+
+        # Once readable and due, the failure-table retry ingests it exactly once.
+        del s3.failing[bad]
+        storage.conn.execute("UPDATE object_failures SET next_attempt_at = '2000-01-01T00:00:00.000000Z'")
+        storage.conn.commit()
+        objects.clear()  # not listed any more (behind the cursor): only the retry pass can find it
+        fourth = ingestor.ingest_once()
+        assert fourth.records_ingested == 1 and fourth.error is None
+        assert storage.get_object_failure(cfg.s3_bucket, bad, "0") is None
+        assert storage.object_seen(cfg.s3_bucket, bad, "0")
+        assert storage.get_status()["total_records"] == 3                       # no duplicates
+
+        # A listing failure in one prefix leaves the others working and is reported.
+        objects.append({"Key": "k3s-logs/logs/warning/2026/09/07/00_00_00_w.gz", "ETag": '"w"',
+                        "LastModified": "2026-09-07T00:00:00Z"})
+        bodies["k3s-logs/logs/warning/2026/09/07/00_00_00_w.gz"] = _gz("2026-09-07T00:00:00Z - app - w/c - w")
+        s3.failing_prefixes.add("k3s-logs/logs/error/")
+        last_success = storage.get_state("last_successful_ingest_at")
+        time.sleep(0.01)
+        fifth = ingestor.ingest_once()
+        assert fifth.records_ingested == 1 and "listing timed out" in fifth.error
+        assert storage.get_state("last_successful_ingest_at") == last_success  # prefix outage = not successful
+
+
+def test_missing_object_is_dropped_from_retries():
+    cfg = load_app_config(CONFIG)
+    with tempfile.TemporaryDirectory() as td:
+        storage = LogStorage(Path(td) / "webapp.sqlite")
+        key = "k3s-logs/logs/error/2026/09/07/00_00_00_gone.gz"
+        s3 = _S3WithFailures([{"Key": key, "ETag": '"g"', "LastModified": "2026-09-07T00:00:00Z"}], {})
+        s3.failing[key] = ClientError({"Error": {"Code": "NoSuchKey", "Message": "gone"}}, "GetObject")
+        ingestor = S3Ingestor(cfg, storage)
+        ingestor.client = s3
+        result = ingestor.ingest_once()
+        assert result.error is None and storage.get_object_failure(cfg.s3_bucket, key, "g") is None
+
+
+def test_status_reports_ingest_staleness_and_insights_errors(caplog):
+    with tempfile.TemporaryDirectory() as td:
+        app = _make_webapp(Path(td) / "webapp.sqlite")
+        assert app.status()["ingest"]["state"] == "stopped"          # loop never started
+
+        app._thread = types.SimpleNamespace(is_alive=lambda: True)
+        assert app.status()["ingest"]["state"] == "starting"
+        app._last_poll_finished = time.monotonic()
+        assert app.status()["ingest"]["state"] == "stale"            # never succeeded
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        app.storage.ingest_state(last_poll_at=now, last_successful_ingest_at=now,
+                                 last_object_last_modified=None, last_error=None)
+        assert app.status()["ingest"]["state"] == "ok"
+        app.storage.record_object_failure(app.cfg.s3_bucket, "k", "e", prefix="p/", last_modified="x", error="boom")
+        ingest = app.status()["ingest"]
+        assert ingest["state"] == "degraded" and ingest["failing_objects"] == 1
+        app._last_poll_finished = time.monotonic() - 10_000
+        assert app.status()["ingest"]["state"] == "stalled"          # loop wedged; liveness unaffected
+
+        # A failing insights run is logged and surfaced, and the loop survives.
+        job = app.insights
+
+        def boom(now):
+            job._stop.set()
+            raise RuntimeError("detector exploded")
+
+        job.detector.detect_all = boom
+        with caplog.at_level(logging.ERROR, logger="webapp.api.insights"):
+            job._loop()
+        insights = app.status()["insights"]
+        assert insights["last_error"] == "detector exploded" and insights["consecutive_failures"] == 1
+        assert any("Insights run failed" in r.getMessage() for r in caplog.records)
+        # Detection reads through its own connection, not the shared one.
+        assert job.detector._conn is not app.storage.conn
+
+
+def test_trusted_host_policy_blocks_dns_rebinding(monkeypatch):
+    monkeypatch.setenv("LOGSCOPE_TRUSTED_HOSTS", "logs.example.com,*.corp.example")
+    with tempfile.TemporaryDirectory() as td:
+        app = _make_webapp(Path(td) / "webapp.sqlite")
+        server = _serve(app)
+        port = server.server_address[1]
+        try:
+            for host in (f"evil.example:{port}", "attacker.test", "corp.example.evil.test", ""):
+                status, payload = _request(server, "GET", "/api/status", headers={"Host": host})
+                assert status == 421 and "LOGSCOPE_TRUSTED_HOSTS" in payload["error"], host
+            # A rebinding POST matches Origin to Host, so only the Host check stops it.
+            status, _ = _request(server, "POST", "/api/actions/execute", body=b"{}",
+                                 headers={**JSON, "Host": f"evil.example:{port}", "Origin": f"http://evil.example:{port}"})
+            assert status == 421
+            for host in (f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}", "logs.example.com",
+                         "a.corp.example", "10.42.0.7:8000"):
+                assert _request(server, "GET", "/api/status", headers={"Host": host})[0] == 200, host
+            # Probes are answered whatever the Host header says.
+            assert _request(server, "GET", "/readyz", headers={"Host": "10.42.0.7:8000"})[0] == 200
+            assert _request(server, "GET", "/readyz", headers={"Host": "anything.test"})[0] == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    monkeypatch.setenv("LOGSCOPE_TRUSTED_HOSTS", "*")
+    with tempfile.TemporaryDirectory() as td:
+        server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
+        try:
+            assert _request(server, "GET", "/api/status", headers={"Host": "anything.test"})[0] == 200
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_actions_are_disabled_unless_explicitly_enabled(monkeypatch):
+    monkeypatch.delenv("LOGSCOPE_ACTIONS_ENABLED", raising=False)
+    with tempfile.TemporaryDirectory() as td:
+        server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
+        try:
+            assert _request(server, "GET", "/api/status")[1]["actions_enabled"] is False
+            status, _ = _request(server, "POST", "/api/actions/execute",
+                                 body=json.dumps({"command": "kubectl get pods"}), headers=JSON)
+            assert status == 403
+        finally:
+            server.shutdown()
+            server.server_close()
+    monkeypatch.setenv("LOGSCOPE_ACTIONS_ENABLED", "true")
+    with tempfile.TemporaryDirectory() as td:
+        assert _make_webapp(Path(td) / "webapp.sqlite").actions_enabled is True
+
+
+def test_validate_endpoint_returns_the_exact_command_that_would_run():
+    with tempfile.TemporaryDirectory() as td:
+        server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
+        try:
+            status, payload = _request(server, "POST", "/api/actions/validate", headers=JSON, body=json.dumps(
+                {"command": "kubectl logs web-0 -n app -c sidecar --previous --tail=50 -A"}))
+            assert status == 200 and payload["valid"] is True
+            assert payload["command"] == ("kubectl logs web-0 -n app -c sidecar --tail=50 "
+                                          "--limit-bytes=262144 --previous")
+            assert payload["ignored_args"] == ["-A"] and payload["risk"] == "read-only"
+            status, payload = _request(server, "POST", "/api/actions/validate", headers=JSON, body=json.dumps(
+                {"action": {"action": "rollout_restart", "namespace": "app", "resource": "web"}}))
+            assert payload["is_mutating"] is True and payload["command"] == "kubectl rollout restart deployment/web -n app"
+            status, payload = _request(server, "POST", "/api/actions/validate", headers=JSON,
+                                       body=json.dumps({"command": "kubectl delete ns prod"}))
+            assert status == 400 and payload["valid"] is False
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_malformed_ai_provider_response_is_a_502_not_a_400(monkeypatch):
+    from webapp.api import ai_summary
+
+    monkeypatch.setenv("LOGSCOPE_AI_API_KEY", "sk-test")
+    with tempfile.TemporaryDirectory() as td:
+        cfg = load_app_config(CONFIG)
+        cfg = replace(cfg, webapp=replace(cfg.webapp, db_path=Path(td) / "webapp.sqlite"),
+                      ai=replace(cfg.ai, provider="openai", model="gpt-test", api_key_env="LOGSCOPE_AI_API_KEY"))
+        app = WebApp(cfg)
+        app.storage.insert_records([_record("2026-09-07T10:00:00Z", "boom", "k1")])
+
+        class _Html:
+            def __enter__(self):
+                return io.BytesIO(b"<html>bad gateway</html>")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(ai_summary.request, "urlopen", lambda req, timeout=0: _Html())
+        server = _serve(app)
+        try:
+            status, payload = _request(server, "POST", "/api/explain-line", body=json.dumps({"id": 1}), headers=JSON)
+            assert status == 502 and "malformed response" in payload["error"]
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+def test_trusted_host_edge_cases(monkeypatch):
+    monkeypatch.setenv("LOGSCOPE_TRUSTED_HOSTS", "Logs.Example.com,*.corp.example")
+    with tempfile.TemporaryDirectory() as td:
+        server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
+        try:
+            for host, expected in (("LOGS.EXAMPLE.COM.", 200), ("logs.example.com:443", 200),
+                                   ("evilcorp.example", 421), ("corp.example.attacker.test", 421),
+                                   ("logs.example.com@evil.test", 421)):
+                assert _request(server, "GET", "/api/status", headers={"Host": host})[0] == expected, host
+            # No Host header at all (HTTP/1.0 style) is refused outside the probes.
+            assert _raw(server, "GET", "/api/status", headers={"Host": ""})[0] == 421
+        finally:
+            server.shutdown()
+            server.server_close()

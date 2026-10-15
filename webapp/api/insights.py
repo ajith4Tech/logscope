@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import re
 import sqlite3
 import threading
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from .actions import step_execution_fields
 from .config import AppConfig, InsightsConfig
 from .storage import SQLITE_BUSY_TIMEOUT_SECS
 
@@ -19,6 +23,14 @@ logger = logging.getLogger(__name__)
 # (shown as "AI error" in the UI) instead of being retried every tick, so a
 # persistently failing anomaly cannot block newer ones from the per-tick quota.
 _MAX_AI_ATTEMPTS_PER_ANOMALY = 3
+
+# Rows read to build one anomaly's evidence (sample timestamps and up to five
+# distinct messages). Counts always come from SQL aggregates, not from these.
+_SAMPLE_SCAN_ROWS = 500
+# Baseline windows are aggregated in slices of this many hours so no single
+# query holds the database for the whole multi-day window.
+_BASELINE_SLICE_HOURS = 24
+_RULE_KEY_SQL_FUNCTION = "logscope_rule_key"
 
 # Ports of the UI's message-normalization (webapp/ui/app.js ruleKeyOf) so the
 # grouping keys used for anomaly detection are identical to the ones used for
@@ -56,6 +68,26 @@ def is_spike(current: int, baseline: float, multiplier: float, min_count: int) -
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _write(method):
+    """Hold the store's lock and roll back a write that fails part-way, so a
+    later commit cannot persist half of it."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            try:
+                return method(self, *args, **kwargs)
+            except BaseException:
+                if self._conn.in_transaction:
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:
+                        logger.exception("Rolling back a failed anomaly write also failed")
+                raise
+
+    return wrapper
 
 
 class AnomalyStore:
@@ -117,39 +149,92 @@ class AnomalyStore:
         evidence: dict[str, Any],
         detected_day: str,
     ) -> int:
-        now = _utc_now_iso()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO anomalies (type, namespace, pod, rule_key, severity, evidence,
-                                       detected_at, detected_day, updated_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
-                ON CONFLICT(type, namespace, pod, rule_key, detected_day) DO UPDATE SET
-                    evidence = CASE
-                        WHEN json_extract(anomalies.evidence, '$.ai_error') IS NULL THEN excluded.evidence
-                        ELSE json_set(excluded.evidence, '$.ai_error', json_extract(anomalies.evidence, '$.ai_error'))
-                    END,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    type,
-                    namespace,
-                    pod,
-                    rule_key,
-                    severity,
-                    json.dumps(evidence, separators=(",", ":")),
-                    now,
-                    detected_day,
-                    now,
-                ),
-            )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT id FROM anomalies WHERE type=? AND namespace=? AND pod=? AND rule_key=? AND detected_day=?",
-                (type, namespace, pod, rule_key, detected_day),
-            ).fetchone()
-            return int(row["id"])
+        anomaly_id, _ = self.record_detection(
+            type=type, namespace=namespace, pod=pod, rule_key=rule_key,
+            severity=severity, evidence=evidence, detected_day=detected_day,
+        )
+        return anomaly_id
 
+    @_write
+    def record_detection(
+        self,
+        *,
+        type: str,
+        namespace: str,
+        pod: str,
+        rule_key: str,
+        severity: str,
+        evidence: dict[str, Any],
+        detected_day: str,
+    ) -> tuple[int, str]:
+        """Insert or refresh one anomaly. Returns (id, outcome) where outcome is
+        "created", "updated" (same occurrence, newer counts) or "recurred" (the
+        same anomaly in a different hourly window of the same day).
+
+        A recurrence replaces the evidence, so any AI summary, steps and AI
+        error written for the earlier occurrence are cleared and the anomaly is
+        summarized again; otherwise the old text would be shown as describing
+        evidence it never saw. Within one occurrence the summary is kept (and a
+        recorded AI error is preserved so failures are not retried every tick).
+        """
+        now = _utc_now_iso()
+        evidence_json = json.dumps(evidence, separators=(",", ":"))
+        key = (type, namespace, pod, rule_key, detected_day)
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, evidence FROM anomalies WHERE type=? AND namespace=? AND pod=? AND rule_key=? AND detected_day=?",
+                key,
+            ).fetchone()
+            if row is None:
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO anomalies (type, namespace, pod, rule_key, severity, evidence,
+                                           detected_at, detected_day, updated_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+                    """,
+                    (type, namespace, pod, rule_key, severity, evidence_json, now, detected_day, now),
+                )
+                self._conn.commit()
+                return int(cur.lastrowid), "created"
+            anomaly_id = int(row["id"])
+            try:
+                previous = json.loads(row["evidence"])
+            except (TypeError, ValueError):
+                previous = {}
+            old_window = previous.get("window_start") if isinstance(previous, dict) else None
+            new_window = evidence.get("window_start")
+            if old_window and new_window and new_window < old_window:
+                # An older window (e.g. the previous hour, re-evaluated) never
+                # replaces evidence for a newer occurrence.
+                return anomaly_id, "unchanged"
+            if old_window and new_window and old_window != new_window:
+                self._conn.execute(
+                    """
+                    UPDATE anomalies SET evidence=?, severity=?, updated_at=?,
+                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL
+                    WHERE id=?
+                    """,
+                    (evidence_json, severity, now, anomaly_id),
+                )
+                outcome = "recurred"
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE anomalies SET
+                        evidence = CASE
+                            WHEN json_extract(evidence, '$.ai_error') IS NULL THEN ?
+                            ELSE json_set(?, '$.ai_error', json_extract(evidence, '$.ai_error'))
+                        END,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (evidence_json, evidence_json, now, anomaly_id),
+                )
+                outcome = "updated"
+            self._conn.commit()
+            return anomaly_id, outcome
+
+    @_write
     def record_ai_failure(self, anomaly_id: int, error: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -158,6 +243,7 @@ class AnomalyStore:
             )
             self._conn.commit()
 
+    @_write
     def save_ai_summary(
         self,
         anomaly_id: int,
@@ -207,10 +293,22 @@ class AnomalyStore:
                     item["ai_steps"] = []
             else:
                 item["ai_steps"] = []
+            if not isinstance(item["ai_steps"], list):
+                item["ai_steps"] = []
+            for step in item["ai_steps"]:
+                # Stored plans may predate the current parser or server-side
+                # risk derivation (or carry a model-chosen label); re-derive
+                # everything execution-related from the command text, so a
+                # stale structured action is never offered to run.
+                if isinstance(step, dict):
+                    for stale in ("action", "is_supported", "exec_command", "ignored_args", "unsupported_reason"):
+                        step.pop(stale, None)
+                    step.update(step_execution_fields(step.get("command") or "", step.get("risk")))
         return {"items": items, "has_more": has_more}
 
     _VALID_STATUSES = frozenset({"new", "reviewed", "dismissed"})
 
+    @_write
     def set_status(self, anomaly_id: int, status: str) -> bool:
         """Update the status of a single anomaly. Returns True if a row was updated."""
         if status not in self._VALID_STATUSES:
@@ -224,35 +322,189 @@ class AnomalyStore:
             return cur.rowcount > 0
 
 
+@dataclass(frozen=True)
+class _Window:
+    """One observation window and the baseline that precedes it."""
+
+    start: datetime
+    end: datetime            # end of observed data: hour end, or `now` for the open hour
+    hour_end: datetime       # the hour's nominal end (reported as window_end)
+    partial: bool
+    baseline_start: datetime  # max(start - baseline window, first stored record)
+
+    @property
+    def hours(self) -> float:
+        return (self.end - self.start).total_seconds() / 3600
+
+    @property
+    def baseline_hours(self) -> float:
+        return (self.start - self.baseline_start).total_seconds() / 3600
+
+
 class InsightsDetector:
     """Deterministic detection over the records table. All windows derive from
-    a single `now` so the math is testable without sleeps or mocks."""
+    a single `now` so the math is testable without sleeps or mocks.
+
+    Each run looks at two hourly windows:
+      * the previous, complete hour — evaluated on every run of the following
+        hour, so its last minutes and late-arriving (late-ingested) records
+        are counted;
+      * the current hour, once `min_partial_window_minutes` of it have passed.
+    Both use one rule: the expected count is the baseline's per-hour average
+    times the hours actually observed, so a 20-minute window is compared with
+    20 minutes' worth of baseline, not with a full hour.
+
+    The baseline average divides by the history that actually exists (from
+    the first stored record), not by the configured window, so a young install
+    is not compared with a baseline diluted by days that were never collected.
+    With less than `min_baseline_hours` of history no anomaly is raised
+    ("learning"); `history_hours` and `learning` report this.
+
+    Counting happens in SQL (GROUP BY), so memory does not grow with log
+    volume, and multi-day baselines are read in day-sized slices. In the web
+    app the detector owns a separate read connection; with WAL it then never
+    waits on, or blocks, the ingest writer and HTTP queries."""
 
     def __init__(self, conn: sqlite3.Connection, cfg: InsightsConfig, lock: threading.RLock | None = None):
         self._conn = conn
         self.cfg = cfg
         # The owner's lock when conn is shared with other threads (LogStorage.lock).
         self._lock = lock or threading.RLock()
-
-    def _hour_bounds(self, now: datetime) -> tuple[str, str]:
-        hour_start = now.replace(minute=0, second=0, microsecond=0)
-        hour_end = hour_start + timedelta(hours=1)
-        return hour_start.isoformat().replace("+00:00", "Z"), hour_end.isoformat().replace("+00:00", "Z")
-
-    def _baseline_start(self, hour_start: datetime) -> str:
-        start = hour_start - timedelta(hours=24 * self.cfg.baseline_window_days)
-        return start.isoformat().replace("+00:00", "Z")
-
-    def _window_rows(self, start: str, end: str, where: str = "") -> list[sqlite3.Row]:
+        self.history_hours: float | None = None
+        self.learning = False
         with self._lock:
-            return self._conn.execute(
-                f"SELECT timestamp, severity_bucket, namespace, pod, message FROM records WHERE timestamp >= ? AND timestamp < ?{where}",
-                (start, end),
-            ).fetchall()
+            self._conn.create_function(_RULE_KEY_SQL_FUNCTION, 1, rule_key_of, deterministic=True)
 
-    def _evidence(self, hour_start: str, hour_end: str, items: list, **extra: Any) -> dict[str, Any]:
+    @staticmethod
+    def _iso(value: datetime) -> str:
+        return value.isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _parse(value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    def _first_record_time(self) -> datetime | None:
+        """Earliest stored event time, or None when there are no records. An
+        unparseable value is treated as "history covers the whole window"."""
+        row = self._query("SELECT MIN(timestamp) FROM records", ())
+        if not row or not row[0][0]:
+            return None
+        return self._parse(row[0][0]) or datetime.min.replace(tzinfo=timezone.utc)
+
+    def _windows(self, now: datetime) -> list[_Window]:
+        """The windows to evaluate at `now`, oldest first. Updates
+        history_hours / learning."""
+        now = now.astimezone(timezone.utc).replace(microsecond=0)
+        hour_start = now.replace(minute=0, second=0)
+        span = timedelta(days=self.cfg.baseline_window_days)
+        min_history = min(
+            timedelta(hours=max(1.0, float(self.cfg.min_baseline_hours))), span
+        )
+        first = self._first_record_time()
+        self.history_hours = (
+            None if first is None else round(max(0.0, (hour_start - first).total_seconds() / 3600), 1)
+        )
+        candidates = [(hour_start - timedelta(hours=1), hour_start, hour_start, False)]
+        if now - hour_start >= timedelta(minutes=float(self.cfg.min_partial_window_minutes)):
+            candidates.append((hour_start, now, hour_start + timedelta(hours=1), True))
+        windows = []
+        for start, end, hour_end, partial in candidates:
+            if first is None or start - first < min_history:
+                continue  # not enough history before this window
+            windows.append(_Window(start, end, hour_end, partial, max(start - span, first)))
+        self.learning = not windows
+        return windows
+
+    def _slices(self, start: str, end: str) -> list[tuple[str, str]]:
+        lo = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        hi = datetime.fromisoformat(end.replace("Z", "+00:00"))
+        out: list[tuple[str, str]] = []
+        while lo < hi:
+            nxt = min(lo + timedelta(hours=_BASELINE_SLICE_HOURS), hi)
+            out.append((self._iso(lo), self._iso(nxt)))
+            lo = nxt
+        return out
+
+    def _query(self, sql: str, args: tuple) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, args).fetchall()
+
+    def _counts(
+        self, start: str, end: str, keys: tuple[str, ...], where: str = "", args: tuple = ()
+    ) -> dict[tuple, int]:
+        """{key tuple: row count} for start <= timestamp < end, aggregated in SQL
+        one slice at a time. `keys` are SQL expressions (fixed by the callers)."""
+        select = ", ".join(f"{expr} AS k{i}" for i, expr in enumerate(keys))
+        group = ", ".join(f"k{i}" for i in range(len(keys)))
+        out: dict[tuple, int] = {}
+        for lo, hi in self._slices(start, end):
+            rows = self._query(
+                f"SELECT {select}, COUNT(*) FROM records "
+                f"WHERE timestamp >= ? AND timestamp < ?{where} GROUP BY {group}",
+                (lo, hi, *args),
+            )
+            for row in rows:
+                key = tuple(row[i] for i in range(len(keys)))
+                out[key] = out.get(key, 0) + int(row[len(keys)])
+        return out
+
+    @staticmethod
+    def _add(*parts: dict[tuple, int]) -> dict[tuple, int]:
+        out: dict[tuple, int] = {}
+        for part in parts:
+            for key, count in part.items():
+                out[key] = out.get(key, 0) + count
+        return out
+
+    def _observed(self, windows: list[_Window], keys: tuple[str, ...], where: str = "", args: tuple = ()) -> list[dict]:
+        return [self._counts(self._iso(w.start), self._iso(w.end), keys, where, args) for w in windows]
+
+    def _baselines(
+        self, windows: list[_Window], observed: list[dict], keys: tuple[str, ...], where: str, args: tuple
+    ) -> list[dict[tuple, int]]:
+        """Baseline counts for each window, sharing the long scan between the
+        previous-hour and current-hour windows: their baselines differ only by
+        one hour at each end, and the newer one's extra hour is exactly the
+        previous window's observation."""
+        if len(windows) == 2:
+            prev, cur = windows
+            core = self._counts(self._iso(cur.baseline_start), self._iso(prev.start), keys, where, args)
+            head = self._counts(self._iso(prev.baseline_start), self._iso(cur.baseline_start), keys, where, args)
+            return [self._add(head, core), self._add(core, observed[0])]
+        return [
+            self._counts(self._iso(w.baseline_start), self._iso(w.start), keys, where, args) for w in windows
+        ]
+
+    def _samples(self, window: _Window, where: str, args: tuple) -> list[sqlite3.Row]:
+        """The first rows (by time) of one group, enough for its evidence."""
+        limit = max(self.cfg.sample_timestamps_max, _SAMPLE_SCAN_ROWS)
+        return self._query(
+            "SELECT timestamp, severity_bucket, message FROM records "
+            f"WHERE timestamp >= ? AND timestamp < ?{where} ORDER BY timestamp, id LIMIT ?",
+            (self._iso(window.start), self._iso(window.end), *args, limit),
+        )
+
+    def _hours_with_data(self, start: datetime, end: datetime) -> int:
+        """Clock hours in [start, end) holding at least one record of any
+        namespace. Far below the baseline's length usually means an ingestion
+        gap (an outage, not a quiet cluster), which dilutes the baseline."""
+        hour = start.replace(minute=0, second=0, microsecond=0)
+        found = 0
+        while hour < end:
+            lo, hi = max(hour, start), min(hour + timedelta(hours=1), end)
+            if self._query("SELECT 1 FROM records WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
+                           (self._iso(lo), self._iso(hi))):
+                found += 1
+            hour += timedelta(hours=1)
+        return found
+
+    def _evidence(self, window: _Window, count: int, samples: list, **extra: Any) -> dict[str, Any]:
         sample_messages: list[str] = []
-        for r in items:
+        for r in samples:
             try:
                 msg = str(r["message"]).strip()
             except (KeyError, TypeError, IndexError):
@@ -263,172 +515,213 @@ class InsightsDetector:
                 break
 
         evidence = {
-            "window_start": hour_start,
-            "window_end": hour_end,
-            "current_count": len(items),
+            "window_start": self._iso(window.start),
+            "window_end": self._iso(window.hour_end),
+            "window_complete": not window.partial,
+            "observed_minutes": round(window.hours * 60, 1),
+            "current_count": count,
             "baseline_window_days": self.cfg.baseline_window_days,
-            "sample_timestamps": [r["timestamp"] for r in items[: self.cfg.sample_timestamps_max]],
+            "baseline_hours": round(window.baseline_hours, 1),
+            # Hours of the baseline that hold any data at all; empty hours are
+            # averaged in as zero, so a gap here can make normal volume look
+            # like a spike.
+            "baseline_hours_with_data": self._hours_with_data(window.baseline_start, window.start),
+            "sample_timestamps": [r["timestamp"] for r in samples[: self.cfg.sample_timestamps_max]],
             "sample_messages": sample_messages,
         }
         evidence.update(extra)
         return evidence
 
-    def detect_error_spikes(self, now: datetime, *, per_pod: bool = False) -> list[dict[str, Any]]:
-        hour_start, hour_end = self._hour_bounds(now)
-        baseline_start = self._baseline_start(datetime.fromisoformat(hour_start.replace("Z", "+00:00")))
-        baseline_hours = max(1, 24 * self.cfg.baseline_window_days)
-        current_rows = self._window_rows(hour_start, hour_end, " AND severity_bucket='error'")
-        baseline_rows = self._window_rows(baseline_start, hour_start, " AND severity_bucket='error'")
+    @staticmethod
+    def _in_list(column: str) -> str:
+        # One bound JSON array instead of one parameter per value.
+        return f" AND {column} IN (SELECT value FROM json_each(?))"
 
-        def key_of(row: sqlite3.Row) -> tuple[str, str]:
-            return (row["namespace"], row["pod"]) if per_pod else (row["namespace"], "")
+    def _rate_anomalies(
+        self,
+        now: datetime,
+        *,
+        type_: str,
+        keys: tuple[str, ...],
+        where: str,
+        multiplier: float,
+        min_count: int,
+        describe: Callable[[tuple], tuple[str, str, str, str]],
+        sample_filter: Callable[[tuple], tuple[str, tuple]],
+        baseline_filter: Callable[[set[tuple]], tuple[str, tuple]],
+    ) -> list[dict[str, Any]]:
+        """Shared rule for error spikes and message frequency: a group is
+        anomalous when its count in the window reaches `min_count` and is at
+        least `multiplier` times the baseline's expected count for the same
+        observed duration. The newest flagged window wins per group."""
+        windows = self._windows(now)
+        if not windows:
+            return []
+        observed = self._observed(windows, keys, where)
+        candidates = {key for counts in observed for key, n in counts.items() if n >= min_count}
+        if not candidates:
+            return []
+        extra_where, extra_args = baseline_filter(candidates)
+        baselines = self._baselines(windows, observed, keys, where + extra_where, extra_args)
 
-        current: dict[tuple[str, str], list] = {}
-        for row in current_rows:
-            current.setdefault(key_of(row), []).append(row)
-        baseline_counts: dict[tuple[str, str], int] = {}
-        for row in baseline_rows:
-            baseline_counts[key_of(row)] = baseline_counts.get(key_of(row), 0) + 1
-
-        anomalies = []
-        for key, items in current.items():
-            baseline_avg = compute_baseline([baseline_counts.get(key, 0) / baseline_hours] * baseline_hours)
-            if not is_spike(len(items), baseline_avg, self.cfg.spike_multiplier, self.cfg.spike_min_count):
-                continue
-            anomalies.append(
-                {
-                    "type": "error_rate_spike",
-                    "namespace": key[0],
-                    "pod": key[1],
-                    "rule_key": "",
-                    "severity": "error",
+        found: dict[tuple, dict[str, Any]] = {}
+        for window, counts, baseline in zip(windows, observed, baselines):
+            for key, count in counts.items():
+                if key not in candidates:
+                    continue
+                avg = baseline.get(key, 0) / max(window.baseline_hours, 1e-9)
+                expected = avg * window.hours
+                if not is_spike(count, expected, multiplier, min_count):
+                    continue
+                namespace, pod, rule_key, severity = describe(key)
+                sample_where, sample_args = sample_filter(key)
+                found[key] = {
+                    "type": type_,
+                    "namespace": namespace,
+                    "pod": pod,
+                    "rule_key": rule_key,
+                    "severity": severity,
                     "evidence": self._evidence(
-                        hour_start, hour_end, items,
-                        baseline_avg_per_hour=round(baseline_avg, 3),
-                        multiplier=self.cfg.spike_multiplier,
+                        window, count, self._samples(window, sample_where, sample_args),
+                        baseline_avg_per_hour=round(avg, 3),
+                        expected_count=round(expected, 3),
+                        multiplier=multiplier,
                     ),
                 }
-            )
-        return anomalies
+        return list(found.values())
 
-    def detect_new_falco_rules(self, now: datetime) -> list[dict[str, Any]]:
-        hour_start, hour_end = self._hour_bounds(now)
-        current_rows = self._window_rows(hour_start, hour_end, " AND scope='security'")
-        if not current_rows:
-            return []
-        with self._lock:
-            prior_rows = self._conn.execute(
-                "SELECT message FROM records WHERE timestamp < ? AND scope='security'",
-                (hour_start,),
-            ).fetchall()
-        prior_keys = {rule_key_of(row["message"]) for row in prior_rows}
-        grouped: dict[str, list] = {}
-        for row in current_rows:
-            key = rule_key_of(row["message"])
-            if key not in prior_keys:
-                grouped.setdefault(key, []).append(row)
-        return [
-            {
-                "type": "new_falco_rule",
-                "namespace": "",
-                "pod": "",
-                "rule_key": key,
-                "severity": items[0]["severity_bucket"],
-                "evidence": self._evidence(
-                    hour_start, hour_end, items, first_seen_timestamp=items[0]["timestamp"]
-                ),
-            }
-            for key, items in grouped.items()
-        ]
+    def detect_error_spikes(self, now: datetime, *, per_pod: bool = False) -> list[dict[str, Any]]:
+        error_only = " AND severity_bucket='error'"
+        return self._rate_anomalies(
+            now,
+            type_="error_rate_spike",
+            keys=("namespace", "pod") if per_pod else ("namespace", "''"),
+            where=error_only,
+            multiplier=self.cfg.spike_multiplier,
+            min_count=self.cfg.spike_min_count,
+            describe=lambda key: (key[0], key[1], "", "error"),
+            sample_filter=lambda key: (
+                (error_only + " AND namespace = ? AND pod = ?", (key[0], key[1]))
+                if per_pod else (error_only + " AND namespace = ?", (key[0],))
+            ),
+            baseline_filter=lambda keys: (
+                self._in_list("namespace"), (json.dumps(sorted({k[0] for k in keys})),)
+            ),
+        )
 
     def detect_message_frequency(self, now: datetime) -> list[dict[str, Any]]:
-        hour_start, hour_end = self._hour_bounds(now)
-        baseline_start = self._baseline_start(datetime.fromisoformat(hour_start.replace("Z", "+00:00")))
-        baseline_hours = max(1, 24 * self.cfg.baseline_window_days)
-        current_rows = self._window_rows(hour_start, hour_end)
-        baseline_rows = self._window_rows(baseline_start, hour_start)
+        rule_key = f"{_RULE_KEY_SQL_FUNCTION}(message)"
+        return self._rate_anomalies(
+            now,
+            type_="message_frequency",
+            keys=("namespace", rule_key),
+            where="",
+            multiplier=self.cfg.frequency_multiplier,
+            min_count=self.cfg.frequency_min_count,
+            describe=lambda key: (key[0], "", key[1], ""),
+            sample_filter=lambda key: (f" AND namespace = ? AND {rule_key} = ?", key),
+            baseline_filter=lambda keys: (
+                self._in_list("namespace") + self._in_list(rule_key),
+                (json.dumps(sorted({k[0] for k in keys})), json.dumps(sorted({k[1] for k in keys}))),
+            ),
+        )
 
-        def key_of(row: sqlite3.Row) -> tuple[str, str]:
-            return (row["namespace"], rule_key_of(row["message"]))
+    def detect_new_falco_rules(self, now: datetime) -> list[dict[str, Any]]:
+        """Falco rules firing in a window that did not fire in the baseline
+        before it (at most baseline_window_days; less on a young install). The
+        look-back is bounded so the cost does not grow with the cache's
+        retention period."""
+        windows = self._windows(now)
+        if not windows:
+            return []
+        rule_key = f"{_RULE_KEY_SQL_FUNCTION}(message)"
+        security = " AND scope='security'"
+        observed = self._observed(windows, (rule_key,), security)
+        candidates = sorted({key[0] for counts in observed for key in counts})
+        if not candidates:
+            return []
+        in_candidates = (self._in_list(rule_key), (json.dumps(candidates),))
+        seen_before = [
+            {key[0] for key in baseline}
+            for baseline in self._baselines(
+                windows, observed, (rule_key,), security + in_candidates[0], in_candidates[1]
+            )
+        ]
 
-        current: dict[tuple[str, str], list] = {}
-        for row in current_rows:
-            current.setdefault(key_of(row), []).append(row)
-        baseline_counts: dict[tuple[str, str], int] = {}
-        for row in baseline_rows:
-            baseline_counts[key_of(row)] = baseline_counts.get(key_of(row), 0) + 1
-
-        anomalies = []
-        for key, items in current.items():
-            baseline_avg = compute_baseline([baseline_counts.get(key, 0) / baseline_hours] * baseline_hours)
-            if not is_spike(
-                len(items), baseline_avg, self.cfg.frequency_multiplier, self.cfg.frequency_min_count
-            ):
-                continue
-            anomalies.append(
-                {
-                    "type": "message_frequency",
-                    "namespace": key[0],
+        found: dict[str, dict[str, Any]] = {}
+        for window, counts, seen in zip(windows, observed, seen_before):
+            for (key,), count in counts.items():
+                if key in seen or key in found:
+                    continue  # known rule, or already reported for the earlier window
+                samples = self._samples(window, f"{security} AND {rule_key} = ?", (key,))
+                if not samples:
+                    continue
+                found[key] = {
+                    "type": "new_falco_rule",
+                    "namespace": "",
                     "pod": "",
-                    "rule_key": key[1],
-                    "severity": "",
+                    "rule_key": key,
+                    "severity": samples[0]["severity_bucket"],
                     "evidence": self._evidence(
-                        hour_start, hour_end, items,
-                        baseline_avg_per_hour=round(baseline_avg, 3),
-                        multiplier=self.cfg.frequency_multiplier,
+                        window, count, samples, first_seen_timestamp=samples[0]["timestamp"]
                     ),
                 }
-            )
-        return anomalies
+        return list(found.values())
 
     def detect_severity_shift(self, now: datetime) -> list[dict[str, Any]]:
-        hour_start, hour_end = self._hour_bounds(now)
-        baseline_start = self._baseline_start(datetime.fromisoformat(hour_start.replace("Z", "+00:00")))
-        current_rows = self._window_rows(hour_start, hour_end)
-        baseline_rows = self._window_rows(baseline_start, hour_start)
-        baseline_total = len(baseline_rows)
-        if baseline_total == 0:
+        """A namespace's share of lines in one severity bucket in the window
+        versus that same namespace's share over its baseline. Both shares use
+        the namespace's own total, so busy namespaces cannot dilute the
+        baseline of quiet ones. A namespace with no baseline lines has nothing
+        to shift from and is skipped (new error activity is the error-spike
+        detector's job). Shares are ratios, so partial windows need no scaling."""
+        windows = self._windows(now)
+        if not windows:
             return []
+        keys = ("namespace", "severity_bucket")
+        observed = self._observed(windows, keys)
+        namespaces = sorted({key[0] for counts in observed for key in counts})
+        if not namespaces:
+            return []
+        baselines = self._baselines(windows, observed, keys, self._in_list("namespace"), (json.dumps(namespaces),))
 
-        current_by_ns: dict[str, list] = {}
-        for row in current_rows:
-            current_by_ns.setdefault(row["namespace"], []).append(row)
-        baseline_counts: dict[str, dict[str, int]] = {}
-        for row in baseline_rows:
-            per_ns = baseline_counts.setdefault(row["namespace"], {})
-            per_ns[row["severity_bucket"]] = per_ns.get(row["severity_bucket"], 0) + 1
-
-        anomalies = []
-        for namespace, rows in current_by_ns.items():
-            ns_total = len(rows)
-            counts: dict[str, int] = {}
-            for row in rows:
-                counts[row["severity_bucket"]] = counts.get(row["severity_bucket"], 0) + 1
-            baseline_per_ns = baseline_counts.get(namespace, {})
-            for bucket, current_count in counts.items():
-                if current_count < self.cfg.shift_min_count:
+        found: dict[tuple, dict[str, Any]] = {}
+        for window, current, baseline in zip(windows, observed, baselines):
+            current_totals: dict[str, int] = {}
+            for (namespace, _), count in current.items():
+                current_totals[namespace] = current_totals.get(namespace, 0) + count
+            baseline_totals: dict[str, int] = {}
+            for (namespace, _), count in baseline.items():
+                baseline_totals[namespace] = baseline_totals.get(namespace, 0) + count
+            for (namespace, bucket), current_count in sorted(current.items()):
+                baseline_total = baseline_totals.get(namespace, 0)
+                if baseline_total == 0 or current_count < self.cfg.shift_min_count:
                     continue
-                current_share = current_count / ns_total
-                baseline_share = baseline_per_ns.get(bucket, 0) / baseline_total
+                current_share = current_count / current_totals[namespace]
+                baseline_share = baseline.get((namespace, bucket), 0) / baseline_total
                 if abs(current_share - baseline_share) < self.cfg.shift_share_delta:
                     continue
-                bucket_rows = [r for r in rows if r["severity_bucket"] == bucket]
-                anomalies.append(
-                    {
-                        "type": "severity_shift",
-                        "namespace": namespace,
-                        "pod": "",
-                        "rule_key": "",
-                        "severity": bucket,
-                        "evidence": self._evidence(
-                            hour_start, hour_end, bucket_rows,
-                            current_share=round(current_share, 3),
-                            baseline_share=round(baseline_share, 3),
-                            baseline_total=baseline_total,
-                        ),
-                    }
-                )
-        return anomalies
+                samples = self._samples(window, " AND namespace = ? AND severity_bucket = ?", (namespace, bucket))
+                found[(namespace, bucket)] = {
+                    "type": "severity_shift",
+                    "namespace": namespace,
+                    "pod": "",
+                    "rule_key": "",
+                    "severity": bucket,
+                    "evidence": self._evidence(
+                        window, current_count, samples,
+                        current_share=round(current_share, 3),
+                        baseline_share=round(baseline_share, 3),
+                        baseline_total=baseline_total,
+                    ),
+                }
+        return list(found.values())
+
+    def future_record_count(self, now: datetime, tolerance: timedelta = timedelta(minutes=5)) -> int:
+        """Records stamped ahead of `now` (clock skew or a wrong timezone). No
+        window ever evaluates them, so they are reported instead."""
+        row = self._query("SELECT COUNT(*) FROM records WHERE timestamp > ?", (self._iso(now + tolerance),))
+        return int(row[0][0]) if row else 0
 
     def detect_all(self, now: datetime) -> list[dict[str, Any]]:
         anomalies = list(self.detect_new_falco_rules(now))
@@ -456,6 +749,15 @@ class InsightsJob:
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self.last_run_at: str | None = None
         self.last_error: str | None = None
+        self.last_error_at: str | None = None
+        self.last_duration_ms: int | None = None
+        self.last_counts: dict[str, int] = {}
+        self.consecutive_failures = 0
+        self.future_dated_records = 0
+        # Last AI provider failure (already key- and content-redacted by
+        # ai_summary); detection keeps running while the provider is down.
+        self.last_ai_error: str | None = None
+        self.last_ai_error_at: str | None = None
         self._summarizer = summarizer
         # anomaly id -> consecutive failures; only ids still pending are kept.
         self._ai_failures: dict[int, int] = {}
@@ -467,27 +769,62 @@ class InsightsJob:
         self._stop.set()
         self._thread.join(timeout=5)
 
+    def status(self) -> dict[str, Any]:
+        return {
+            "enabled": bool(self.cfg.insights.enabled),
+            "running": self._thread.is_alive(),
+            "detect_interval_secs": self.cfg.insights.detect_interval_secs,
+            "last_run_at": self.last_run_at,
+            "last_duration_ms": self.last_duration_ms,
+            "last_counts": dict(self.last_counts),
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at,
+            "consecutive_failures": self.consecutive_failures,
+            "last_ai_error": self.last_ai_error,
+            "last_ai_error_at": self.last_ai_error_at,
+            # True while there is less stored history than min_baseline_hours:
+            # rate-based detection is waiting for a baseline.
+            "learning": self.detector.learning,
+            # Records timestamped more than 5 minutes ahead of the clock.
+            "future_dated_records": self.future_dated_records,
+            "history_hours": self.detector.history_hours,
+            # Hours of history needed before rate-based detectors fire.
+            "min_baseline_hours": min(
+                max(1.0, float(self.cfg.insights.min_baseline_hours)), self.cfg.insights.baseline_window_days * 24.0
+            ),
+        }
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
                 self.run_once()
-            except Exception as exc:  # surfaced to status; never kills the loop
-                self.last_error = str(exc)
+            except Exception as exc:  # logged and surfaced in /api/status; never kills the loop
+                self.consecutive_failures += 1
+                self.last_error = str(exc)[:500]
+                self.last_error_at = _utc_now_iso()
+                logger.exception("Insights run failed (%d in a row)", self.consecutive_failures)
             self._stop.wait(self.cfg.insights.detect_interval_secs)
 
     def run_once(self, now: datetime | None = None) -> dict[str, int]:
+        started = time.monotonic()
         now = now or datetime.now(timezone.utc)
-        created = self.detect_once(now)
-        summarized = self.summarize_pending()
+        counts = self.detect_once(now)
+        self.future_dated_records = self.detector.future_record_count(now)
+        counts["anomalies_summarized"] = self.summarize_pending()
+        self.last_duration_ms = int((time.monotonic() - started) * 1000)
         self.last_run_at = _utc_now_iso()
+        self.last_counts = counts
         self.last_error = None
-        return {"anomalies_created": created, "anomalies_summarized": summarized}
+        self.consecutive_failures = 0
+        return counts
 
-    def detect_once(self, now: datetime) -> int:
-        created = 0
-        day = now.strftime("%Y-%m-%d")
+    def detect_once(self, now: datetime) -> dict[str, int]:
+        counts = {"anomalies_created": 0, "anomalies_updated": 0, "anomalies_recurred": 0, "anomalies_unchanged": 0}
         for anomaly in self.detector.detect_all(now):
-            self.store.upsert_anomaly(
+            # The day of the window, not of the run: the previous hour checked
+            # just after midnight belongs to the day before.
+            day = str(anomaly["evidence"].get("window_start") or now.strftime("%Y-%m-%d"))[:10]
+            _, outcome = self.store.record_detection(
                 type=anomaly["type"],
                 namespace=anomaly["namespace"],
                 pod=anomaly["pod"],
@@ -496,8 +833,8 @@ class InsightsJob:
                 evidence=anomaly["evidence"],
                 detected_day=day,
             )
-            created += 1
-        return created
+            counts[f"anomalies_{outcome}"] += 1
+        return counts
 
     def summarize_pending(self) -> int:
         summarizer = self._summarizer or (lambda anomaly: None)
@@ -510,6 +847,8 @@ class InsightsJob:
             try:
                 result = summarizer(anomaly)
             except Exception as exc:
+                self.last_ai_error = str(exc)[:500]
+                self.last_ai_error_at = _utc_now_iso()
                 failures = self._ai_failures.get(anomaly_id, 0) + 1
                 logger.warning(
                     "AI summarization failed for anomaly %s (attempt %d/%d): %s",
@@ -523,6 +862,7 @@ class InsightsJob:
                     self._ai_failures[anomaly_id] = failures
                 continue
             self._ai_failures.pop(anomaly_id, None)
+            self.last_ai_error = None
             if result:
                 self.store.save_ai_summary(
                     int(anomaly["id"]),

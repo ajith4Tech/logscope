@@ -33,6 +33,8 @@ DEFAULT_INSIGHTS = {
     "frequency_min_count": 30,
     "detect_per_pod": False,
     "sample_timestamps_max": 10,
+    "min_baseline_hours": 24,
+    "min_partial_window_minutes": 15,
 }
 
 DEFAULT_AI = {
@@ -54,11 +56,23 @@ _DEFAULT_KEY_ENV = {
 
 DEFAULT_MATTERMOST = {
     "enabled": False,
+    # The webhook URL is a credential: read from this env var only, never
+    # from config files, and never logged or returned by the API.
     "webhook_url_env": "MATTERMOST_WEBHOOK_URL",
     "min_urgency": "high",
+    # Public URL of the Logscope UI (e.g. https://logscope.example.com), used
+    # for "open investigation" links in messages. Empty = no links.
+    "link_base_url": "",
+    # A recurrence of the same anomaly (type, namespace, pod, rule) is only
+    # notified again once this long after the previous notification.
+    "renotify_after_hours": 6,
+    # Occurrences whose window started longer ago than this are never sent
+    # (no backlog flood when notifications are first enabled).
+    "max_age_hours": 6,
 }
 
-# Ordering used to compare an anomaly's ai_urgency against min_urgency.
+# Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
+# against min_urgency.
 URGENCY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
 
 
@@ -85,6 +99,12 @@ class InsightsConfig:
     frequency_min_count: int
     detect_per_pod: bool
     sample_timestamps_max: int
+    # Hours of stored history needed before rate-based detectors may fire
+    # (a new install has no baseline yet). Capped at the baseline window.
+    min_baseline_hours: float = 24
+    # The current, still-open hour is evaluated once this many minutes of it
+    # have passed; the previous complete hour is always evaluated.
+    min_partial_window_minutes: float = 15
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,9 @@ class MattermostConfig:
     enabled: bool
     webhook_url_env: str
     min_urgency: str  # low | medium | high | urgent — threshold, inclusive
+    link_base_url: str = ""
+    renotify_after_hours: float = 6
+    max_age_hours: float = 6
 
 
 @dataclass(frozen=True)
@@ -195,6 +218,29 @@ def load_app_config(config_path: Path) -> AppConfig:
             f"webapp.mattermost.min_urgency must be one of {sorted(URGENCY_ORDER)}, got {min_urgency!r}"
         )
 
+    # Values that would spin a loop, return nothing or never expire anything.
+    for section, key, value, minimum in (
+        ("backend", "poll_interval_secs", backend["poll_interval_secs"], 1),
+        ("backend", "page_size_default", backend["page_size_default"], 1),
+        ("backend", "page_size_max", backend["page_size_max"], 1),
+        ("backend", "s3_lookback_secs", backend["s3_lookback_secs"], 0),
+        ("backend", "retention_days", retention_days, 0),
+        ("insights", "detect_interval_secs", insights["detect_interval_secs"], 10),
+        ("insights", "baseline_window_days", insights["baseline_window_days"], 1),
+        ("ai", "max_anomalies_per_tick", ai["max_anomalies_per_tick"], 0),
+    ):
+        if int(value) < minimum:
+            raise ValueError(f"webapp.{section}.{key} must be >= {minimum}, got {value!r}")
+    if int(backend["page_size_default"]) > int(backend["page_size_max"]):
+        raise ValueError("webapp.backend.page_size_default must not exceed page_size_max")
+
+    link_base_url = str(mattermost.get("link_base_url") or "").strip().rstrip("/")
+    if link_base_url and not link_base_url.lower().startswith(("https://", "http://")):
+        raise ValueError("webapp.mattermost.link_base_url must start with https:// or http://")
+    for key in ("renotify_after_hours", "max_age_hours"):
+        if float(mattermost[key]) <= 0:
+            raise ValueError(f"webapp.mattermost.{key} must be > 0, got {mattermost[key]!r}")
+
     return AppConfig(
         root=config_path.resolve().parent,
         s3_bucket=str(s3_cfg["bucket"]),
@@ -226,6 +272,8 @@ def load_app_config(config_path: Path) -> AppConfig:
             frequency_min_count=int(insights["frequency_min_count"]),
             detect_per_pod=bool(insights["detect_per_pod"]),
             sample_timestamps_max=int(insights["sample_timestamps_max"]),
+            min_baseline_hours=float(insights["min_baseline_hours"]),
+            min_partial_window_minutes=float(insights["min_partial_window_minutes"]),
         ),
         ai=AiConfig(
             provider=str(ai.get("provider", "openrouter")),
@@ -239,6 +287,9 @@ def load_app_config(config_path: Path) -> AppConfig:
             enabled=bool(mattermost["enabled"]),
             webhook_url_env=str(mattermost["webhook_url_env"]),
             min_urgency=min_urgency,
+            link_base_url=link_base_url,
+            renotify_after_hours=float(mattermost["renotify_after_hours"]),
+            max_age_hours=float(mattermost["max_age_hours"]),
         ),
     )
 
