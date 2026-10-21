@@ -25,6 +25,8 @@ if not (ROOT / "logscope" / "_version.py").is_file():
 # Explicit file list (not a directory glob), so nothing else in webapp/ui can ride along.
 datas = [(str(ROOT / "webapp" / "ui" / name), "webapp/ui") for name in ("index.html", "app.js", "styles.css")]
 datas.append((str(ROOT / "config.example.yaml"), "."))  # `logscope render` fallback config
+# Built-in log signatures, read next to webapp/api/signatures.py.
+datas.append((str(ROOT / "webapp" / "api" / "signatures.yaml"), "webapp/api"))
 # botocore/boto3 service models and endpoint data are JSON files, not imports.
 datas += collect_data_files("botocore") + collect_data_files("boto3")
 
@@ -32,6 +34,8 @@ hiddenimports = (
     collect_submodules("logscope")
     + collect_submodules("webapp")
     + collect_submodules("anthropic")  # provider SDK, imported lazily by webapp.api.ai_summary
+    + collect_submodules("cryptography")  # stored AI key encryption (webapp.api.secrets); Rust + cffi bindings
+    + ["_cffi_backend"]
     + collect_submodules("botocore")
     + collect_submodules("boto3")
 )
@@ -43,7 +47,7 @@ if importlib.util.find_spec("certifi") is not None:
     hiddenimports.append("certifi")
 
 # Distribution metadata some SDKs read at runtime (importlib.metadata.version).
-for dist in ("anthropic", "boto3", "botocore", "pydantic", "httpx2"):
+for dist in ("anthropic", "boto3", "botocore", "pydantic", "httpx2", "cryptography"):
     try:
         datas += copy_metadata(dist)
     except Exception:  # noqa: BLE001 - not installed

@@ -375,3 +375,33 @@ def test_kubectl_enabled_with_namespaced_roles():
 def test_packaging_render_guards(overrides, message):
     _, err = _helm(_merge(BASE, overrides), expect_ok=False)
     assert message in err
+
+
+def test_settings_secret_refs_and_allowed_hosts():
+    docs, _ = _helm(BASE)
+    env = {e["name"] for e in _find(docs, "Deployment", "logscope-webapp")
+           ["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert not env & {"LOGSCOPE_ADMIN_TOKEN", "LOGSCOPE_SECRET_KEY", "LOGSCOPE_SECRET_KEY_PREVIOUS",
+                      "LOGSCOPE_AI_ALLOWED_HOSTS"}  # optional: generated on the state volume
+
+    docs, _ = _helm(_merge(BASE, {
+        "settings": {"adminToken": {"existingSecret": "ls-admin"},
+                     "secretKey": {"existingSecret": "ls-master", "existingSecretKey": "key"}},
+        "ai": {"allowedHosts": ["gw.example.internal", "llm.corp"], "prices": {"m-1": {"input": 1, "output": 2}},
+               "budgets": {"daily_tokens": 1000}, "features": {"anomaly_auto_summary": True}},
+    }))
+    env = {e["name"]: e for e in _find(docs, "Deployment", "logscope-webapp")
+           ["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["LOGSCOPE_ADMIN_TOKEN"]["valueFrom"]["secretKeyRef"] == \
+        {"name": "ls-admin", "key": "LOGSCOPE_ADMIN_TOKEN"}
+    assert env["LOGSCOPE_SECRET_KEY"]["valueFrom"]["secretKeyRef"] == {"name": "ls-master", "key": "key"}
+    assert env["LOGSCOPE_SECRET_KEY_PREVIOUS"]["valueFrom"]["secretKeyRef"] == \
+        {"name": "ls-master", "key": "LOGSCOPE_SECRET_KEY_PREVIOUS", "optional": True}
+    assert env["LOGSCOPE_AI_ALLOWED_HOSTS"]["value"] == "gw.example.internal,llm.corp"
+    raw = _find(docs, "ConfigMap", "logscope-webapp-config")["data"]["config.yaml"]
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "config.yaml"
+        p.write_text(raw)
+        cfg = load_app_config(p)
+    assert cfg.ai.prices == {"m-1": {"input": 1.0, "output": 2.0}}
+    assert cfg.ai.budgets == {"daily_tokens": 1000} and cfg.ai.features == {"anomaly_auto_summary": True}

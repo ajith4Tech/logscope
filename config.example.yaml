@@ -198,6 +198,17 @@ webapp:
     api_key_env: OPENROUTER_API_KEY # key itself NEVER in config, env var only (e.g. OPENROUTER_API_KEY or GEMINI_API_KEY)
     max_anomalies_per_tick: 5
     reasoning_effort: medium        # low|medium|high — only passed to models that support it; ignored otherwise, don't error
+    # deep_model: ""                # model for anomaly summaries; "" = model
+    # Defaults for the web UI's Settings tab, which overrides them at runtime
+    # (an environment variable always wins; see the chart README).
+    # prices:                       # USD per million tokens, for usage cost estimates
+    #   some-model-id: {input: 1.0, output: 4.0, cached: 0.1}
+    # features: {anomaly_auto_summary: false}   # explain_line, explain_filtered, anomaly_auto_summary,
+    #                                           # anomaly_manual_summary, nl_filters
+    # budgets: {daily_tokens: 2000000, daily_cost_usd: 5, daily_calls: {explain_filtered: 200}}  # UTC days
+    # cache_ttl_hours: 168            # AI answers cached per log template (0 = off)
+    # auto_summary_min_urgency: urgent # with anomaly_auto_summary on: low | medium | high | urgent
+    # signatures: []                  # extra known-pattern rules, format of webapp/api/signatures.yaml
   # Optional Mattermost notifications for Insights anomalies (off by default).
   # Sent once per anomaly occurrence at or above min_urgency; a recurrence of the
   # same anomaly is suppressed for renotify_after_hours. Urgency per type:

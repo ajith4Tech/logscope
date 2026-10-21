@@ -91,6 +91,10 @@
             <span class="tab-icon"></span> Pipeline
             <span id="pipelineBadge" class="tab-badge" hidden></span>
           </button>
+          <button id="tabSettings" class="tab" role="tab" aria-selected="false" aria-controls="panelSettings">
+            <span class="tab-icon"></span> Settings
+            <span id="settingsBadge" class="tab-badge" hidden></span>
+          </button>
           <button id="copyLinkBtn" type="button" class="ghost tab-bar-action" title="Copy a link that reopens this view: tab, filters, time range and selected entry or anomaly (no log content)">Copy link</button>
         </nav>
 
@@ -217,6 +221,7 @@
                 <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
               </div>
             </div>
+            <div id="explainMeta"></div>
             <div id="explainSummary" class="explain-summary"></div>
             <div id="explainAction" class="explain-action" hidden></div>
           </div>
@@ -415,6 +420,33 @@
           <div id="pipelineBanner" class="pipeline-banner" role="status" hidden></div>
           <div id="pipelineContent" class="pipeline-grid"></div>
         </div>
+
+        <!-- Settings panel (admin token required) -->
+        <div id="panelSettings" class="panel settings-panel" role="tabpanel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>AI settings</h2>
+              <div class="subtle" id="settingsSubtitle">Unlock with the admin token to view or change AI settings.</div>
+            </div>
+            <div class="settings-head-actions">
+              <button id="settingsRefresh" type="button" class="ghost" hidden>Refresh</button>
+              <button id="settingsLock" type="button" class="ghost" hidden>Lock</button>
+            </div>
+          </div>
+          <form id="settingsUnlock" class="settings-unlock" autocomplete="off">
+            <label>Admin token
+              <input id="settingsToken" type="password" autocomplete="off" spellcheck="false" required />
+            </label>
+            <button type="submit">Unlock</button>
+            <p class="subtle">The token is LOGSCOPE_ADMIN_TOKEN, or the admin.token file next to the state database (its path is in the server log). It is kept in this browser tab only and is forgotten when the tab closes.</p>
+            <div id="settingsUnlockError" class="settings-error" role="alert" hidden></div>
+          </form>
+          <div id="settingsBody" hidden>
+            <div id="settingsWarnings" class="pipeline-banner tone-warn" role="status" hidden></div>
+            <div id="settingsMessage" class="settings-message" role="status" hidden></div>
+            <div id="settingsContent" class="settings-grid"></div>
+          </div>
+        </div>
       </section>
     </main>
   </div>
@@ -498,6 +530,7 @@
           <span class="badge"></span>
         </div>
         <div class="anomaly-col anomaly-col-summary">
+          <span class="anomaly-source" hidden></span>
           <div class="anomaly-summary-text"></div>
           <div class="anomaly-action-text"></div>
         </div>
@@ -506,6 +539,8 @@
           <div class="anomaly-time"></div>
         </div>
         <div class="anomaly-col anomaly-col-actions">
+          <button type="button" class="anomaly-btn-summarize ghost" title="Summarize this anomaly with AI (fast model)" hidden>✦ Summarize</button>
+          <button type="button" class="anomaly-btn-deep ghost" title="Deep analysis with the deep model (separate budget)" hidden>Deep</button>
           <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab"> Troubleshoot</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>

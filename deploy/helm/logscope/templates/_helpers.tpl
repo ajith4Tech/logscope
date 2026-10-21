@@ -17,7 +17,7 @@
      an existingSecret is not visible to Helm; restart the workload instead. */}}
 {{- define "logscope.webapp.credentialsChecksum" -}}
 {{- $c := .Values.s3.credentials.webapp -}}
-{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey .Values.mattermost.enabled .Values.mattermost.existingSecret .Values.mattermost.existingSecretKey .Values.mattermost.webhookUrl | toJson | sha256sum -}}
+{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey .Values.mattermost.enabled .Values.mattermost.existingSecret .Values.mattermost.existingSecretKey .Values.mattermost.webhookUrl .Values.settings.adminToken .Values.settings.secretKey | toJson | sha256sum -}}
 {{- end -}}
 
 {{- define "logscope.vector.credentialsChecksum" -}}

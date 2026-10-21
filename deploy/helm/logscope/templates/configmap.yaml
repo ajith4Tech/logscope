@@ -7,7 +7,14 @@
   "api_key_env" "LOGSCOPE_AI_API_KEY"
   "base_url" (toString .Values.ai.baseUrl)
   "reasoning_effort" (toString .Values.ai.reasoningEffort)
-  "max_anomalies_per_tick" (int .Values.ai.maxAnomaliesPerTick) -}}
+  "max_anomalies_per_tick" (int .Values.ai.maxAnomaliesPerTick)
+  "deep_model" (toString (.Values.ai.deepModel | default ""))
+  "prices" (.Values.ai.prices | default dict)
+  "features" (.Values.ai.features | default dict)
+  "budgets" (.Values.ai.budgets | default dict)
+  "cache_ttl_hours" (.Values.ai.cacheTtlHours | default 168)
+  "auto_summary_min_urgency" (toString (.Values.ai.autoSummaryMinUrgency | default "urgent"))
+  "signatures" (.Values.ai.signatures | default list) -}}
 {{- $mm := dict
   "enabled" (and .Values.mattermost.enabled true)
   "webhook_url_env" "LOGSCOPE_MATTERMOST_WEBHOOK_URL"

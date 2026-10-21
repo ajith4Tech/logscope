@@ -21,6 +21,9 @@ REQUIRED = (
     "webapp/ui/styles.css",
     "config.example.yaml",
     "botocore/data/endpoints.json",
+    "webapp/api/signatures.yaml",
+    # Rust bindings behind the stored AI key encryption (cryptography.fernet).
+    "cryptography/hazmat/bindings/_rust.abi3.so",
 )
 # Matched against each file's base name.
 FORBIDDEN_NAMES = (

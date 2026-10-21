@@ -40,7 +40,7 @@ from .storage import SQLITE_BUSY_TIMEOUT_SECS
 
 _REQUIRED_TABLES = ("records", "ingested_objects", "app_state")
 _COUNTED_TABLES = ("records", "ingested_objects", "anomalies")
-_STATE_COUNTED_TABLES = ("saved_views",)
+_STATE_COUNTED_TABLES = ("saved_views", "ai_usage")
 _SIDE_SUFFIXES = ("-wal", "-shm")
 # Headroom kept free on the volume beyond what a command needs.
 _SPACE_MARGIN_BYTES = 64 * 1024 * 1024

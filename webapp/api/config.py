@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,18 @@ DEFAULT_AI = {
     "max_anomalies_per_tick": 5,
     "reasoning_effort": "medium",
     "base_url": "",
+    "deep_model": "",
+    "prices": {},
+    "features": {},
+    "budgets": {},
+    # AI answers are cached per log template for this long (0 = no cache).
+    "cache_ttl_hours": 168,
+    # With anomaly_auto_summary on, only anomalies at or above this urgency
+    # (see notify.anomaly_urgency) are summarized automatically.
+    "auto_summary_min_urgency": "urgent",
+    # Extra signature rules (same format as webapp/api/signatures.yaml),
+    # tried after the built-in ones.
+    "signatures": [],
 }
 
 # Conventional key variable per provider when webapp.ai.api_key_env is not set.
@@ -121,6 +133,19 @@ class AiConfig:
     max_anomalies_per_tick: int
     reasoning_effort: str
     base_url: str = ""
+    # Model for anomaly summaries (deeper analysis); "" = model.
+    deep_model: str = ""
+    # Per-model prices in USD per million tokens: {model: {input, output, cached}}.
+    prices: dict = field(default_factory=dict, compare=False)
+    # Defaults for the Settings UI's feature flags and budgets (it overrides them).
+    features: dict = field(default_factory=dict, compare=False)
+    budgets: dict = field(default_factory=dict, compare=False)
+    cache_ttl_hours: float = 168.0
+    auto_summary_min_urgency: str = "urgent"
+    signatures: tuple = field(default_factory=tuple, compare=False)
+    # The resolved key (see ai_settings.AiSettings.effective); never from
+    # config.yaml. Excluded from repr so it cannot reach a log line.
+    api_key: str = field(default="", repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -242,6 +267,30 @@ def load_app_config(config_path: Path) -> AppConfig:
     if int(backend["page_size_default"]) > int(backend["page_size_max"]):
         raise ValueError("webapp.backend.page_size_default must not exceed page_size_max")
 
+    from .ai_settings import SettingsError, clean_budgets, clean_flags, clean_prices
+
+    try:
+        ai["prices"] = clean_prices(ai.get("prices") or {}, "webapp.ai.prices")
+        ai["features"] = clean_flags(ai.get("features") or {}, "webapp.ai.features")
+        ai["budgets"] = clean_budgets(ai.get("budgets") or {}, "webapp.ai.budgets")
+    except SettingsError as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(ai.get("signatures") or [], list):
+        raise ValueError("webapp.ai.signatures must be a list of rules")
+    from .signatures import SignatureError, load_rules
+
+    try:
+        load_rules(ai.get("signatures") or [])
+    except SignatureError as exc:
+        raise ValueError(f"webapp.ai.signatures: {exc}") from None
+    auto_urgency = str(ai.get("auto_summary_min_urgency") or "urgent").strip().lower()
+    if auto_urgency not in URGENCY_ORDER:
+        raise ValueError(f"webapp.ai.auto_summary_min_urgency must be one of {sorted(URGENCY_ORDER)}")
+    if float(ai.get("cache_ttl_hours") or 0) < 0:
+        raise ValueError("webapp.ai.cache_ttl_hours must be >= 0")
+    if "api_key" in ai_raw:
+        raise ValueError("webapp.ai.api_key is not read from config files; set the variable named in api_key_env")
+
     link_base_url = str(mattermost.get("link_base_url") or "").strip().rstrip("/")
     if link_base_url and not link_base_url.lower().startswith(("https://", "http://")):
         raise ValueError("webapp.mattermost.link_base_url must start with https:// or http://")
@@ -291,6 +340,13 @@ def load_app_config(config_path: Path) -> AppConfig:
             max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
             reasoning_effort=str(ai.get("reasoning_effort") or ""),
             base_url=str(ai.get("base_url") or ""),
+            deep_model=str(ai.get("deep_model") or ""),
+            prices=dict(ai.get("prices") or {}),
+            features=dict(ai.get("features") or {}),
+            budgets=dict(ai.get("budgets") or {}),
+            cache_ttl_hours=float(ai.get("cache_ttl_hours") if ai.get("cache_ttl_hours") is not None else 168),
+            auto_summary_min_urgency=auto_urgency,
+            signatures=tuple(ai.get("signatures") or ()),
         ),
         mattermost=MattermostConfig(
             enabled=bool(mattermost["enabled"]),

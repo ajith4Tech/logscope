@@ -128,6 +128,9 @@ class AnomalyStore:
             cols = [info[1] for info in cur.execute("PRAGMA table_info(anomalies)").fetchall()]
             if "ai_steps" not in cols:
                 cur.execute("ALTER TABLE anomalies ADD COLUMN ai_steps TEXT")
+            if "ai_meta" not in cols:
+                # {source: signature|cache|ai, tier, generated_at, cache_key}
+                cur.execute("ALTER TABLE anomalies ADD COLUMN ai_meta TEXT")
             # Regenerate existing cached AI summaries that lack structured steps
             cur.execute(
                 "UPDATE anomalies SET ai_summarized_at = NULL "
@@ -208,7 +211,8 @@ class AnomalyStore:
                 self._conn.execute(
                     """
                     UPDATE anomalies SET evidence=?, severity=?, updated_at=?,
-                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL
+                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL,
+                        ai_meta=NULL
                     WHERE id=?
                     """,
                     (evidence_json, severity, now, anomaly_id),
@@ -247,12 +251,15 @@ class AnomalyStore:
         summary: str,
         action: str,
         steps: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         steps_json = json.dumps(steps, separators=(",", ":")) if steps is not None else None
+        meta_json = json.dumps(meta, separators=(",", ":")) if meta else None
         with self._lock:
             self._conn.execute(
-                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_steps=?, ai_summarized_at=? WHERE id=?",
-                (summary, action, steps_json, _utc_now_iso(), anomaly_id),
+                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_steps=?, ai_summarized_at=?, ai_meta=? "
+                "WHERE id=?",
+                (summary, action, steps_json, _utc_now_iso(), meta_json, anomaly_id),
             )
             self._conn.commit()
 
@@ -267,7 +274,7 @@ class AnomalyStore:
     def query_anomalies(self, params: dict[str, Any], *, limit: int) -> dict[str, Any]:
         clauses: list[str] = []
         args: list[Any] = []
-        for field in ("status", "type", "namespace"):
+        for field in ("id", "status", "type", "namespace"):
             value = params.get(field)
             if value:
                 clauses.append(f"{field} = ?")
@@ -282,6 +289,10 @@ class AnomalyStore:
         items = [dict(row) for row in rows[:limit]]
         for item in items:
             item["evidence"] = json.loads(item["evidence"])
+            try:
+                item["ai_meta"] = json.loads(item["ai_meta"]) if item.get("ai_meta") else None
+            except ValueError:
+                item["ai_meta"] = None
             raw_steps = item.get("ai_steps")
             if raw_steps:
                 try:
@@ -302,6 +313,10 @@ class AnomalyStore:
                         step.pop(stale, None)
                     step.update(step_execution_fields(step.get("command") or "", step.get("risk")))
         return {"items": items, "has_more": has_more}
+
+    def get_anomaly(self, anomaly_id: int) -> dict[str, Any] | None:
+        items = self.query_anomalies({"id": anomaly_id}, limit=1)["items"]
+        return items[0] if items else None
 
     _VALID_STATUSES = frozenset({"new", "reviewed", "dismissed"})
 
@@ -738,6 +753,7 @@ class InsightsJob:
         store: AnomalyStore,
         summarizer: Callable[[dict[str, Any]], dict[str, str] | None] | None = None,
         records_lock: threading.RLock | None = None,
+        dispatcher: Callable[[list[dict[str, Any]]], int] | None = None,
     ):
         self.cfg = cfg
         self.store = store
@@ -756,6 +772,10 @@ class InsightsJob:
         self.last_ai_error: str | None = None
         self.last_ai_error_at: str | None = None
         self._summarizer = summarizer
+        # When set, pending anomalies are handed to this non-blocking queue
+        # (summary_worker.SummaryWorker.enqueue) instead of being summarized
+        # inline, so a slow provider never delays detection.
+        self._dispatcher = dispatcher
         # anomaly id -> consecutive failures; only ids still pending are kept.
         self._ai_failures: dict[int, int] = {}
 
@@ -807,7 +827,10 @@ class InsightsJob:
         now = now or datetime.now(timezone.utc)
         counts = self.detect_once(now)
         self.future_dated_records = self.detector.future_record_count(now)
-        counts["anomalies_summarized"] = self.summarize_pending()
+        if self._dispatcher is not None:
+            counts["anomalies_queued"] = self.dispatch_pending()
+        else:
+            counts["anomalies_summarized"] = self.summarize_pending()
         self.last_duration_ms = int((time.monotonic() - started) * 1000)
         self.last_run_at = _utc_now_iso()
         self.last_counts = counts
@@ -832,6 +855,15 @@ class InsightsJob:
             )
             counts[f"anomalies_{outcome}"] += 1
         return counts
+
+    def dispatch_pending(self) -> int:
+        """Hand pending anomalies to the summary queue; returns how many it took."""
+        limit = max(50, self.cfg.ai.max_anomalies_per_tick * 10)
+        try:
+            return int(self._dispatcher(self.store.pending_ai_anomalies(limit)) or 0)  # type: ignore[misc]
+        except Exception as exc:  # the queue must never fail detection
+            logger.warning("Could not queue anomalies for AI summaries (%s)", type(exc).__name__)
+            return 0
 
     def summarize_pending(self) -> int:
         summarizer = self._summarizer or (lambda anomaly: None)

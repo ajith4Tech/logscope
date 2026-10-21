@@ -50,7 +50,7 @@ Every setting is in [values.yaml](values.yaml).
 | **Logscope web app / API** | Deployment (1 replica, `Recreate`) | **Always** | UI and API on port 8000. Polls S3, caches in SQLite, detects anomalies, calls the AI provider. Non-root, read-only root FS, no Kubernetes API token. Cluster actions (kubectl) are disabled |
 | Service | ClusterIP, port 8000 | Always | `<release>-webapp` |
 | PersistentVolumeClaim | 2Gi ⚙, default StorageClass ⚙ | Always (⚙ `persistence`) | SQLite log cache and anomaly triage state. Kept on `helm uninstall` |
-| ConfigMap | web app `config.yaml` | Always | S3 location, classification, AI provider/model. **No credentials** |
+| ConfigMap | web app `config.yaml` | Always | S3 location, classification, AI provider/model defaults (the Settings tab can override them at runtime). **No credentials** |
 | Secret(s) | Opaque | Only for credentials given inline in values ⚙ | Otherwise the chart references existing Secrets |
 | NetworkPolicy | ingress-only | Default on ⚙ | Only Traefik (kube-system) may reach port 8000 |
 | Ingress + Traefik Middlewares | — | Only if `ingress.enabled` ⚙ (default off) | HTTPS-only, basic auth, HTTP→HTTPS redirect |
@@ -141,5 +141,10 @@ Vector and Falco keep running unchanged.
 - **Credentials in values.yaml** become Kubernetes Secrets but also live in
   Helm's release record. Prefer existing Secrets, and never commit a filled-in
   values file.
+- **AI settings from the UI** (Settings tab) are protected by an admin token
+  and stored in the state database; a key entered there is encrypted with a
+  master key (`/state/secret.key` or `settings.secretKey.existingSecret`).
+  Losing or replacing the master key makes a stored key unreadable (the app
+  warns and keeps running). Rotation: README → "Rotating the master key".
 - **Chart-managed Vector or Falco** replaces the existing releases; it doesn't
   run alongside them. See README → "Existing vs Helm-managed Falco/Vector".

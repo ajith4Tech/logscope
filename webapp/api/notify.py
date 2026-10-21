@@ -251,6 +251,18 @@ class MattermostNotifier:
         url = os.environ.get(self.cfg.webhook_url_env, "").strip() if self.cfg.webhook_url_env else ""
         return url if url.lower().startswith(("https://", "http://")) else ""
 
+    def send_text(self, text: str) -> bool:
+        """A one-off message (e.g. an AI budget notice) to the same webhook.
+        False when not configured or delivery failed; never raises."""
+        if not self.configured:
+            return False
+        try:
+            self._sender(self._webhook_url(), {"text": text})
+        except DeliveryError as exc:
+            logger.warning("Mattermost message failed (%s)", exc)
+            return False
+        return True
+
     @property
     def configured(self) -> bool:
         """Enabled and a usable webhook URL is present. Nothing is queued or

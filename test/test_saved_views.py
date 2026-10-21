@@ -330,7 +330,7 @@ def test_dbtool_state_backup_verify_restore(tmp_path, monkeypatch, capsys):
     assert _mode(backup) == 0o600
     assert dbtool.main(["verify", "--state", str(backup)]) == 0
     out = capsys.readouterr().out
-    assert "'saved_views': 1" in out and "'schema_version': 1" in out
+    assert "'saved_views': 1" in out and f"'schema_version': {MIGRATIONS[-1][0]}" in out
     # The two kinds of database are not interchangeable.
     assert dbtool.main(["verify", str(backup)]) == 1
     assert "not a Logscope database" in capsys.readouterr().err

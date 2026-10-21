@@ -64,6 +64,50 @@ ai:
   # across all users; cached answers don't count. Excess requests get HTTP 429.
   # In-memory, per web app pod. 0 disables the limit.
   rateLimitPerMinute: 10
+  # Model for anomaly summaries (deeper analysis). "" = model.
+  deepModel: ""
+  # Defaults for the Settings tab, which can override them at runtime
+  # (provider/model/baseUrl/key above are defaults too: a value set from the
+  # Settings tab wins over config.yaml, but never over an environment variable
+  # such as the key from apiKey/existingSecret). See DEPLOYMENT.md.
+  # USD per million tokens, for the usage panel's cost estimate. A model
+  # without a price is metered in tokens with an unknown cost.
+  prices: {}
+  #   claude-opus-5-5: {input: 5.0, output: 25.0, cached: 0.5}
+  # Feature flags: explain_line, explain_filtered, anomaly_auto_summary
+  # (default false), anomaly_manual_summary, nl_filters.
+  features: {}
+  # Daily budgets (UTC): {daily_tokens: N, daily_cost_usd: X, daily_calls: {feature: N}}.
+  # Over budget, calls are skipped; at 80% /api/status warns (and Mattermost, if enabled).
+  budgets: {}
+  # Extra hosts allowed for a base URL entered in the Settings tab (the
+  # official provider APIs and localhost are always allowed; https required).
+  allowedHosts: []
+  # AI answers are cached per log template for this long (0 = no cache).
+  cacheTtlHours: 168
+  # With the anomaly_auto_summary feature on, only anomalies at or above this
+  # urgency are summarized automatically: low | medium | high | urgent.
+  autoSummaryMinUrgency: urgent
+  # Extra known-pattern rules (format: webapp/api/signatures.yaml), tried
+  # after the built-in ones; answered without an AI call.
+  signatures: []
+
+# ---------------------------------------------------------------------------
+# Settings tab (AI settings from the UI). Both secrets are optional: without
+# an existingSecret the app generates each once on the state volume
+# (/state/admin.token and /state/secret.key, mode 0600; only the token's path
+# is logged). Key rotation is described in DEPLOYMENT.md.
+# ---------------------------------------------------------------------------
+settings:
+  adminToken:
+    existingSecret: ""          # Secret holding the bearer token for the Settings tab
+    existingSecretKey: LOGSCOPE_ADMIN_TOKEN
+  secretKey:
+    existingSecret: ""          # Secret holding the master key that encrypts a stored API key
+    existingSecretKey: LOGSCOPE_SECRET_KEY
+    # Optional key in the same Secret: previous master key(s), comma-separated,
+    # while rotating. The stored API key is re-encrypted with the new key at start.
+    previousKeysKey: LOGSCOPE_SECRET_KEY_PREVIOUS
 
 # ---------------------------------------------------------------------------
 # Optional Mattermost notifications for Insights anomalies (off by default).

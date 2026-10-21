@@ -39,7 +39,79 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         )
         """,
     )),
+    # AI settings managed from the UI (one row, id 1) and per-call usage.
+    # api_key_enc is a Fernet token (see ai_settings); the plain key is never
+    # stored. prices is NULL until a price table is saved from the UI.
+    (2, (
+        """
+        CREATE TABLE ai_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            provider TEXT,
+            model TEXT,
+            deep_model TEXT,
+            base_url TEXT,
+            api_key_enc TEXT,
+            key_last4 TEXT,
+            updated_at TEXT NOT NULL,
+            feature_flags TEXT NOT NULL DEFAULT '{}',
+            budgets TEXT NOT NULL DEFAULT '{}',
+            prices TEXT
+        )
+        """,
+        """
+        CREATE TABLE ai_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            feature TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            tokens_in INTEGER NOT NULL DEFAULT 0,
+            tokens_out INTEGER NOT NULL DEFAULT 0,
+            cached_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd_est REAL,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            outcome TEXT NOT NULL
+                CHECK (outcome IN ('ok', 'error', 'cache_hit', 'budget_blocked', 'signature'))
+        )
+        """,
+        "CREATE INDEX idx_ai_usage_ts ON ai_usage(ts)",
+    )),
+    # AI answers cached by log template (see ai_cache); helpful_* is feedback.
+    (3, (
+        """
+        CREATE TABLE ai_cache (
+            key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            template_id TEXT NOT NULL DEFAULT '',
+            model_tier TEXT NOT NULL,
+            response TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            hits INTEGER NOT NULL DEFAULT 0,
+            last_hit_at TEXT,
+            helpful_up INTEGER NOT NULL DEFAULT 0,
+            helpful_down INTEGER NOT NULL DEFAULT 0
+        )
+        """,
+        "CREATE INDEX idx_ai_cache_created ON ai_cache(created_at)",
+    )),
+    # One 👍/👎 per (cache entry, browser session); ai_usage rows can name what
+    # they were about (e.g. "anomaly:42") so budget blocks are written once a day.
+    (4, (
+        """
+        CREATE TABLE ai_cache_votes (
+            key TEXT NOT NULL,
+            client_id TEXT NOT NULL,
+            vote INTEGER NOT NULL CHECK (vote IN (-1, 1)),
+            voted_at TEXT NOT NULL,
+            PRIMARY KEY (key, client_id)
+        )
+        """,
+        "ALTER TABLE ai_usage ADD COLUMN subject TEXT",
+        "CREATE INDEX idx_ai_usage_subject ON ai_usage(outcome, subject, ts)",
+    )),
 )
+# What identifies a state database (also one written before a later
+# migration, e.g. a restored backup): tables added later are not required.
 REQUIRED_TABLES = ("schema_version", "saved_views")
 
 # Saved view limits.

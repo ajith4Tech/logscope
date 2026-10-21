@@ -63,6 +63,9 @@ const state = {
   expandedGroups: new Set(),
   groupByRule: false,
   aiConfigured: false,
+  // Feature flags from /api/status (ai_features); a feature turned off in
+  // Settings hides its buttons.
+  aiFeatures: {},
   // Server capability from /api/status; the server enforces it (403) regardless.
   actionsEnabled: false,
   explainCooldownUntil: 0,
@@ -138,13 +141,14 @@ function dashboardContextText() {
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
-const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'pipeline'];
+const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'pipeline', 'settings'];
 const TAB_IDS = {
   dashboard: ['tabDashboard', 'panelDashboard'],
   logs: ['tabLogs', 'panelLogs'],
   insights: ['tabInsights', 'panelInsights'],
   actionable: ['tabActionable', 'panelActionable'],
   pipeline: ['tabPipeline', 'panelPipeline'],
+  settings: ['tabSettings', 'panelSettings'],
 };
 
 // history: 'push' for a user navigation, 'replace' to update the current
@@ -174,6 +178,7 @@ function switchTab(name, { history = 'push' } = {}) {
     updateActionableSourceOptions();
     renderActionableWorkspace();
   }
+  if (name === 'settings') openSettings();
   if (name === 'pipeline') {
     startPipelinePolling();
   } else {
@@ -656,7 +661,7 @@ function rowMarkup(item) {
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
   messageButton.title = 'Click row to expand full details';
-  if (state.aiConfigured) {
+  if (aiFeatureOn('explain_line')) {
     const explainBlock = lineExplainMarkup(String(item.id), item);
     node.appendChild(explainBlock);
   }
@@ -675,6 +680,121 @@ function addDetailBlock(wrap, label, text) {
   block.appendChild(labelNode);
   block.appendChild(pre);
   wrap.appendChild(block);
+}
+
+// ─── Explanation source, age, feedback ──────────────────────────────────────
+
+function formatAge(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function ageFrom(meta) {
+  if (Number.isFinite(Number(meta.age_secs)) && meta.source === 'cache') return Number(meta.age_secs);
+  const t = Date.parse(meta.generated_at || '');
+  return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / 1000) : null;
+}
+
+function sourceLabel(meta) {
+  if (meta.source === 'signature') return 'Signature';
+  if (meta.source === 'cache') return meta.tier === 'deep' ? 'Cache · deep' : 'Cache';
+  if (meta.source === 'ai') return meta.tier === 'deep' ? 'AI deep' : 'AI fast';
+  return '';
+}
+
+// Badge (signature | cache | AI fast | AI deep) with its age, plus the
+// follow-up actions: Ask AI anyway / Regenerate / Deep analysis / 👍 👎.
+// rerun(options) repeats the request with {tier, regenerate, skip_signature}.
+function explainMetaNode(meta, rerun) {
+  const bar = document.createElement('div');
+  bar.className = 'explain-meta';
+  const label = sourceLabel(meta || {});
+  if (!label) return bar;
+  const badge = document.createElement('span');
+  badge.className = `source-badge source-${meta.source}${meta.tier === 'deep' ? ' source-deep' : ''}`;
+  const age = ageFrom(meta);
+  badge.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
+  if (meta.signature && meta.signature.title) badge.title = `Known pattern: ${meta.signature.title} (no AI call)`;
+  else if (meta.source === 'cache') badge.title = 'Answer reused for the same log pattern (no AI call)';
+  bar.appendChild(badge);
+  const button = (text, title, onClick) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ghost explain-meta-btn';
+    b.textContent = text;
+    b.title = title;
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(b); });
+    bar.appendChild(b);
+    return b;
+  };
+  if (meta.source === 'signature') {
+    button('Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
+      () => rerun({ skip_signature: true }));
+  } else {
+    button('Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
+  }
+  if (meta.tier !== 'deep') {
+    button('Deep analysis', 'Ask the deep model (separate cache and daily budget)',
+      () => rerun({ tier: 'deep', skip_signature: true }));
+  }
+  if (meta.cache_key && meta.source !== 'signature') {
+    const note = document.createElement('span');
+    note.className = 'subtle explain-feedback-note';
+    // One vote per answer and browser session; voting again changes it.
+    const vote = async (value, btns) => {
+      btns.forEach((b, i) => b.setAttribute('aria-pressed', String((i === 0) === (value === 'up'))));
+      try {
+        await fetchJson('/api/ai/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Logscope-Client': feedbackClientId() },
+          body: JSON.stringify({ key: meta.cache_key, vote: value }),
+        });
+        note.textContent = value === 'down' ? 'Thanks — answers with 2 or more net 👎 are replaced.' : 'Thanks.';
+      } catch (err) {
+        note.textContent = `Feedback not saved: ${err.message}`;
+      }
+    };
+    const up = button('👍', 'Helpful', () => vote('up', [up, down]));
+    const down = button('👎', 'Not helpful: drop this cached answer', () => vote('down', [up, down]));
+    up.setAttribute('aria-label', 'Helpful');
+    down.setAttribute('aria-label', 'Not helpful');
+    bar.appendChild(note);
+  }
+  return bar;
+}
+
+// Random id for this browser session (sessionStorage): the server keeps one
+// 👍/👎 per cached answer and client id.
+function feedbackClientId() {
+  const key = 'logscope.feedback.clientId';
+  try {
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      id = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      window.sessionStorage.setItem(key, id);
+    }
+    return id;
+  } catch (_) {
+    if (!state.feedbackClientId) {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      state.feedbackClientId = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    return state.feedbackClientId;
+  }
+}
+
+function explainOptionsQuery(options = {}) {
+  const out = {};
+  if (options.tier === 'deep') out.tier = 'deep';
+  if (options.regenerate) out.regenerate = '1';
+  if (options.skip_signature) out.skip_signature = '1';
+  return out;
 }
 
 // ─── Per-line "Explain this log" ─────────────────────────────────────────────
@@ -700,6 +820,7 @@ function lineExplainMarkup(rowId, item) {
   if (lineState.status === 'done') {
     const result = document.createElement('div');
     result.className = 'line-explain-result';
+    result.appendChild(explainMetaNode(lineState.rawResult || {}, (options) => explainLine(rowId, item, options)));
     const summary = document.createElement('div');
     summary.className = 'line-explain-summary';
     summary.textContent = lineState.summary;
@@ -734,15 +855,15 @@ function lineExplainMarkup(rowId, item) {
   return box;
 }
 
-async function explainLine(rowId, item) {
-  if (!state.aiConfigured) return;
+async function explainLine(rowId, item, options = {}) {
+  if (!aiFeatureOn('explain_line')) return;
   state.lineExplainState.set(rowId, { status: 'loading' });
   renderAll();
   try {
     const result = await fetchJson('/api/explain-line', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: item.id }),
+      body: JSON.stringify({ id: item.id, ...explainOptionsQuery(options) }),
     });
     if (result.error) {
       state.lineExplainState.set(rowId, { status: 'error', error: result.error });
@@ -1120,14 +1241,31 @@ function renderAnomalies() {
 
     const summaryEl = node.querySelector('.anomaly-summary-text');
     const actionEl = node.querySelector('.anomaly-action-text');
+    // Free template summary until (or instead of) an AI summary.
+    const templateSummary = anomaly.template_summary || {};
+    const sourceEl = node.querySelector('.anomaly-source');
+    const meta = anomaly.ai_meta || null;
     if (anomaly.ai_summary) {
       summaryEl.textContent = anomaly.ai_summary;
+      const label = meta ? sourceLabel(meta) : 'AI';
+      if (label) {
+        const age = meta ? ageFrom(meta) : null;
+        sourceEl.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
+        sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
+        sourceEl.hidden = false;
+      }
     } else {
-      summaryEl.textContent = 'Awaiting AI summary…';
+      summaryEl.textContent = templateSummary.headline || 'No summary yet.';
       summaryEl.classList.add('muted');
+      sourceEl.textContent = 'Template';
+      sourceEl.className = 'anomaly-source source-badge source-template';
+      sourceEl.title = 'Computed from the detection counts and log templates (no AI call)';
+      sourceEl.hidden = false;
     }
     if (anomaly.ai_suggested_action) {
       actionEl.textContent = `→ ${anomaly.ai_suggested_action}`;
+    } else if (!anomaly.ai_summary && templateSummary.signature) {
+      actionEl.textContent = `Known pattern: ${templateSummary.signature.title}`;
     } else {
       actionEl.hidden = true;
     }
@@ -1142,6 +1280,24 @@ function renderAnomalies() {
       ? formatTimestamp(anomaly.detected_at)
       : '—';
 
+    const btnSummarize = node.querySelector('.anomaly-btn-summarize');
+    const btnDeep = node.querySelector('.anomaly-btn-deep');
+    if (aiFeatureOn('anomaly_manual_summary')) {
+      const fromSignature = meta && meta.source === 'signature';
+      btnSummarize.hidden = false;
+      btnDeep.hidden = false;
+      if (fromSignature) btnSummarize.textContent = '✦ Ask AI anyway';
+      else if (anomaly.ai_summary) btnSummarize.textContent = '✦ Regenerate';
+      btnSummarize.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        summarizeAnomaly(anomaly, btnSummarize, fromSignature ? { skip_signature: true }
+          : anomaly.ai_summary ? { regenerate: true, skip_signature: true } : {});
+      });
+      btnDeep.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        summarizeAnomaly(anomaly, btnDeep, { tier: 'deep', skip_signature: true });
+      });
+    }
     const btnTroubleshoot = node.querySelector('.anomaly-btn-troubleshoot');
     const btnReviewed = node.querySelector('.anomaly-btn-reviewed');
     const btnDismissed = node.querySelector('.anomaly-btn-dismissed');
@@ -1201,6 +1357,18 @@ function renderAnomalies() {
 function fillAnomalyDetail(container, anomaly) {
   container.innerHTML = '';
   const evidence = anomaly.evidence || {};
+  const ts = anomaly.template_summary;
+  if (ts) {
+    const lines = [ts.headline];
+    const c = ts.counts || {};
+    if (c.current !== undefined && c.current !== null) {
+      lines.push(`Count ${c.current}${c.expected !== null && c.expected !== undefined ? ` · expected ${c.expected}` : ''}`
+        + `${c.ratio ? ` · ${c.ratio}× baseline` : ''}${c.baseline_avg_per_hour !== null && c.baseline_avg_per_hour !== undefined ? ` · baseline ${c.baseline_avg_per_hour}/h` : ''}`);
+    }
+    for (const t of ts.templates || []) lines.push(`${t.count}× ${t.template}`);
+    if (ts.signature) lines.push('', `Known pattern: ${ts.signature.title}`, ts.signature.explanation);
+    addDetailBlock(container, 'Template summary (no AI)', lines.join('\n'));
+  }
 
   const msgs = evidence.sample_messages;
   if (msgs && msgs.length) {
@@ -1369,9 +1537,10 @@ async function focusAnomaly(id, { openInActionable = false } = {}) {
 
 function updateExplainButton() {
   const btn = el('explainBtn');
+  btn.hidden = state.aiFeatures.explain_filtered === false;
   if (!state.aiConfigured) {
     btn.disabled = true;
-    btn.title = 'AI provider not configured — set ai.provider in config.yaml';
+    btn.title = 'AI provider not configured — set it in the Settings tab or config.yaml';
     return;
   }
   const coolingDown = Date.now() < state.explainCooldownUntil;
@@ -1392,10 +1561,11 @@ function startExplainCooldown() {
   }, EXPLAIN_COOLDOWN_MS + 50);
 }
 
-async function runExplain() {
-  if (!state.aiConfigured) return;
+async function runExplain(options = {}) {
+  if (!aiFeatureOn('explain_filtered')) return;
   if (Date.now() < state.explainCooldownUntil) return;
   startExplainCooldown();
+  el('explainMeta').replaceChildren();
 
   const panel = el('explainPanel');
   const summaryEl = el('explainSummary');
@@ -1409,7 +1579,7 @@ async function runExplain() {
   cachedBadge.hidden = true;
 
   try {
-    const params = new URLSearchParams(queryFromFilters());
+    const params = new URLSearchParams({ ...queryFromFilters(), ...explainOptionsQuery(options) });
     const result = await fetchJson(`/api/explain?${params.toString()}`, { method: 'POST' });
     summaryEl.classList.remove('thinking');
     if (result.error) {
@@ -1422,9 +1592,10 @@ async function runExplain() {
         actionEl.textContent = `→ ${result.suggested_action}`;
         actionEl.hidden = false;
       }
-      if (result.cached) {
-        cachedBadge.hidden = false;
-      }
+      el('explainMeta').replaceChildren(explainMetaNode(result, (opts) => {
+        state.explainCooldownUntil = 0;
+        runExplain(opts).catch(() => {});
+      }));
       setPlanFromExplainResult(result, 'logs');
     }
   } catch (err) {
@@ -1444,6 +1615,7 @@ el('explainDismiss').addEventListener('click', () => {
   el('explainSummary').classList.remove('explain-error', 'thinking');
   el('explainAction').hidden = true;
   el('explainCachedBadge').hidden = true;
+  el('explainMeta').replaceChildren();
 });
 
 // ─── Actionable Troubleshooting Workspace ────────────────────────────────────
@@ -2927,6 +3099,10 @@ function renderInsightsCard(status) {
     }
   }
   if (ins.last_error) kvBlock(card, `Last detection error${ins.last_error_at ? ` (${describeAge(ins.last_error_at)})` : ''}`, ins.last_error, 'error');
+  for (const warning of status.ai_warnings || []) {
+    kvBlock(card, 'AI', warning, 'warn');
+    tone = worstTone(tone, 'warn');
+  }
   if (ins.last_ai_error) {
     kvBlock(card, `Last AI summary error${ins.last_ai_error_at ? ` (${describeAge(ins.last_ai_error_at)})` : ''}`, ins.last_ai_error, 'warn');
     tone = worstTone(tone, 'warn');
@@ -3080,6 +3256,7 @@ async function refreshStatus() {
     const status = await fetchJson('/api/status');
     if (requestId !== state.pipeline.requestId) return status;
     state.lastStatus = status;
+    applyAiStatus(status);
     state.pipeline.fetchedAt = Date.now();
     state.pipeline.error = '';
     updateHealthFromStatus(status);
@@ -3754,6 +3931,509 @@ el('pinnedViewsCards').addEventListener('click', (event) => {
   }
 });
 
+// ─── AI features and the Settings tab ────────────────────────────────────────
+
+// A feature's buttons show only when AI is configured and the feature is on.
+function aiFeatureOn(name) {
+  return state.aiConfigured && state.aiFeatures[name] !== false;
+}
+
+function applyAiStatus(status) {
+  const features = status.ai_features && typeof status.ai_features === 'object' ? status.ai_features : {};
+  const configured = Boolean(status.ai_configured);
+  const changed = configured !== state.aiConfigured
+    || JSON.stringify(features) !== JSON.stringify(state.aiFeatures);
+  state.aiConfigured = configured;
+  state.aiFeatures = { ...features };
+  const warnings = Array.isArray(status.ai_warnings) ? status.ai_warnings : [];
+  const badge = el('settingsBadge');
+  badge.hidden = warnings.length === 0;
+  badge.textContent = warnings.length ? '!' : '';
+  badge.title = warnings.join('\n');
+  if (!changed) return;
+  updateExplainButton();
+  if (state.items && state.items.length) renderAll();
+  if (state.insightsLoaded) renderAnomalies();
+}
+
+async function summarizeAnomaly(anomaly, btn, options = {}) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = options.tier === 'deep' ? 'Analyzing…' : '✦ Summarizing…';
+  try {
+    const result = await postJson(`/api/anomalies/${encodeURIComponent(anomaly.id)}/summarize`,
+      explainOptionsQuery(options));
+    if (result.degraded) throw new Error(result.error || 'The daily AI budget is used up');
+    await fetchInsights();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = original;
+    btn.title = `Failed: ${err.message}`;
+    showInsightsError(`AI summary failed: ${err.message}`);
+  }
+}
+
+const SETTINGS_TOKEN_KEY = 'logscope.settings.adminToken';
+const FEATURE_LABELS = {
+  explain_line: ['Explain this line', 'Per-line AI explanation in the Logs tab'],
+  explain_filtered: ['Explain these logs', 'AI summary of the currently filtered logs'],
+  anomaly_auto_summary: ['Automatic anomaly summaries', 'Every detected anomaly is summarized in the background (uses the deep model)'],
+  anomaly_manual_summary: ['Summarize anomaly on request', 'The ✦ Summarize button on Insights rows (uses the deep model)'],
+  nl_filters: ['Natural-language filters', 'Reserved for natural-language search; no button uses it yet'],
+  deep_analysis: ['Deep analysis', 'Every "Deep analysis" run (deep model), whatever it explains'],
+  settings_test: ['Connection tests', 'Settings → Test connection'],
+};
+const SOURCE_LABELS = { env: 'environment', ui: 'Settings', config: 'config.yaml', none: 'not set' };
+const settingsState = { data: null, usage: null, loading: false, test: null, prices: null };
+
+function settingsToken() {
+  try { return window.sessionStorage.getItem(SETTINGS_TOKEN_KEY) || ''; } catch (_) { return ''; }
+}
+
+function setSettingsToken(value) {
+  try {
+    if (value) window.sessionStorage.setItem(SETTINGS_TOKEN_KEY, value);
+    else window.sessionStorage.removeItem(SETTINGS_TOKEN_KEY);
+  } catch (_) {}
+}
+
+class SettingsAuthError extends Error {}
+
+// fetch with the admin token; a 401 locks the tab again.
+async function settingsRequest(url, { method = 'GET', body } = {}) {
+  const headers = { Authorization: `Bearer ${settingsToken()}` };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (err) {
+    throw new Error(`Network error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) throw new SettingsAuthError(data.error || 'The admin token was not accepted');
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`);
+    err.field = data.field;
+    throw err;
+  }
+  return data;
+}
+
+function lockSettings(message = '') {
+  setSettingsToken('');
+  settingsState.data = null;
+  settingsState.usage = null;
+  settingsState.test = null;
+  settingsState.prices = null;
+  el('settingsBody').hidden = true;
+  el('settingsUnlock').hidden = false;
+  el('settingsLock').hidden = true;
+  el('settingsRefresh').hidden = true;
+  el('settingsSubtitle').textContent = 'Unlock with the admin token to view or change AI settings.';
+  const errorEl = el('settingsUnlockError');
+  errorEl.hidden = !message;
+  errorEl.textContent = message;
+  el('settingsContent').innerHTML = '';
+}
+
+function openSettings() {
+  if (!settingsToken()) {
+    lockSettings();
+    return;
+  }
+  if (!settingsState.data && !settingsState.loading) loadSettings().catch(() => {});
+}
+
+function settingsMessage(text, tone = 'ok') {
+  const node = el('settingsMessage');
+  node.hidden = !text;
+  node.className = `settings-message tone-${tone}`;
+  node.textContent = text;
+}
+
+async function loadSettings() {
+  settingsState.loading = true;
+  el('settingsSubtitle').textContent = 'Loading…';
+  try {
+    const [data, usage] = await Promise.all([
+      settingsRequest('/api/settings/ai'),
+      settingsRequest('/api/settings/ai/usage?days=7'),
+    ]);
+    settingsState.data = data;
+    settingsState.usage = usage;
+    settingsState.prices = null;
+    el('settingsUnlock').hidden = true;
+    el('settingsBody').hidden = false;
+    el('settingsLock').hidden = false;
+    el('settingsRefresh').hidden = false;
+    el('settingsSubtitle').textContent = 'Changes apply immediately, without a restart. Values set by environment variables are read-only here.';
+    renderSettings();
+  } catch (err) {
+    if (err instanceof SettingsAuthError) lockSettings(err.message);
+    else el('settingsSubtitle').textContent = `Could not load settings: ${err.message}`;
+  } finally {
+    settingsState.loading = false;
+  }
+}
+
+async function saveSettings(body, okText) {
+  settingsMessage('Saving…', 'info');
+  try {
+    settingsState.data = await settingsRequest('/api/settings/ai', { method: 'PUT', body });
+    settingsState.usage = await settingsRequest('/api/settings/ai/usage?days=7').catch(() => settingsState.usage);
+    settingsState.prices = null;
+    settingsMessage(okText, 'ok');
+    renderSettings();
+    refreshStatus().catch(() => {});
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      lockSettings(err.message);
+      return;
+    }
+    settingsMessage(`Not saved: ${err.message}`, 'error');
+  }
+}
+
+function sourceBadge(source) {
+  const label = SOURCE_LABELS[source] || source || '';
+  return `<span class="settings-source source-${escapeHtml(source || 'none')}" title="Value comes from ${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+}
+
+function settingsField(id, label, value, source, { placeholder = '', type = 'text' } = {}) {
+  const locked = source === 'env';
+  return `
+    <label class="settings-field">
+      <span class="settings-label">${escapeHtml(label)} ${sourceBadge(source)}</span>
+      <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" value="${escapeHtml(value || '')}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" spellcheck="false" ${locked ? 'disabled title="Set by an environment variable"' : ''} />
+    </label>`;
+}
+
+function numberOrNull(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const value = Number(text);
+  if (!Number.isFinite(value)) throw new Error(`'${text}' is not a number`);
+  return value;
+}
+
+function formatUsd(value) {
+  const number = Number(value || 0);
+  return `$${number < 1 ? number.toFixed(4) : number.toFixed(2)}`;
+}
+
+function settingsBarRow(label, value, max, text, alt = false) {
+  const width = max > 0 ? Math.max(value > 0 ? 4 : 0, Math.round((value / max) * 100)) : 0;
+  return `
+    <div class="dashboard-bar-row settings-bar-row">
+      <span class="dashboard-bar-label">${escapeHtml(label)}</span>
+      <span class="dashboard-bar-track"><span class="dashboard-bar-fill${alt ? ' dashboard-bar-fill-alt' : ''}" style="width:${Math.min(100, width)}%"></span></span>
+      <span class="dashboard-bar-count">${escapeHtml(text)}</span>
+    </div>`;
+}
+
+function providerCardMarkup(data) {
+  const src = data.sources || {};
+  const providerLocked = src.provider === 'env';
+  const options = ['<option value="">(config.yaml default)</option>']
+    .concat((data.providers || []).map((p) => `<option value="${escapeHtml(p)}" ${p === data.provider ? 'selected' : ''}>${escapeHtml(p)}</option>`));
+  const keyLocked = data.key_source === 'env';
+  const keyState = data.key_set
+    ? `Set (${escapeHtml(SOURCE_LABELS[data.key_source] || data.key_source)}) · ends in ${escapeHtml(data.key_last4 || '????')}`
+    : 'Not set';
+  const keyNote = keyLocked
+    ? `Set by $${escapeHtml(data.key_env)}; change it there (it takes precedence over a stored key).`
+    : data.key_storage_available
+      ? 'Write-only: the stored key is never shown. Leave empty to keep it.'
+      : 'Key storage is unavailable on this server; set the key by environment variable.';
+  const test = settingsState.test;
+  const testText = !test ? ''
+    : test.pending ? 'Testing…'
+      : test.ok ? `OK · ${escapeHtml(formatCount(test.latency_ms))} ms · ${test.model}`
+        : `Failed${test.model ? ` (${test.model})` : ''}: ${test.error || 'unknown error'}`;
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Provider</h3></div>
+      <label class="settings-field">
+        <span class="settings-label">Provider ${sourceBadge(src.provider)}</span>
+        <select id="setProvider" ${providerLocked ? 'disabled title="Set by an environment variable"' : ''}>${options.join('')}</select>
+      </label>
+      ${settingsField('setModel', 'Model', data.model, src.model, { placeholder: 'model id' })}
+      ${settingsField('setDeepModel', 'Deep model (anomaly summaries)', data.deep_model, src.deep_model, { placeholder: 'empty = same as model' })}
+      ${settingsField('setBaseUrl', 'Base URL', data.base_url, src.base_url, { placeholder: 'empty = provider default' })}
+      <div class="subtle settings-hint">Allowed hosts: ${escapeHtml((data.allowed_hosts || []).join(', '))}. https is required except for localhost.</div>
+      <label class="settings-field">
+        <span class="settings-label">API key ${sourceBadge(data.key_source)}</span>
+        <input id="setApiKey" type="password" value="" placeholder="${escapeHtml(keyState)}" autocomplete="new-password" spellcheck="false" ${keyLocked || !data.key_storage_available ? 'disabled' : ''} />
+      </label>
+      <div class="subtle settings-hint">${keyNote}</div>
+      ${data.key_source === 'ui' ? '<label class="toggle settings-clear"><input id="setClearKey" type="checkbox" /> Remove the stored key</label>' : ''}
+      <div class="settings-actions">
+        <button id="saveProvider" type="button">Save</button>
+        <button id="testProvider" type="button" class="ghost" title="One minimal request with the saved settings (no log content)">Test connection</button>
+      </div>
+      <div id="settingsTestResult" class="settings-test ${test && !test.pending ? (test.ok ? 'tone-ok' : 'tone-error') : ''}" ${testText ? '' : 'hidden'}>${escapeHtml(testText)}</div>
+    </section>`;
+}
+
+function featuresCardMarkup(data) {
+  const rows = (data.features || []).map((name) => {
+    const [label, help] = FEATURE_LABELS[name] || [name, ''];
+    return `
+      <label class="settings-toggle">
+        <input type="checkbox" data-feature="${escapeHtml(name)}" ${data.flags && data.flags[name] ? 'checked' : ''} />
+        <span><strong>${escapeHtml(label)}</strong><span class="subtle">${escapeHtml(help)}</span></span>
+      </label>`;
+  });
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Features</h3></div>
+      <div class="settings-toggles">${rows.join('')}</div>
+      <div class="subtle settings-hint">A feature that is off answers 403 and its buttons are hidden.</div>
+      <div class="settings-actions"><button id="saveFeatures" type="button">Save features</button></div>
+    </section>`;
+}
+
+function budgetsCardMarkup(data) {
+  const budgets = data.budgets || {};
+  const calls = budgets.daily_calls || {};
+  const valueOf = (v) => (v === null || v === undefined ? '' : String(v));
+  const callInputs = (data.budget_features || data.features || []).filter((f) => f !== 'nl_filters').map((name) => `
+      <label class="settings-field settings-field-compact">
+        <span class="settings-label">${escapeHtml((FEATURE_LABELS[name] || [name])[0])}</span>
+        <input type="number" min="0" step="1" data-budget-calls="${escapeHtml(name)}" value="${escapeHtml(valueOf(calls[name]))}" placeholder="no limit" />
+      </label>`);
+  const status = (data.budget_status || []).map((item) => settingsBarRow(
+    item.budget, Math.min(item.ratio, 1), 1,
+    `${item.budget === 'daily_cost_usd' ? formatUsd(item.used) : formatCount(item.used)} / ${item.budget === 'daily_cost_usd' ? formatUsd(item.limit) : formatCount(item.limit)}`,
+    item.ratio >= 0.8,
+  ));
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Daily budgets <span class="subtle">· UTC days</span></h3></div>
+      <div class="settings-row">
+        <label class="settings-field settings-field-compact">
+          <span class="settings-label">Tokens per day</span>
+          <input id="setDailyTokens" type="number" min="0" step="1" value="${escapeHtml(valueOf(budgets.daily_tokens))}" placeholder="no limit" />
+        </label>
+        <label class="settings-field settings-field-compact">
+          <span class="settings-label">Cost per day (USD)</span>
+          <input id="setDailyCost" type="number" min="0" step="0.01" value="${escapeHtml(valueOf(budgets.daily_cost_usd))}" placeholder="no limit" />
+        </label>
+      </div>
+      <div class="settings-label settings-sub">Calls per day, by feature</div>
+      <div class="settings-row settings-row-wrap">${callInputs.join('')}</div>
+      <div class="subtle settings-hint">Empty = no limit. Over budget, calls are skipped (the answer says so) until 00:00 UTC; at 80% a warning shows in the Pipeline tab and, when notifications are on, in Mattermost.</div>
+      ${status.length ? `<div class="dashboard-bars settings-bars">${status.join('')}</div>` : ''}
+      <div class="settings-actions"><button id="saveBudgets" type="button">Save budgets</button></div>
+    </section>`;
+}
+
+function pricesCardMarkup(data) {
+  if (!settingsState.prices) {
+    settingsState.prices = Object.entries(data.prices || {}).map(([model, p]) => ({
+      model, input: p.input ?? '', output: p.output ?? '', cached: p.cached ?? '',
+    }));
+  }
+  const rows = settingsState.prices.map((row, index) => `
+      <tr>
+        <td><input type="text" data-price="${index}" data-col="model" value="${escapeHtml(row.model)}" placeholder="model id" spellcheck="false" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="input" value="${escapeHtml(String(row.input))}" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="output" value="${escapeHtml(String(row.output))}" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="cached" value="${escapeHtml(String(row.cached))}" placeholder="= input" /></td>
+        <td><button type="button" class="ghost" data-price-remove="${index}" aria-label="Remove ${escapeHtml(row.model || 'row')}">✕</button></td>
+      </tr>`);
+  return `
+    <section class="settings-card settings-card-wide">
+      <div class="pipeline-card-head"><h3>Prices <span class="subtle">· USD per million tokens</span></h3>${sourceBadge(data.prices_source)}</div>
+      <div class="settings-table-wrap"><table class="pipeline-table settings-prices">
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cached input</th><th></th></tr></thead>
+        <tbody>${rows.join('') || '<tr><td colspan="5" class="subtle">No prices: tokens are counted, cost is unknown.</td></tr>'}</tbody>
+      </table></div>
+      <div class="settings-actions">
+        <button id="addPrice" type="button" class="ghost">Add model</button>
+        <button id="savePrices" type="button">Save prices</button>
+        ${data.prices_source === 'ui' ? '<button id="resetPrices" type="button" class="ghost" title="Use webapp.ai.prices from config.yaml again">Use config.yaml prices</button>' : ''}
+      </div>
+    </section>`;
+}
+
+function usageCardMarkup(usage) {
+  if (!usage) return '';
+  const featureRows = (scope) => {
+    const entries = Object.entries(scope.by_feature || {});
+    if (!entries.length) return '<tr><td colspan="7" class="subtle">No AI requests.</td></tr>';
+    return entries.map(([name, u]) => `
+        <tr>
+          <td>${escapeHtml((FEATURE_LABELS[name] || [name])[0])}</td>
+          <td>${escapeHtml(formatCount(u.calls))}${u.errors ? ` <span class="subtle">(${escapeHtml(formatCount(u.errors))} failed)</span>` : ''}</td>
+          <td>${escapeHtml(formatCount(u.tokens))}</td>
+          <td>${escapeHtml(formatUsd(u.cost_usd))}${u.unpriced_calls ? ' <span class="subtle" title="Calls to models without a price">+?</span>' : ''}</td>
+          <td>${escapeHtml(String(u.cache_hit_pct))}%</td>
+          <td>${escapeHtml(String(u.signature_hit_pct ?? 0))}%</td>
+          <td>${escapeHtml(formatCount(u.blocked))}</td>
+        </tr>`).join('');
+  };
+  const table = (title, scope) => `
+      <h4 class="settings-sub">${escapeHtml(title)}</h4>
+      <div class="settings-table-wrap"><table class="pipeline-table settings-usage">
+        <thead><tr><th>Feature</th><th>AI calls</th><th>Tokens</th><th>Cost</th><th>Cache hits</th><th>Signature hits</th><th>Blocked</th></tr></thead>
+        <tbody>${featureRows(scope)}</tbody>
+      </table></div>`;
+  const days = usage.by_day || [];
+  const served = (d) => d.calls + d.cache_hits + (d.signature_hits || 0);
+  const maxCalls = Math.max(0, ...days.map(served));
+  // settingsBarRow escapes the label and text.
+  const dayBars = days.map((d) => settingsBarRow(
+    d.day, served(d), maxCalls,
+    `${formatCount(d.calls)} AI · ${formatCount(served(d) - d.calls)} free · ${formatCount(d.tokens)} tok · ${formatUsd(d.cost_usd)}`,
+  ));
+  const features = Object.entries((usage.period || {}).by_feature || {});
+  const maxTokens = Math.max(0, ...features.map(([, u]) => u.tokens));
+  const featureBars = features.map(([name, u]) => settingsBarRow(
+    (FEATURE_LABELS[name] || [name])[0], u.tokens, maxTokens, `${escapeHtml(formatCount(u.tokens))} tok`, true,
+  ));
+  return `
+    <section class="settings-card settings-card-wide">
+      <div class="pipeline-card-head"><h3>Usage</h3><span class="subtle">UTC days · cached answers and blocked calls are free</span></div>
+      ${table(`Today (${usage.today ? usage.today.date : ''})`, usage.today || {})}
+      ${table(`Last ${usage.days} days (from ${usage.period ? usage.period.from : ''})`, usage.period || {})}
+      ${(() => {
+        const t = (usage.period || {}).total || {};
+        const labels = ['cache hits', 'signature hits', 'answered without an AI call'];
+        return `<div class="settings-rates">${['cache_hit_pct', 'signature_hit_pct', 'free_pct'].map((k, i) => `
+          <div class="settings-rate"><span class="settings-rate-value">${escapeHtml(String(t[k] ?? 0))}%</span>
+          <span class="subtle">${escapeHtml(labels[i])}, last ${escapeHtml(String(usage.days))} days</span></div>`).join('')}</div>`;
+      })()}
+      <h4 class="settings-sub">Requests per day</h4>
+      <div class="dashboard-bars settings-bars">${dayBars.join('')}</div>
+      ${featureBars.length ? `<h4 class="settings-sub">Tokens by feature, last ${usage.days} days</h4><div class="dashboard-bars settings-bars">${featureBars.join('')}</div>` : ''}
+    </section>`;
+}
+
+function renderSettings() {
+  const data = settingsState.data;
+  if (!data) return;
+  const warnings = (data.warnings || []).concat((data.budget_status || [])
+    .filter((b) => b.ratio >= 0.8)
+    .map((b) => `Budget ${b.budget} is at ${Math.round(b.ratio * 100)}% today${b.used >= b.limit ? ' — calls are being skipped' : ''}.`));
+  const warnEl = el('settingsWarnings');
+  warnEl.hidden = !warnings.length;
+  warnEl.innerHTML = warnings.map((w) => `<div>${escapeHtml(w)}</div>`).join('');
+  el('settingsContent').innerHTML = providerCardMarkup(data) + featuresCardMarkup(data) + budgetsCardMarkup(data)
+    + pricesCardMarkup(data) + usageCardMarkup(settingsState.usage);
+  bindSettingsEvents(data);
+}
+
+function collectPriceRows() {
+  for (const input of el('settingsContent').querySelectorAll('[data-price]')) {
+    const row = settingsState.prices[Number(input.dataset.price)];
+    if (row) row[input.dataset.col] = input.value;
+  }
+}
+
+function bindSettingsEvents(data) {
+  const src = data.sources || {};
+  el('saveProvider').addEventListener('click', () => {
+    const body = {};
+    if (src.provider !== 'env') body.provider = el('setProvider').value;
+    if (src.model !== 'env') body.model = el('setModel').value.trim();
+    if (src.deep_model !== 'env') body.deep_model = el('setDeepModel').value.trim();
+    if (src.base_url !== 'env') body.base_url = el('setBaseUrl').value.trim();
+    const clear = el('setClearKey');
+    const key = el('setApiKey').value;
+    if (clear && clear.checked) body.api_key = '__clear__';
+    else if (key && data.key_source !== 'env') body.api_key = key;
+    el('setApiKey').value = '';
+    saveSettings(body, 'Provider settings saved.');
+  });
+  el('testProvider').addEventListener('click', async () => {
+    settingsState.test = { pending: true };
+    renderSettings();
+    try {
+      settingsState.test = await settingsRequest('/api/settings/ai/test', { method: 'POST' });
+      [settingsState.data, settingsState.usage] = await Promise.all([
+        settingsRequest('/api/settings/ai'), settingsRequest('/api/settings/ai/usage?days=7'),
+      ]);
+    } catch (err) {
+      if (err instanceof SettingsAuthError) {
+        lockSettings(err.message);
+        return;
+      }
+      settingsState.test = { ok: false, error: err.message };
+    }
+    renderSettings();
+  });
+  el('saveFeatures').addEventListener('click', () => {
+    const flags = {};
+    for (const box of el('settingsContent').querySelectorAll('[data-feature]')) flags[box.dataset.feature] = box.checked;
+    saveSettings({ flags }, 'Features saved.');
+  });
+  el('saveBudgets').addEventListener('click', () => {
+    try {
+      const dailyCalls = {};
+      for (const input of el('settingsContent').querySelectorAll('[data-budget-calls]')) {
+        dailyCalls[input.dataset.budgetCalls] = numberOrNull(input.value);
+      }
+      saveSettings({
+        budgets: {
+          daily_tokens: numberOrNull(el('setDailyTokens').value),
+          daily_cost_usd: numberOrNull(el('setDailyCost').value),
+          daily_calls: dailyCalls,
+        },
+      }, 'Budgets saved.');
+    } catch (err) {
+      settingsMessage(`Not saved: ${err.message}`, 'error');
+    }
+  });
+  el('addPrice').addEventListener('click', () => {
+    collectPriceRows();
+    settingsState.prices.push({ model: '', input: '', output: '', cached: '' });
+    renderSettings();
+  });
+  for (const btn of el('settingsContent').querySelectorAll('[data-price-remove]')) {
+    btn.addEventListener('click', () => {
+      collectPriceRows();
+      settingsState.prices.splice(Number(btn.dataset.priceRemove), 1);
+      renderSettings();
+    });
+  }
+  el('savePrices').addEventListener('click', () => {
+    collectPriceRows();
+    try {
+      const prices = {};
+      for (const row of settingsState.prices) {
+        const model = String(row.model || '').trim();
+        if (!model) continue;
+        const entry = { input: numberOrNull(row.input), output: numberOrNull(row.output) };
+        const cached = numberOrNull(row.cached);
+        if (cached !== null) entry.cached = cached;
+        prices[model] = entry;
+      }
+      saveSettings({ prices }, 'Prices saved.');
+    } catch (err) {
+      settingsMessage(`Not saved: ${err.message}`, 'error');
+    }
+  });
+  const reset = el('resetPrices');
+  if (reset) reset.addEventListener('click', () => saveSettings({ prices: null }, 'Using the config.yaml prices.'));
+}
+
+el('settingsUnlock').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const token = el('settingsToken').value.trim();
+  el('settingsToken').value = '';
+  if (!token) return;
+  setSettingsToken(token);
+  el('settingsUnlockError').hidden = true;
+  loadSettings().catch(() => {});
+});
+el('settingsLock').addEventListener('click', () => lockSettings());
+el('settingsRefresh').addEventListener('click', () => {
+  settingsMessage('');
+  loadSettings().catch(() => {});
+});
+
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -3770,7 +4450,7 @@ async function init() {
     el('health').textContent = `Status unavailable: ${err.message}`;
   }
   if (status) {
-    state.aiConfigured = Boolean(status.ai_configured);
+    applyAiStatus(status);
     state.actionsEnabled = status.actions_enabled === true;
     if (status.last_successful_ingest_at) {
       el('freshness').textContent = fmtFreshness(status.last_successful_ingest_at);
