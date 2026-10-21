@@ -2,7 +2,7 @@
 # Production builds use the PyInstaller binary / container image instead
 # (Makefile, Dockerfile); their dependency pins are in requirements.lock.
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license string
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,6 +10,8 @@ name = "logscope"
 dynamic = ["version"]
 description = "Kubernetes log viewer with anomaly insights (Vector -> S3 -> SQLite) and its operator tools"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = ["PyYAML>=6.0", "boto3>=1.28"]
 
 [project.optional-dependencies]
