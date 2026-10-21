@@ -1,0 +1,7 @@
+# Build-only tools for the PyInstaller binary (never shipped in the image).
+# Compiled with hashes into requirements-build.lock by `make deps-lock`,
+# constrained to the runtime lock so both install together.
+-c requirements.lock
+pip==26.2.2
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.9

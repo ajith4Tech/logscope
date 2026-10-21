@@ -25,3 +25,8 @@ venv/
 # Editor / OS
 .DS_Store
 *.swp
+
+# Build outputs (make bin / make sbom) and the generated version module
+dist/
+build/
+logscope/_version.py

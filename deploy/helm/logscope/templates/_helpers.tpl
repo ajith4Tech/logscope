@@ -25,6 +25,22 @@
 {{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey | toJson | sha256sum -}}
 {{- end -}}
 
+{{/* Web app image: repository:tag[@digest]; tag defaults to the chart's appVersion. */}}
+{{- define "logscope.imageTag" -}}
+{{- .Values.image.tag | default .Chart.AppVersion | toString -}}
+{{- end -}}
+
+{{- define "logscope.image" -}}
+{{- $ref := printf "%s:%s" .Values.image.repository (include "logscope.imageTag" .) -}}
+{{- with .Values.image.digest }}{{ $ref = printf "%s@%s" $ref . }}{{ end -}}
+{{- $ref -}}
+{{- end -}}
+
+{{/* "true" when the pod needs a ServiceAccount token and runs kubectl actions. */}}
+{{- define "logscope.kubectlEnabled" -}}
+{{- if .Values.kubectl.enabled }}true{{ end -}}
+{{- end -}}
+
 {{- define "logscope.namespace" -}}
 {{- default .Release.Namespace .Values.namespace -}}
 {{- end -}}
@@ -98,7 +114,7 @@ Ingress host when enabled, and webapp.trustedHosts.
 
 {{/* Variables the chart sets itself; webapp.extraEnv must not override them. */}}
 {{- define "logscope.reservedEnv" -}}
-LOGSCOPE_WEBAPP_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVEL LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE LOGSCOPE_ALLOWED_ORIGINS LOGSCOPE_TRUSTED_HOSTS LOGSCOPE_AI_API_KEY LOGSCOPE_MATTERMOST_WEBHOOK_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+LOGSCOPE_WEBAPP_DB_PATH LOGSCOPE_WEBAPP_STATE_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVEL LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE LOGSCOPE_ALLOWED_ORIGINS LOGSCOPE_TRUSTED_HOSTS LOGSCOPE_AI_API_KEY LOGSCOPE_MATTERMOST_WEBHOOK_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 {{- end -}}
 
 {{- define "logscope.validate" -}}
@@ -111,9 +127,18 @@ LOGSCOPE_WEBAPP_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVE
 {{- if gt (int .Values.replicaCount) 1 -}}
 {{- fail "replicaCount must be 0 or 1: the web app uses a single-writer SQLite database on a ReadWriteOnce volume" -}}
 {{- end -}}
-{{- $_ := required "image.tag is required (use an immutable tag such as the git commit SHA)" .Values.image.tag -}}
-{{- if eq (toString .Values.image.tag) "latest" -}}
+{{- $_ := required "image.repository is required" .Values.image.repository -}}
+{{- $_ := required "image.tag is required (or set the chart's appVersion; use an immutable tag such as a release version or git SHA)" (include "logscope.imageTag" .) -}}
+{{- if eq (include "logscope.imageTag" .) "latest" -}}
 {{- fail "image.tag must be immutable; \"latest\" is not allowed" -}}
+{{- end -}}
+{{- with .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" (toString .)) -}}
+{{- fail "image.digest must look like sha256:<64 hex characters>" -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.kubectl.enabled (not (or .Values.rbac.readOnly.create .Values.rbac.rollout.create)) -}}
+{{- fail "kubectl.enabled=true needs an explicit RBAC Role: set rbac.readOnly.create and/or rbac.rollout.create (and an image built with INCLUDE_KUBECTL=true). The API has no authentication; see values.yaml" -}}
 {{- end -}}
 {{- $_ := required "s3.bucket is required" .Values.s3.bucket -}}
 {{- $_ := required "s3.region is required" .Values.s3.region -}}

@@ -322,3 +322,56 @@ def test_trusted_hosts_and_fixed_action_kill_switch():
         "logscope-webapp", "logscope-webapp.logging", "logscope-webapp.logging.svc",
         "logscope-webapp.logging.svc.cluster.local", "logs.example.internal", "*.corp.example",
     ]
+
+
+def _webapp_container(docs):
+    return _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]["containers"][0]
+
+
+def test_image_defaults_to_app_version_and_uses_image_command():
+    chart = yaml.safe_load((CHART / "Chart.yaml").read_text())
+    values = copy.deepcopy(BASE)
+    values["image"] = {"repository": "registry.example/logscope"}  # no tag: appVersion
+    docs, _ = _helm(values)
+    container = _webapp_container(docs)
+    assert container["image"] == f"registry.example/logscope:{chart['appVersion']}"
+    assert "args" not in container and "command" not in container   # image ENTRYPOINT/CMD
+    assert {"name": "tmp", "mountPath": "/tmp"} in container["volumeMounts"]
+    assert container["securityContext"]["readOnlyRootFilesystem"] is True
+
+    digest = "sha256:" + "0" * 64
+    docs, _ = _helm(_merge(BASE, {"image": {"digest": digest, "pullPolicy": "Never"}}))
+    container = _webapp_container(docs)
+    assert container["image"].endswith(f":abc123@{digest}") and container["imagePullPolicy"] == "Never"
+
+
+def test_kubectl_actions_and_roles_off_by_default():
+    docs, _ = _helm(BASE)
+    assert not [d for d in docs if d["kind"] in ("Role", "RoleBinding")]
+    pod = _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+
+
+def test_kubectl_enabled_with_namespaced_roles():
+    docs, _ = _helm(_merge(BASE, {"kubectl": {"enabled": True},
+                                  "rbac": {"readOnly": {"create": True}, "namespaces": ["app"]}}))
+    pod = _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]
+    env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
+    assert pod["automountServiceAccountToken"] is True and env["LOGSCOPE_ACTIONS_ENABLED"] == "true"
+    role = _find(docs, "Role", "logscope-webapp-read")
+    assert role["metadata"]["namespace"] == "app"
+    assert all(set(rule["verbs"]) <= {"get", "list", "watch"} for rule in role["rules"])
+    binding = _find(docs, "RoleBinding", "logscope-webapp-read")
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "logscope-webapp", "namespace": "logging"}]
+    assert not [d for d in docs if d["kind"] in ("ClusterRole", "ClusterRoleBinding")
+                and "webapp" in d["metadata"]["name"]]
+    assert not [d for d in docs if d["metadata"]["name"] == "logscope-webapp-rollout"]
+
+
+@pytest.mark.parametrize("overrides,message", [
+    ({"kubectl": {"enabled": True}}, "needs an explicit RBAC Role"),
+    ({"image": {"digest": "latest"}}, "image.digest must look like sha256"),
+])
+def test_packaging_render_guards(overrides, message):
+    _, err = _helm(_merge(BASE, overrides), expect_ok=False)
+    assert message in err

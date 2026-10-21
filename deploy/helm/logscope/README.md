@@ -173,21 +173,34 @@ message in any of these cases:
 
 ## Image
 
+The web app image is built from the repository's `Dockerfile`: the `logscope`
+binary on distroless (no shell, UID 10001). The container runs the image's
+own command (`logscope serve --host 0.0.0.0 --port 8000 --config
+/etc/logscope/config.yaml`). `image.tag` defaults to the chart's
+`appVersion`; release tags `vX.Y.Z` publish image tag `X.Y.Z`.
+
 ```bash
 git status --porcelain                        # empty: the tag must identify the code
-TAG=$(git rev-parse --short=12 HEAD)
-docker build -f webapp/Dockerfile -t logscope-webapp:$TAG .
+make image IMAGE=ghcr.io/<owner>/logscope     # tag = git describe, without a leading "v"
+TAG=$(make -s version | sed 's/^v//')
 ```
 
-- **Single node, no registry:** `docker save logscope-webapp:$TAG | sudo k3s ctr images import -`,
-  and keep `image.repository: logscope-webapp`.
+- **Single node, no registry:** `make k3s-import` prints
+  `docker save ghcr.io/<owner>/logscope:$TAG | sudo k3s ctr images import -`;
+  run it on the node and install with `--set image.pullPolicy=Never`.
 - **Multi-node:** an imported image exists on one node only, and pods placed
-  elsewhere fail with `ErrImagePull`. Push to a registry every node can reach,
-  set `image.repository: <registry>/<project>/logscope-webapp`, and add
+  elsewhere fail with `ErrImagePull`. Push to a registry every node can reach
+  (`make image-multi PUSH=1`, or the release workflow pushes `v*` tags to
+  GHCR), set `image.repository` (optionally `image.digest` to pin it), and add
   `image.pullSecrets` if the registry is private.
+- **kubectl actions** (off by default) need an image built with
+  `INCLUDE_KUBECTL=true`, `kubectl.enabled: true` and an explicit Role
+  (`rbac.readOnly.create` / `rbac.rollout.create`, namespaced, listed in
+  `rbac.namespaces`). The HTTP API has no authentication, so whoever reaches
+  the web app can run what those Roles allow.
 
-Vector (`docker.io/timberio/vector`) and Falco pull from public registries,
-as they do today.
+Vector (`docker.io/timberio/vector`) and Falco keep pulling their upstream
+images from public registries, as they do today.
 
 ## Install / upgrade / rollback
 
@@ -499,8 +512,8 @@ failures are also logged with a traceback.
   its own thread (10 s timeout, up to 5 attempts with backoff) and its state
   is shown in `/api/status` → `notifications` and on the Pipeline tab. The
   pod needs egress to the Mattermost server.
-- **Backups.** Only anomaly triage state on the PVC can't be rebuilt from S3.
-  Nothing backs it up automatically; see
+- **Backups.** Only anomaly triage state and saved views on the PVC can't be
+  rebuilt from S3. Nothing backs them up automatically; see
   [Backup and restore](#backup-and-restore-of-the-web-app-database).
 
 ## Backup and restore of the web app database
@@ -515,13 +528,78 @@ Backup (online — the app keeps running; uses SQLite's backup API, so the copy
 is consistent). It needs free space on the PVC about the size of the live data
 (the command checks first and refuses an existing destination file):
 
+The web app image has no shell and no `tar`, so `kubectl cp` and `rm` cannot
+run in its container. Files go in and out of the PVC through a short-lived
+busybox pod that mounts the same claim (`logscope-webapp-data`), and
+`logscope db` runs either in the web app container (`kubectl exec`, app
+running) or in a one-off pod from the same image (app stopped). Define these
+two shell helpers first:
+
 ```bash
-POD=$(kubectl -n logging get pod -l app.kubernetes.io/instance=logscope -o name | head -1)
+# Copy pod: busybox on the PVC as UID 10001 (the state database is mode 0600).
+# NODE pins it to the volume's node (needed for ReadWriteOnce network storage);
+# leave it empty when the web app is scaled to 0.
+copy_pod() {
+  kubectl -n logging apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: logscope-copy}
+spec:
+  ${NODE:+nodeName: $NODE}
+  restartPolicy: Never
+  securityContext: {runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true}
+  containers:
+    - name: copy
+      image: busybox:1.36
+      command: [sleep, "1800"]
+      securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: data, mountPath: /data}]
+  volumes:
+    - {name: data, persistentVolumeClaim: {claimName: logscope-webapp-data}}
+YAML
+  kubectl -n logging wait --for=condition=Ready pod/logscope-copy --timeout=180s
+}
+
+# One-off `logscope db ARGS...` in a pod from the web app's image (app stopped).
+db_pod() {
+  local img args
+  img=$(kubectl -n logging get deploy logscope-webapp -o jsonpath='{.spec.template.spec.containers[0].image}')
+  args=$(printf '"%s", ' db "$@"); args=${args%, }
+  kubectl -n logging apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata: {name: logscope-db}
+spec:
+  restartPolicy: Never
+  securityContext: {runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true}
+  containers:
+    - name: db
+      image: $img
+      args: [$args]
+      securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+      volumeMounts: [{name: data, mountPath: /data}, {name: tmp, mountPath: /tmp}]
+  volumes:
+    - {name: data, persistentVolumeClaim: {claimName: logscope-webapp-data}}
+    - {name: tmp, emptyDir: {}}
+YAML
+  kubectl -n logging wait --for=jsonpath='{.status.phase}'=Succeeded pod/logscope-db --timeout=30m
+  kubectl -n logging logs pod/logscope-db
+  kubectl -n logging delete pod logscope-db
+}
+```
+
+Backup:
+
+```bash
+POD=$(kubectl -n logging get pod -l app.kubernetes.io/instance=logscope,app.kubernetes.io/component=webapp -o name | head -1)
+NODE=$(kubectl -n logging get $POD -o jsonpath='{.spec.nodeName}')
 STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-kubectl -n logging exec $POD -- python -m webapp.api.dbtool backup /data/backup-$STAMP.sqlite
-kubectl -n logging cp ${POD#pod/}:/data/backup-$STAMP.sqlite ./logscope-$STAMP.sqlite
-kubectl -n logging exec $POD -- rm /data/backup-$STAMP.sqlite
-python -m webapp.api.dbtool verify ./logscope-$STAMP.sqlite      # integrity check + row counts
+kubectl -n logging exec $POD -- logscope db backup /data/backup-$STAMP.sqlite
+copy_pod
+kubectl -n logging cp logscope-copy:/data/backup-$STAMP.sqlite ./logscope-$STAMP.sqlite
+kubectl -n logging exec logscope-copy -- rm /data/backup-$STAMP.sqlite
+kubectl -n logging delete pod logscope-copy
+logscope db verify ./logscope-$STAMP.sqlite      # integrity check + row counts (or python -m webapp.api.dbtool)
 ```
 
 Restore (the app must be stopped; nothing is deleted or overwritten). The
@@ -536,14 +614,49 @@ changes made after the backup are lost:
 
 ```bash
 kubectl -n logging scale deploy/logscope-webapp --replicas=0
-# Start a pod from the same image that mounts the PVC (claim logscope-webapp-data),
-# copy the backup into /data, then inside it:
-python -m webapp.api.dbtool --db /data/logscope.sqlite restore /data/logscope-<stamp>.sqlite --app-stopped
+NODE= copy_pod
+kubectl -n logging cp ./logscope-<stamp>.sqlite logscope-copy:/data/logscope-<stamp>.sqlite
+kubectl -n logging delete pod logscope-copy
+db_pod --db /data/logscope.sqlite restore /data/logscope-<stamp>.sqlite --app-stopped
 kubectl -n logging scale deploy/logscope-webapp --replicas=1
 ```
 
-`python -m webapp.api.dbtool --db /data/logscope.sqlite compact --app-stopped`
-(app stopped; free space ≈ twice the live data, because VACUUM writes a copy
+### Saved views (state database)
+
+Saved views live in a separate SQLite file, `/state/state.sqlite`: the same
+PVC mounted a second time under its own subPath (`state/`), set through
+`LOGSCOPE_WEBAPP_STATE_DB_PATH`. Wiping or restoring the log cache never
+touches it. The file is created with mode 0600 and its schema is versioned
+(`schema_version` table; upgrades only ever add migrations). Outside the
+chart it defaults to `$XDG_DATA_HOME/logscope/state.sqlite`
+(`~/.local/share/logscope/state.sqlite`), never `/tmp`; set
+`webapp.backend.state_db_path` in `config.yaml` to change it.
+
+`backup`, `verify` and `restore` take `--state` to work on this file instead
+(same safety rules as above; copies are created with mode 0600, and `--db`
+defaults to `$LOGSCOPE_WEBAPP_STATE_DB_PATH`):
+
+```bash
+kubectl -n logging exec $POD -- logscope db backup --state /state/backup-$STAMP.sqlite
+copy_pod                         # mounts the whole PVC: /state is /data/state here
+kubectl -n logging cp logscope-copy:/data/state/backup-$STAMP.sqlite ./logscope-state-$STAMP.sqlite
+kubectl -n logging exec logscope-copy -- rm /data/state/backup-$STAMP.sqlite
+kubectl -n logging delete pod logscope-copy
+logscope db verify --state ./logscope-state-$STAMP.sqlite   # integrity + saved view count
+# restore: app stopped; both helper pods mount the whole PVC at /data, so the
+# state file is /data/state/state.sqlite.
+kubectl -n logging scale deploy/logscope-webapp --replicas=0
+NODE= copy_pod
+kubectl -n logging cp ./logscope-state-<stamp>.sqlite logscope-copy:/data/state/logscope-state-<stamp>.sqlite
+kubectl -n logging delete pod logscope-copy
+db_pod --db /data/state/state.sqlite restore --state /data/state/logscope-state-<stamp>.sqlite --app-stopped
+kubectl -n logging scale deploy/logscope-webapp --replicas=1
+```
+
+### Compaction
+
+`db_pod --db /data/logscope.sqlite compact --app-stopped`, with the web app
+scaled to 0 (app stopped; free space ≈ twice the live data, because VACUUM writes a copy
 and, in WAL mode, the WAL as well — the command checks first) rewrites a database created by an
 older version so that pruning returns space to the filesystem; new databases
 do this automatically.

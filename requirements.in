@@ -1,0 +1,6 @@
+# Runtime dependencies of the logscope binary and container image: the pinned
+# web app set plus PyYAML and boto3 (render / s3-lifecycle). Compiled with
+# hashes into requirements.lock by `make deps-lock` (pip-compile runs only in
+# the Dockerfile's builder base image). Edit the pins in the files below.
+-r webapp/requirements.txt
+-r requirements.txt

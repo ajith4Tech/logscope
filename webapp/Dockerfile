@@ -1,3 +1,6 @@
+# Superseded by the repository-root Dockerfile (distroless `logscope` binary
+# image: make image). Kept so existing build scripts keep working.
+#
 # Logscope web app (API + static UI). Build from the repo root:
 #   docker build -f webapp/Dockerfile -t logscope-webapp:$(git rev-parse --short HEAD) .
 #

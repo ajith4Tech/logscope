@@ -9,6 +9,7 @@ import os
 import shutil
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -65,6 +66,39 @@ CONTEXT_WINDOW_SECS = 6 * 3600
 # Per-prefix S3 listing errors kept from the last poll (for the status page).
 _PREFIX_ERRORS_MAX = 50
 _PREFIX_ERROR_CHARS = 300
+
+# Secondary indexes on records for filtered queries (field filter + time
+# range or time ordering). The UNIQUE key only serves ingest dedupe.
+_RECORD_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS idx_records_ts_ns ON records(timestamp, namespace)",
+    "CREATE INDEX IF NOT EXISTS idx_records_ns_ts ON records(namespace, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_records_sev_ts ON records(severity_bucket, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_records_scope_ts ON records(scope, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_records_pod_ts ON records(pod, timestamp)",
+)
+
+# Filter fields: (record column, exclusion parameter). An exclusion parameter
+# holds values to leave out, e.g. xns=kube-system.
+FILTER_FIELDS = (
+    ("scope", "xscope"),
+    ("namespace", "xns"),
+    ("pod", "xpod"),
+    ("container", "xctr"),
+    ("severity_bucket", "xsev"),
+)
+
+# /api/fields: values returned per field, and the time budget of each
+# field's query (checked every _PROGRESS_OPS SQLite VM instructions).
+FIELD_TOP_VALUES = 10
+FIELD_QUERY_TIMEOUT_SECS = 2.0
+_PROGRESS_OPS = 1000
+
+# /api/histogram: bucket sizes (seconds) to choose from, the bucket count
+# aimed for, and the most buckets returned (older ones are dropped).
+HISTOGRAM_BUCKET_SECS = (60, 300, 900, 3600, 21600)
+HISTOGRAM_TARGET_BUCKETS = 60
+HISTOGRAM_MAX_BUCKETS = 1000
+_HISTOGRAM_SEVERITIES = ("error", "warning", "info", "debug")
 
 _RECORD_COLUMNS = (
     "id, timestamp, severity_bucket, scope, namespace, pod, container, message, raw_line, "
@@ -134,6 +168,47 @@ def _locked(method):
 def _iso_ms(value: datetime) -> str:
     """UTC ISO-8601 with milliseconds, the format browsers send."""
     return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
+
+
+def _fts_phrase(token: str) -> str:
+    return '"' + token.replace('"', '""') + '"'
+
+
+def _like_pattern(text: str) -> str:
+    """A LIKE substring pattern (ESCAPE '\\') matching text literally."""
+    escaped = text.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def split_search_terms(q: str) -> tuple[list[str], list[str]]:
+    """Whitespace-separated search words as (wanted, excluded); a leading '-'
+    excludes a word. FTS operators (AND, OR, NOT, NEAR, *, :) typed by the
+    user are plain words here."""
+    wanted: list[str] = []
+    excluded: list[str] = []
+    for token in q.split():
+        if len(token) > 1 and token.startswith("-"):
+            excluded.append(token[1:])
+        else:
+            wanted.append(token)
+    return wanted, excluded
+
+
+def _has_word_chars(token: str) -> bool:
+    # The FTS tokenizer drops punctuation; a phrase of punctuation only is
+    # empty and matches nothing, so such words are matched as substrings.
+    return any(ch.isalnum() for ch in token)
+
+
+def _parse_iso(value: str | None) -> datetime | None:
+    """An ISO-8601 time from a request (UTC when it has no offset)."""
+    if not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"Invalid time {str(value)[:40]!r}") from None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _encode_cursor(ts: str, record_id: int) -> str:
@@ -266,6 +341,8 @@ class LogStorage:
             )
             """
         )
+        for statement in _RECORD_INDEXES:
+            cur.execute(statement)
         self._init_fts(cur)
         self._conn.commit()
 
@@ -638,14 +715,20 @@ class LogStorage:
         except sqlite3.OperationalError as exc:
             raise ValueError(f"Invalid search query: {exc}") from None
 
-    def _build_filters(self, params: dict[str, Any]) -> tuple[str, list[Any]]:
+    def _build_filters(self, params: dict[str, Any], *, skip_field: str | None = None) -> tuple[str, list[Any]]:
+        """WHERE clause for the API filters. skip_field leaves out the equality
+        filter on that one field (its exclusions still apply)."""
         clauses = ["1 = 1"]
         args: list[Any] = []
-        for field in ("scope", "namespace", "pod", "container", "severity_bucket"):
+        for field, exclude_key in FILTER_FIELDS:
             value = params.get(field)
-            if value:
+            if value and field != skip_field:
                 clauses.append(f"{field} = ?")
                 args.append(value)
+            excluded = params.get(exclude_key)
+            if excluded:
+                clauses.append(f"{field} NOT IN (SELECT value FROM json_each(?))")
+                args.append(json.dumps(list(excluded)))
         start = params.get("start")
         end = params.get("end")
         before = params.get("before")
@@ -660,15 +743,48 @@ class LogStorage:
             args.append(before)
         q = params.get("q")
         if q:
-            if self.fts_search:
-                self._check_fts_query(q)
-                clauses.append("id IN (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)")
-                args.append(q)
+            if params.get("qmode") == "raw":
+                self._raw_search_clause(str(q), clauses, args)
             else:
-                clauses.append("(LOWER(message) LIKE ? OR LOWER(raw_line) LIKE ?)")
-                needle = f"%{str(q).lower()}%"
-                args.extend([needle, needle])
+                self._phrase_search_clauses(str(q), clauses, args)
         return " AND ".join(clauses), args
+
+    _LIKE_SQL = "(LOWER(message) LIKE ? ESCAPE '\\' OR LOWER(raw_line) LIKE ? ESCAPE '\\')"
+    _MATCH_SQL = "id {op} (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)"
+
+    def _raw_search_clause(self, q: str, clauses: list[str], args: list[Any]) -> None:
+        """qmode=raw: q is FTS5 query syntax (or one substring without FTS)."""
+        if self.fts_search:
+            self._check_fts_query(q)
+            clauses.append(self._MATCH_SQL.format(op="IN"))
+            args.append(q)
+        else:
+            clauses.append(self._LIKE_SQL)
+            needle = _like_pattern(q)
+            args.extend([needle, needle])
+
+    def _phrase_search_clauses(self, q: str, clauses: list[str], args: list[Any]) -> None:
+        """Default search: every word must appear (each word is matched as an
+        FTS phrase, so kube-system or 10.0.3.4 match as written), and a word
+        with a leading '-' must not."""
+        wanted, excluded = split_search_terms(q)
+        # Without FTS every word is a substring match; with it, only words
+        # the FTS tokenizer cannot index are.
+        fts_wanted = [t for t in wanted if self.fts_search and _has_word_chars(t)]
+        fts_excluded = [t for t in excluded if self.fts_search and _has_word_chars(t)]
+        if fts_wanted:
+            clauses.append(self._MATCH_SQL.format(op="IN"))
+            args.append(" AND ".join(_fts_phrase(t) for t in fts_wanted))
+        if fts_excluded:
+            # FTS5 NOT is binary ("a NOT b"), so exclusions are a separate
+            # NOT IN; that also covers a query of exclusions only.
+            clauses.append(self._MATCH_SQL.format(op="NOT IN"))
+            args.append(" OR ".join(_fts_phrase(t) for t in fts_excluded))
+        for tokens, fts_tokens, negate in ((wanted, fts_wanted, ""), (excluded, fts_excluded, "NOT ")):
+            for token in tokens:
+                if token not in fts_tokens:
+                    clauses.append(negate + self._LIKE_SQL)
+                    args.extend([_like_pattern(token)] * 2)
 
     @_locked
     def query_logs(self, params: dict[str, Any], *, limit: int, cursor: tuple[str, int] | None = None, direction: str = "desc") -> dict[str, Any]:
@@ -754,6 +870,131 @@ class LogStorage:
             ).fetchall()
             out[field] = [{"value": row[0], "count": int(row[1])} for row in rows]
         return out
+
+    @contextmanager
+    def _time_limit(self, timeout_secs: float):
+        """Interrupt the queries run inside after timeout_secs; an interrupted
+        query raises sqlite3.OperationalError ("interrupted")."""
+        deadline = time.monotonic() + timeout_secs
+        self._conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, _PROGRESS_OPS)
+        try:
+            yield
+        finally:
+            self._conn.set_progress_handler(None, 0)
+
+    @_locked
+    def query_fields(self, params: dict[str, Any], *, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[str, Any]:
+        """Top values of each filter field under the current filters. A field's
+        own equality filter is left out of its query, so its other values stay
+        visible (its exclusions still apply). Each field's query gets
+        timeout_secs; a field that runs out reports partial with no values."""
+        fields: dict[str, Any] = {}
+        any_partial = False
+        for field, exclude_key in FILTER_FIELDS:
+            where_sql, args = self._build_filters(params, skip_field=field)
+            try:
+                with self._time_limit(timeout_secs):
+                    rows = self._conn.execute(
+                        f"""
+                        SELECT {field} AS value, COUNT(*) AS count,
+                               SUM(COUNT(*)) OVER () AS total, COUNT(*) OVER () AS distinct_count
+                        FROM records
+                        WHERE {where_sql}
+                        GROUP BY {field}
+                        ORDER BY count DESC, value ASC
+                        LIMIT ?
+                        """,
+                        (*args, FIELD_TOP_VALUES),
+                    ).fetchall()
+            except sqlite3.OperationalError as exc:
+                if "interrupted" not in str(exc):
+                    raise
+                any_partial = True
+                fields[field] = {"param": field, "exclude_param": exclude_key, "values": [],
+                                 "total": None, "distinct": None, "partial": True}
+                continue
+            fields[field] = {
+                "param": field,
+                "exclude_param": exclude_key,
+                "values": [{"value": row[0], "count": int(row[1])} for row in rows],
+                "total": int(rows[0][2]) if rows else 0,
+                "distinct": int(rows[0][3]) if rows else 0,
+                "partial": False,
+            }
+        return {"fields": fields, "partial": any_partial}
+
+    @_locked
+    def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+        """Entry counts per time bucket (total and per severity) over the
+        filtered range, every bucket present. Buckets are aligned to the
+        bucket size in UTC epoch seconds; record times are normalized with
+        SQLite's date functions, so offsets and fractional seconds land in
+        the right bucket. Without a start the range begins at the oldest
+        matching entry; without an end it stops at now."""
+        end_dt = _parse_iso(params.get("before"))
+        if end_dt is None and params.get("end"):
+            inclusive = _parse_iso(params.get("end"))
+            end_dt = inclusive + timedelta(seconds=1) if inclusive else None
+        end_epoch = int((end_dt or now or datetime.now(timezone.utc)).timestamp())
+        start_dt = _parse_iso(params.get("start"))
+        # The range is applied on epoch seconds below. The text comparison
+        # kept here is widened by a day (more than any UTC offset) so the
+        # timestamp indexes still narrow the scan.
+        where_sql, args = self._build_filters(
+            {key: value for key, value in params.items() if key not in ("start", "end", "before")}
+        )
+        if start_dt is not None:
+            where_sql += " AND timestamp >= ?"
+            args.append(_iso_ms(start_dt - timedelta(days=1)))
+        if end_dt is not None:
+            where_sql += " AND timestamp < ?"
+            args.append(_iso_ms(end_dt + timedelta(days=1)))
+        if start_dt is not None:
+            start_epoch = int(start_dt.timestamp())
+        else:
+            row = self._conn.execute(
+                f"SELECT MIN(CAST(strftime('%s', timestamp) AS INTEGER)) FROM records WHERE {where_sql}", args
+            ).fetchone()
+            if row[0] is None:
+                return {"bucket_secs": HISTOGRAM_BUCKET_SECS[0], "buckets": [], "truncated": False}
+            start_epoch = int(row[0])
+        span = max(1, end_epoch - start_epoch)
+        bucket_secs = next(
+            (size for size in HISTOGRAM_BUCKET_SECS if span / size <= HISTOGRAM_TARGET_BUCKETS),
+            HISTOGRAM_BUCKET_SECS[-1],
+        )
+        origin = start_epoch - start_epoch % bucket_secs
+        count = max(1, -(-(end_epoch - origin) // bucket_secs))
+        truncated = count > HISTOGRAM_MAX_BUCKETS
+        if truncated:  # keep the newest buckets
+            origin += (count - HISTOGRAM_MAX_BUCKETS) * bucket_secs
+            count = HISTOGRAM_MAX_BUCKETS
+        severity_sql = ", ".join(f"SUM(severity_bucket = '{sev}')" for sev in _HISTOGRAM_SEVERITIES)
+        rows = self._conn.execute(
+            f"""
+            SELECT (ep - ?) / ? AS bucket, COUNT(*), {severity_sql}
+            FROM (
+                SELECT CAST(strftime('%s', timestamp) AS INTEGER) AS ep, severity_bucket
+                FROM records
+                WHERE {where_sql}
+            )
+            WHERE ep >= ? AND ep < ?
+            GROUP BY bucket
+            """,
+            (origin, bucket_secs, *args, max(origin, start_epoch), min(origin + count * bucket_secs, end_epoch)),
+        ).fetchall()
+        by_bucket = {int(row[0]): row for row in rows}
+        buckets = []
+        for index in range(count):
+            row = by_bucket.get(index)
+            entry = {
+                "t": datetime.fromtimestamp(origin + index * bucket_secs, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "total": int(row[1]) if row else 0,
+            }
+            for offset, sev in enumerate(_HISTOGRAM_SEVERITIES):
+                entry[sev] = int(row[2 + offset] or 0) if row else 0
+            buckets.append(entry)
+        return {"bucket_secs": bucket_secs, "buckets": buckets, "truncated": truncated}
 
     @_locked
     def query_dashboard(self, params: dict[str, Any]) -> dict[str, Any]:

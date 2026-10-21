@@ -57,7 +57,7 @@ cp config.example.yaml config.yaml   # then edit paths.host_path, routing, etc.
 # Directory must already exist on the node (hostPath type: Directory).
 sudo mkdir -p /var/lib/logscope
 
-python3 scripts/render.py
+python3 scripts/render.py          # or: logscope render
 
 kubectl apply -f deploy/namespace.yaml
 helm repo add vector https://helm.vector.dev && helm repo update
@@ -92,8 +92,9 @@ Re-render, then follow [`production-vector/README.md`](./production-vector/READM
 `config.yaml`, run once:
 
 ```bash
-python3 scripts/apply_s3_lifecycle.py
-# uses deploy/k3s/s3-secret.yaml when present, else AWS_* env / default chain
+logscope s3-lifecycle          # or: python3 scripts/apply_s3_lifecycle.py
+# uses deploy/k3s/s3-secret.yaml when present, else AWS_* env / default chain;
+# LOGSCOPE_S3_* overrides apply, exactly as for render
 ```
 
 That installs a native S3 Lifecycle expiration rule (rolling by object age under
@@ -221,8 +222,81 @@ kubectl -n logging create job --from=cronjob/vector-log-backup backup-manual
 ## Web app
 
 `webapp/` is a log viewer with anomaly insights. It reads the S3 objects
-Vector writes (same `config.yaml`) and caches them in SQLite. Run it locally
-with `python3 -m webapp.api.server`. To run it in the cluster, see
+Vector writes (same `config.yaml`) and caches them in SQLite. It ships as one
+`logscope` command, as a standalone binary or a container image:
+
+```
+logscope serve        [--host H] [--port P] [--config FILE]   web app (UI + API)
+logscope render       [-c FILE] [-o DIR]                      Vector Helm values / vector.yaml
+logscope s3-lifecycle [-c FILE] [--secret FILE]               S3 retention rule
+logscope db           [--db FILE] backup|verify|restore|compact [--state]
+logscope healthcheck  [--port P]                              GET 127.0.0.1:$PORT/healthz; exit 0/1
+logscope selfcheck    [--config FILE]                         FTS5, config, writable paths, AI/S3 settings (no network)
+logscope version
+```
+
+From a source checkout the same commands run as `python3 -m logscope ...`
+(or `pip install .`), and the older entry points still work
+(`python3 -m webapp.api.server`, `python -m webapp.api.dbtool`,
+`scripts/render.py`, `scripts/apply_s3_lifecycle.py`).
+
+### Binary
+
+One self-contained file per architecture (PyInstaller; Python and all
+dependencies inside). Built on Debian bookworm; its newest glibc symbol is
+GLIBC_2.35, so it runs on Ubuntu 22.04+, Debian 12+ and RHEL 10 (not RHEL 9).
+Download it from a GitHub release
+(verify against `sha256sums.txt`) or build it with Docker:
+
+```bash
+make bin                                   # -> dist/logscope-<version>-linux-<arch> (+ .sha256)
+install -m 0755 dist/logscope-*-linux-amd64 /usr/local/bin/logscope
+logscope selfcheck --config /etc/logscope/config.yaml
+logscope serve --config /etc/logscope/config.yaml   # http://127.0.0.1:8000
+```
+
+[`deploy/systemd/logscope.service`](./deploy/systemd/logscope.service) is an
+example unit (hardened, state in `/var/lib/logscope`, credentials in a mode
+0600 `EnvironmentFile`).
+
+### Container image
+
+`Dockerfile` builds the binary (onedir) on `python:3.12-slim-bookworm` and
+copies it into `gcr.io/distroless/cc-debian12`: no shell, no package manager,
+UID 10001, both bases pinned by digest, Python dependencies installed from
+`requirements.lock` with `--require-hashes`.
+
+```bash
+make image                     # current arch, loaded into the local Docker
+make smoke                     # build image + binary and run the smoke checks
+make image-multi PUSH=1 IMAGE=ghcr.io/<owner>/logscope   # amd64 + arm64, SBOM + provenance, pushed
+make scan                      # trivy, if installed
+```
+
+The image tag is the version without its leading `v` (`v0.3.0` -> `0.3.0`;
+untagged commits use `git describe`, e.g. `828a417-dirty`). `INCLUDE_KUBECTL=true`
+adds a pinned, checksum-verified `kubectl` for clusters that enable actions
+(see the chart's `kubectl.*` / `rbac.*` values). The version is reported by
+`logscope version`, `/api/status` (`version`) and the `X-Logscope-Version`
+response header.
+
+### k3s: import or registry
+
+- **Single node, no registry:** build on the node (or copy the image there)
+  and import it into k3s's containerd. `make k3s-import` prints the command:
+
+  ```bash
+  docker save ghcr.io/<owner>/logscope:<tag> | sudo k3s ctr images import -
+  helm upgrade --install logscope deploy/helm/logscope -n logging -f $V \
+    --set image.repository=ghcr.io/<owner>/logscope --set image.tag=<tag> --set image.pullPolicy=Never
+  ```
+- **Multi-node:** an imported image exists on one node only. Push it to a
+  registry every node can reach (`make image-multi PUSH=1`, or the release
+  workflow on a `v*` tag pushes to GHCR), set `image.repository` (and
+  `image.digest` to pin it), and `image.pullSecrets` if the registry is private.
+
+Vector (`timberio/vector`) and Falco keep running from their upstream images;
+only the web app uses this image. Deploying the chart is described in
 [`deploy/helm/logscope/README.md`](./deploy/helm/logscope/README.md).
 
 - Running suggested `kubectl` steps from the UI is off unless you start the
@@ -231,8 +305,8 @@ with `python3 -m webapp.api.server`. To run it in the cluster, see
 - The server answers only to trusted `Host` names: IP addresses, `localhost`
   and the `--host` name. Reach it by any other name? Add it to
   `LOGSCOPE_TRUSTED_HOSTS` (comma-separated; `*.example.com` allowed).
-- Back up the SQLite cache with `python -m webapp.api.dbtool backup <file>`
-  (see the chart README for restore).
+- Back up the SQLite cache with `logscope db backup <file>` (see the chart
+  README for restore).
 
 ## Notes
 

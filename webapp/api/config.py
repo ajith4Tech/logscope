@@ -7,10 +7,15 @@ from typing import Any
 
 import yaml
 
+from .state import STATE_DB_ENV, default_state_db_path
+
 
 DEFAULT_BACKEND = {
     "poll_interval_secs": 30,
     "db_path": "/tmp/logscope-webapp.sqlite",
+    # Durable state (saved views) in its own file; never in /tmp. None =
+    # $XDG_DATA_HOME/logscope/state.sqlite (~/.local/share/logscope/...).
+    "state_db_path": None,
     "page_size_default": 200,
     "page_size_max": 1000,
     # Re-list this much key time behind each prefix cursor to catch objects that
@@ -84,6 +89,7 @@ class BackendConfig:
     page_size_max: int
     s3_lookback_secs: int = 3600
     retention_days: int = 0
+    state_db_path: Path | None = None  # None = state.default_state_db_path()
 
 
 @dataclass(frozen=True)
@@ -196,6 +202,8 @@ def load_app_config(config_path: Path) -> AppConfig:
     # the local-dev default; same LOGSCOPE_* override style as scripts/render.py.
     if os.environ.get("LOGSCOPE_WEBAPP_DB_PATH"):
         backend["db_path"] = os.environ["LOGSCOPE_WEBAPP_DB_PATH"]
+    if os.environ.get(STATE_DB_ENV):
+        backend["state_db_path"] = os.environ[STATE_DB_ENV]
     retention_days = backend.get("retention_days")
     if retention_days is None:
         retention_days = s3_cfg.get("retention_days") or 0
@@ -259,6 +267,7 @@ def load_app_config(config_path: Path) -> AppConfig:
             page_size_max=int(backend["page_size_max"]),
             s3_lookback_secs=int(backend["s3_lookback_secs"]),
             retention_days=int(retention_days),
+            state_db_path=Path(str(backend["state_db_path"] or default_state_db_path())).expanduser(),
         ),
         insights=InsightsConfig(
             enabled=bool(insights["enabled"]),

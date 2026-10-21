@@ -167,7 +167,7 @@ def test_http_health_errors_and_action_kill_switch(monkeypatch):
 
             status, payload = _request(server, "GET", "/api/logs?limit=abc")
             assert status == 400 and "error" in payload
-            status, payload = _request(server, "GET", '/api/logs?q=%22unterminated')
+            status, payload = _request(server, "GET", '/api/logs?qmode=raw&q=%22unterminated')
             assert status == 400 and payload["error"].startswith("Invalid request: Invalid search query")
 
             status, payload = _request(

@@ -1,6 +1,6 @@
 Logscope installed in namespace {{ include "logscope.namespace" . }}.
 
-Web app ({{ .Values.image.repository }}:{{ .Values.image.tag }}):
+Web app ({{ include "logscope.image" . }}):
   kubectl -n {{ include "logscope.namespace" . }} rollout status deploy/{{ include "logscope.fullname" . }}
   kubectl -n {{ include "logscope.namespace" . }} port-forward svc/{{ include "logscope.fullname" . }} 8000:{{ .Values.service.port }}
   curl -s localhost:8000/api/status      # last_error should be null

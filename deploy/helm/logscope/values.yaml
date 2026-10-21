@@ -139,10 +139,14 @@ logscope:
 # ---------------------------------------------------------------------------
 # Web app (UI + API): Deployment, Service, PVC, ConfigMap, NetworkPolicy.
 # ---------------------------------------------------------------------------
+# Built from the repository's Dockerfile (make image / make image-multi):
+# a distroless image whose entrypoint is the `logscope` binary. The container
+# uses the image's own command and arguments (`logscope serve ...`).
 image:
-  repository: logscope-webapp   # or <registry>/<project>/logscope-webapp
-  tag: ""                       # REQUIRED, immutable (e.g. git SHA). Never "latest".
-  pullPolicy: IfNotPresent
+  repository: ghcr.io/owner/logscope   # your registry/owner; or the name used with `make k3s-import`
+  tag: ""                       # "" = the chart's appVersion. Immutable tags only; never "latest".
+  digest: ""                    # optional sha256:...; pins the image (used together with the tag)
+  pullPolicy: IfNotPresent      # Never: image imported into k3s (make k3s-import), no registry
   pullSecrets: []               # existing docker-registry Secret names
 
 # 0 or 1 only: single-writer SQLite on a ReadWriteOnce volume.
@@ -180,8 +184,40 @@ webapp:
     s3_lookback_secs: 3600
   insights:
     enabled: true     # any other webapp.insights key from config.example.yaml may be added
-  # kubectl actions are always disabled (LOGSCOPE_ACTIONS_ENABLED=false): the
-  # API is unauthenticated, the image has no kubectl, the pod has no API token.
+  # kubectl actions are disabled (LOGSCOPE_ACTIONS_ENABLED=false) unless
+  # kubectl.enabled is set below: the API is unauthenticated, the default image
+  # has no kubectl and the pod gets no API token.
+
+# ---------------------------------------------------------------------------
+# kubectl actions (optional, off by default). Running the UI's suggested
+# kubectl steps needs ALL of:
+#   1. an image built with kubectl: make image INCLUDE_KUBECTL=true
+#      (pinned version, sha256-verified);
+#   2. kubectl.enabled: true (mounts the ServiceAccount token and sets
+#      LOGSCOPE_ACTIONS_ENABLED=true);
+#   3. an explicit RBAC Role: rbac.readOnly.create and/or rbac.rollout.create.
+#      Rendering fails when kubectl.enabled is set without one.
+# The HTTP API has NO authentication: anyone who can reach the web app can
+# run what these Roles allow. Keep the Ingress behind authentication and the
+# NetworkPolicy in place, and grant only the namespaces you need.
+# ---------------------------------------------------------------------------
+kubectl:
+  enabled: false
+
+rbac:
+  # Namespaces the Roles are created in (each gets a Role + RoleBinding for
+  # this release's ServiceAccount). Empty = the release namespace only. No
+  # cluster-wide grant is offered.
+  namespaces: []
+  # get/list/watch pods, pods/log, events, deployments, replicasets: the
+  # read-only actions (get, describe, logs, events, rollout status).
+  readOnly:
+    create: false
+  # Mutating actions `kubectl rollout restart` / `rollout undo` on
+  # Deployments (get + patch Deployments, get/list ReplicaSets). Every run
+  # still needs an explicit confirmation in the UI.
+  rollout:
+    create: false
 
 service:
   port: 8000

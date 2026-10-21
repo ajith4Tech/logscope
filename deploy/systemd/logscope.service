@@ -1,0 +1,72 @@
+# Example systemd unit for the standalone `logscope` binary (not installed by
+# anything in this repository). To use it on a host:
+#
+#   install -m 0755 dist/logscope-<version>-linux-amd64 /usr/local/bin/logscope
+#   useradd --system --no-create-home --shell /usr/sbin/nologin logscope
+#   install -d -m 0755 /etc/logscope
+#   install -m 0644 config.yaml /etc/logscope/config.yaml          # no credentials in here
+#   install -m 0600 -o root -g root /dev/null /etc/logscope/logscope.env
+#   # /etc/logscope/logscope.env (mode 0600, root-owned; systemd reads it as
+#   # root before dropping privileges) holds the credentials, one per line:
+#   #   AWS_ACCESS_KEY_ID=...
+#   #   AWS_SECRET_ACCESS_KEY=...
+#   #   OPENROUTER_API_KEY=...            # only with an AI provider; name = webapp.ai.api_key_env
+#   #   LOGSCOPE_TRUSTED_HOSTS=logs.example.internal
+#   cp deploy/systemd/logscope.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now logscope
+#   /usr/local/bin/logscope healthcheck --port 8000
+#
+# The server has no authentication: it listens on 127.0.0.1 here. Put an
+# authenticating reverse proxy in front before binding it elsewhere.
+
+[Unit]
+Description=Logscope web app (Kubernetes log viewer with anomaly insights)
+Documentation=https://github.com/owner/logscope
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=logscope
+Group=logscope
+EnvironmentFile=/etc/logscope/logscope.env
+# Databases live under StateDirectory (/var/lib/logscope, created and owned
+# by systemd for User=). The state database (saved views) is durable;
+# back both up with `logscope db backup` (see the chart README).
+StateDirectory=logscope
+StateDirectoryMode=0700
+Environment=LOGSCOPE_WEBAPP_DB_PATH=/var/lib/logscope/logscope.sqlite
+Environment=LOGSCOPE_WEBAPP_STATE_DB_PATH=/var/lib/logscope/state/state.sqlite
+Environment=SQLITE_TMPDIR=/var/lib/logscope
+Environment=LOGSCOPE_LOG_LEVEL=INFO
+ExecStart=/usr/local/bin/logscope serve --host 127.0.0.1 --port 8000 --config /etc/logscope/config.yaml
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+UMask=0077
+
+# Hardening. The onefile binary unpacks itself into $TMPDIR at start
+# (PrivateTmp gives it a private /tmp).
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/logscope
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

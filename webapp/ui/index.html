@@ -35,6 +35,16 @@
           <button id="securityShortcut" class="ghost">Security</button>
         </div>
         <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
+        <div id="viewBar" class="view-bar" hidden>
+          <span class="view-bar-label">View</span>
+          <span id="viewBarName" class="view-bar-name"></span>
+          <span id="viewModifiedDot" class="view-modified-dot" title="The filters differ from this saved view" hidden></span>
+          <span class="view-bar-actions">
+            <button id="viewRevertBtn" type="button" class="link-btn" title="Restore the saved filters" hidden>Revert</button>
+            <button id="viewUpdateBtn" type="button" class="link-btn" title="Save the current filters into this view" hidden>Update</button>
+            <button id="viewCloseBtn" type="button" class="link-btn" title="Stop following this view (filters stay as they are)" aria-label="Close view">✕</button>
+          </span>
+        </div>
         <label>Scope <select id="scope"></select></label>
         <label>Namespace <select id="namespace"></select></label>
         <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
@@ -48,6 +58,15 @@
         <div class="actions">
           <button id="apply">Apply</button>
           <label class="toggle"><input id="live" type="checkbox" checked /> Live tail</label>
+        </div>
+        <div class="views-actions">
+          <button id="saveViewBtn" type="button" class="ghost" title="Save the current filters and time range as a named view">Save view</button>
+          <button id="viewsMenuBtn" type="button" class="ghost" aria-haspopup="true" aria-expanded="false" aria-controls="viewsMenu">Views <span id="viewsCount" class="views-count"></span> ▾</button>
+        </div>
+        <div id="viewsMenu" class="views-menu" hidden>
+          <input id="viewsSearch" type="search" placeholder="Search views" autocomplete="off" aria-label="Search saved views" />
+          <div id="viewsError" class="views-error" role="alert" hidden></div>
+          <div id="viewsList" class="views-list"></div>
         </div>
       </aside>
 
@@ -84,6 +103,12 @@
             </div>
             <button id="refreshDashboard" class="ghost">Refresh</button>
           </div>
+          <section id="pinnedViews" class="pinned-views" aria-label="Pinned views" hidden>
+            <div class="section-head">
+              <h3>Pinned views <span class="subtle">· last hour</span></h3>
+            </div>
+            <div id="pinnedViewsCards" class="pinned-views-cards"></div>
+          </section>
           <div id="dashboardLoading" class="dashboard-state" hidden>Loading dashboard…</div>
           <div id="dashboardError" class="dashboard-state dashboard-state-error" hidden></div>
           <div id="dashboardEmpty" class="empty-state" hidden>No log data found for the selected filters.</div>
@@ -223,6 +248,29 @@
             <div id="contextList" class="context-list" aria-live="polite"></div>
           </section>
           <div id="resultsView">
+          <div id="logsBody" class="logs-body">
+          <!-- Field sidebar: top values of each field under the current filters -->
+          <aside id="fieldSidebar" class="field-sidebar" aria-label="Field values">
+            <div class="field-sidebar-head">
+              <span class="field-sidebar-title">Fields <span id="fieldExcludedCount" class="field-excluded-count" hidden></span></span>
+              <button id="fieldSidebarToggle" type="button" class="ghost field-sidebar-toggle" aria-expanded="true" aria-controls="fieldSidebarBody" title="Hide fields" aria-label="Hide fields">‹</button>
+            </div>
+            <div id="fieldSidebarBody" class="field-sidebar-body">
+              <div class="field-sidebar-hint">Click a value to filter · Alt- or Shift-click to exclude it</div>
+              <div id="fieldList" class="field-list" aria-live="polite"></div>
+            </div>
+          </aside>
+          <div class="logs-main">
+          <!-- Histogram: entries over the selected range, stacked by severity -->
+          <section id="histogram" class="histogram" aria-label="Entries over time">
+            <div class="histogram-head">
+              <span id="histogramSummary" class="subtle">Loading…</span>
+              <button id="histogramReset" type="button" class="link-btn" hidden>Reset range</button>
+            </div>
+            <div id="histogramBars" class="histogram-bars" title="Drag across bars to select a range; click a bar to zoom to it"></div>
+            <div class="histogram-axis"><span id="histogramFrom"></span><span id="histogramTo"></span></div>
+            <div id="histogramTooltip" class="histogram-tooltip" role="status" hidden></div>
+          </section>
           <div class="table-head">
             <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
           </div>
@@ -243,6 +291,8 @@
           </div>
           <div class="pager">
             <button id="loadMore">Load older</button>
+          </div>
+          </div>
           </div>
           </div>
         </div>
@@ -386,6 +436,40 @@
        <button id="confirmExecuteBtn" type="button" class="destructive-btn">
   Execute
 </button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="saveViewModal" class="confirm-modal view-modal">
+    <form method="dialog" class="confirm-modal-box view-modal-box" novalidate>
+      <div class="confirm-modal-head">
+        <h3 id="saveViewTitle">Save view</h3>
+      </div>
+      <label class="view-field">Name
+        <input id="saveViewName" type="text" maxlength="80" required autocomplete="off" />
+      </label>
+      <label class="view-field">Description <span class="muted">(optional)</span>
+        <textarea id="saveViewDescription" maxlength="500" rows="3"></textarea>
+      </label>
+      <label class="toggle view-pin"><input id="saveViewPinned" type="checkbox" /> Pin to the dashboard</label>
+      <div id="saveViewError" class="views-error" role="alert" hidden></div>
+      <div class="confirm-modal-actions">
+        <button id="saveViewCancel" type="button" class="ghost">Cancel</button>
+        <button id="saveViewAsNew" type="button" class="ghost">Save as new</button>
+        <button id="saveViewSubmit" type="button" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="deleteViewModal" class="confirm-modal">
+    <form method="dialog" class="confirm-modal-box">
+      <div class="confirm-modal-head">
+        <h3>Delete view</h3>
+      </div>
+      <p id="deleteViewText" class="confirm-modal-text"></p>
+      <div class="confirm-modal-actions">
+        <button id="deleteViewCancel" type="button" class="ghost">Cancel</button>
+        <button id="deleteViewConfirm" type="button" class="destructive-btn">Delete</button>
       </div>
     </form>
   </dialog>

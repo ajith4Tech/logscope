@@ -15,7 +15,11 @@ from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs, urlparse, urlsplit
+
+from logscope.resources import default_server_config, ui_asset
+from logscope.version import __version__
 
 from .actions import (
     ActionBusy,
@@ -31,7 +35,8 @@ from .config import AppConfig, load_app_config
 from .ingest import S3Ingestor
 from .insights import AnomalyStore, InsightsJob
 from .notify import MattermostNotifier
-from .storage import MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
+from .state import SavedViews, StateDB, ViewError, ViewNotFound, default_state_db_path
+from .storage import FILTER_FIELDS, MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
 
 _EXPLAIN_CACHE_TTL = 300  # seconds — reuse cached answer for same filter set
 _EXPLAIN_SAMPLE_SIZE = 50  # max log lines sent to the AI
@@ -57,6 +62,10 @@ _FTS_MIGRATION_RETRY_SECS = 60
 _FTS_MIGRATION_RETRY_MAX_SECS = 1800
 # Filter values longer than this are rejected (400); searches are short.
 _MAX_QUERY_PARAM_CHARS = 1000
+# Search modes: "phrase" (default; words matched as written) or "raw" FTS5
+# query syntax. Values per exclusion parameter (xns, xpod, ...).
+_SEARCH_MODES = frozenset({"phrase", "raw"})
+_MAX_EXCLUDED_VALUES = 50
 # Cached AI answers kept per cache (oldest dropped first).
 _EXPLAIN_CACHE_MAX_ENTRIES = 256
 # HTTP requests handled at once; more get an immediate 503 instead of a
@@ -80,10 +89,6 @@ _SECURITY_HEADERS = (
 
 logger = logging.getLogger("logscope.webapp")
 access_logger = logging.getLogger("logscope.access")
-
-
-ROOT = Path(__file__).resolve().parents[2]
-UI_DIR = ROOT / "webapp" / "ui"
 
 
 def _json_bytes(payload: dict) -> bytes:
@@ -286,6 +291,7 @@ class LogscopeHandler(BaseHTTPRequestHandler):
     def end_headers(self) -> None:
         for name, value in _SECURITY_HEADERS:
             self.send_header(name, value)
+        self.send_header("X-Logscope-Version", __version__)
         super().end_headers()
 
     def _send_json(self, payload: dict, status: int = 200, headers: dict[str, str] | None = None) -> None:
@@ -357,8 +363,9 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, ValueError):
             return {}
 
-    def _serve_asset(self, path: Path, content_type: str) -> None:
-        if not path.exists():
+    def _serve_asset(self, name: str, content_type: str) -> None:
+        path = ui_asset(name)  # source checkout, installed package or PyInstaller bundle
+        if not path.is_file():
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         data = path.read_bytes()
@@ -415,6 +422,57 @@ class LogscopeHandler(BaseHTTPRequestHandler):
     def do_PATCH(self):  # noqa: N802
         self._guarded(self._handle_patch, state_changing=True)
 
+    def do_DELETE(self):  # noqa: N802
+        self._guarded(self._handle_delete, state_changing=True)
+
+    def _view_route(self, path: str) -> tuple[bool, int | None, str | None]:
+        """/api/views[/<id>[/<action>]] -> (matched, id, action). An id that is
+        not a storable integer matches with id None (answered with 404)."""
+        parts = path.strip("/").split("/")
+        if parts[:2] != ["api", "views"] or len(parts) > 4:
+            return False, None, None
+        if len(parts) == 2:
+            return True, None, None
+        try:
+            view_id = _bounded_int(parts[2], "id") if parts[2].isdigit() else None
+        except ValueError:
+            view_id = None
+        return True, view_id, parts[3] if len(parts) == 4 else None
+
+    def _handle_views(self, method: str, path: str) -> bool:
+        """Saved views. Returns False when the path is not a views route.
+        Errors: 404 unknown view, 409 duplicate name, 422 invalid field."""
+        matched, view_id, action = self._view_route(path)
+        if not matched:
+            return False
+        views = self.server.app.views
+        try:
+            if view_id is None and path.strip("/") != "api/views":
+                raise ViewNotFound("Saved view not found")
+            if action is None and view_id is None and method == "GET":
+                self._send_json({"views": views.list()})
+            elif action is None and view_id is None and method == "POST":
+                self._send_json({"view": views.create(self._read_body_json())}, status=201)
+            elif action is None and view_id is not None and method == "GET":
+                self._send_json({"view": views.get(view_id)})
+            elif action is None and view_id is not None and method == "PATCH":
+                self._send_json({"view": views.update(view_id, self._read_body_json())})
+            elif action is None and view_id is not None and method == "DELETE":
+                views.delete(view_id)
+                self._send_json({"ok": True, "id": view_id})
+            elif action == "use" and view_id is not None and method == "POST":
+                self._send_json({"view": views.mark_used(view_id)})
+            elif action not in (None, "use"):
+                raise ViewNotFound("Not found")
+            else:
+                self._send_json({"error": "Method not allowed"}, status=405)
+        except ViewError as exc:
+            payload = {"error": str(exc)}
+            if exc.field:
+                payload["field"] = exc.field
+            self._send_json(payload, status=exc.status)
+        return True
+
     def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -435,19 +493,25 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status=200 if ready else 503)
             return
         if parsed.path in ("/", "/index.html"):
-            self._serve_asset(UI_DIR / "index.html", "text/html; charset=utf-8")
+            self._serve_asset("index.html", "text/html; charset=utf-8")
             return
         if parsed.path == "/app.js":
-            self._serve_asset(UI_DIR / "app.js", "application/javascript; charset=utf-8")
+            self._serve_asset("app.js", "application/javascript; charset=utf-8")
             return
         if parsed.path == "/styles.css":
-            self._serve_asset(UI_DIR / "styles.css", "text/css; charset=utf-8")
+            self._serve_asset("styles.css", "text/css; charset=utf-8")
             return
         if parsed.path == "/api/status":
             self._send_json(app.status())
             return
         if parsed.path == "/api/facets":
             self._send_json(app.storage.query_facets(_query_params(params)))
+            return
+        if parsed.path == "/api/fields":
+            self._send_json(app.storage.query_fields(_query_params(params)))
+            return
+        if parsed.path == "/api/histogram":
+            self._send_json(app.storage.query_histogram(_query_params(params)))
             return
         if parsed.path == "/api/dashboard":
             self._send_json(app.api_dashboard(params))
@@ -463,6 +527,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/api/anomalies":
             self._send_json(app.api_anomalies(params))
+            return
+        if self._handle_views("GET", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -540,6 +606,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
+        if self._handle_views("POST", parsed.path):
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _handle_patch(self) -> None:
@@ -568,17 +636,41 @@ class LogscopeHandler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, "id": anomaly_id, "status": status})
             return
+        if self._handle_views("PATCH", parsed.path):
+            return
+        self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _handle_delete(self) -> None:
+        if self._handle_views("DELETE", urlparse(self.path).path):
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
 
-def _query_params(params: dict[str, list[str]]) -> dict[str, str]:
-    out: dict[str, str] = {}
+def _query_params(params: dict[str, list[str]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
     for key in ("scope", "namespace", "pod", "container", "severity_bucket", "start", "end", "before", "q"):
         value = _first(params, key)
         if value:
             if len(value) > _MAX_QUERY_PARAM_CHARS:
                 raise ValueError(f"'{key}' is longer than {_MAX_QUERY_PARAM_CHARS} characters")
             out[key] = value
+    qmode = _first(params, "qmode")
+    if qmode:
+        if qmode not in _SEARCH_MODES:
+            raise ValueError(f"'qmode' must be one of {sorted(_SEARCH_MODES)}")
+        if qmode == "raw":  # phrase is the default; leaving it out keeps cache keys stable
+            out["qmode"] = qmode
+    for _field, key in FILTER_FIELDS:
+        # Values to leave out: repeated parameters and/or comma-separated
+        # (Kubernetes names, scopes and severities never contain commas).
+        values = sorted({v.strip() for raw in params.get(key, []) for v in raw.split(",") if v.strip()})
+        if not values:
+            continue
+        if len(values) > _MAX_EXCLUDED_VALUES:
+            raise ValueError(f"'{key}' lists more than {_MAX_EXCLUDED_VALUES} values")
+        if any(len(v) > _MAX_QUERY_PARAM_CHARS for v in values):
+            raise ValueError(f"A '{key}' value is longer than {_MAX_QUERY_PARAM_CHARS} characters")
+        out[key] = values
     return out
 
 
@@ -629,6 +721,9 @@ class WebApp:
         # Optional Mattermost notifications; own thread and connection, so a
         # slow webhook never delays ingestion or detection.
         self.notifier = MattermostNotifier(cfg, cfg.webapp.db_path)
+        # Saved views live in the durable state database, not the cache.
+        self.state_db = StateDB(cfg.webapp.state_db_path or default_state_db_path())
+        self.views = SavedViews(self.state_db)
         # Server-side explain caches: filter-set explain and per-line explain
         self._explain_cache: dict[str, tuple[dict, float]] = {}
         self._explain_line_cache: dict[int, tuple[dict, float]] = {}
@@ -772,6 +867,7 @@ class WebApp:
                 "database_error": f"{type(exc).__name__}: {exc}"[:300],
                 "ingest": {"state": "unknown", "poll_interval_secs": self.cfg.webapp.poll_interval_secs},
             }
+        status["version"] = __version__
         status["ai_configured"] = self.ai_configured()
         status["actions_enabled"] = self.actions_enabled
         status["insights"] = self.insights.status()
@@ -943,16 +1039,16 @@ class WebApp:
         return result
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the Logscope web app")
-    parser.add_argument("--config", default=str(ROOT / "config.yaml"))
+def build_parser(prog: str | None = None) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog=prog, description="Run the Logscope web app")
+    parser.add_argument("--config", default=str(default_server_config()))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def main(argv: list[str] | None = None, prog: str | None = None) -> None:
+    args = build_parser(prog).parse_args(argv)
     logging.basicConfig(
         level=os.environ.get("LOGSCOPE_LOG_LEVEL", "INFO").upper(),
         stream=sys.stderr,
@@ -969,7 +1065,7 @@ def main() -> None:
     try:
         app = WebApp(cfg, extra_trusted_hosts=extra_hosts)
     except (OSError, sqlite3.Error, ValueError) as exc:
-        logger.error("Cannot open database %s: %s", cfg.webapp.db_path, exc)
+        logger.error("Cannot open database %s or %s: %s", cfg.webapp.db_path, cfg.webapp.state_db_path, exc)
         sys.exit(2)
     app.start()
     server = AppHTTPServer((args.host, args.port), LogscopeHandler, app)
@@ -982,8 +1078,8 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _shutdown)
     try:
         logger.info(
-            "Logscope web app listening on http://%s:%s (bucket region %s, db %s, actions %s, AI %s)",
-            args.host, args.port, cfg.s3_region, cfg.webapp.db_path,
+            "Logscope %s web app listening on http://%s:%s (bucket region %s, db %s, actions %s, AI %s)",
+            __version__, args.host, args.port, cfg.s3_region, cfg.webapp.db_path,
             "enabled" if app.actions_enabled else "disabled",
             "configured" if app.ai_configured() else "not configured",
         )
