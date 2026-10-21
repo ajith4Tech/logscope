@@ -243,6 +243,63 @@ From a source checkout the same commands run as `python3 -m logscope ...`
 (`python3 -m webapp.api.server`, `python -m webapp.api.dbtool`,
 `scripts/render.py`, `scripts/apply_s3_lifecycle.py`).
 
+### AI cost
+
+AI is optional, and most requests never reach a provider. Every explanation
+(one line, the filtered logs, an anomaly) is answered by the cheapest source
+first. The UI shows which one answered and how old the answer is:
+
+1. **Signature**: about 40 built-in known patterns, such as OOMKilled,
+   CrashLoopBackOff, image pull errors, probes, DNS, TLS, ENOSPC, PostgreSQL
+   errors, Go/Python/Java crashes and the common Falco rules
+   (`webapp/api/signatures.yaml`). These answers are free. Click **Ask AI
+   anyway** for a model answer instead. You can add your own rules under
+   `webapp.ai.signatures` (same format). They are validated at startup,
+   including that every command is a supported read-only kubectl
+   diagnostic.
+2. **Cache**: answers are stored per log template, which is the message
+   with numbers, ids, IPs, timestamps, pod hashes and so on replaced. A
+   second pod or IP with the same error reuses the answer. Answers are kept
+   for 7 days (`webapp.ai.cache_ttl_hours`) and survive restarts.
+   - **Regenerate** asks the AI again.
+   - 👎 drops the cached answer.
+3. **AI**: one call with a compact input. Filtered explanations and anomaly
+   summaries send the top 15 templates with counts and 3 redacted exemplars,
+   not raw lines (about a third of the tokens on the test fixture).
+   - Identical requests in flight share one call.
+   - The static prompt comes first, so provider prompt caching applies
+     (Anthropic `cache_control`; OpenAI and Gemini cache the stable prefix
+     implicitly).
+   - **Deep analysis** uses `deep_model`, with its own cache and its own
+     `daily_calls.deep_analysis` budget.
+
+Anomalies show a free template summary: what changed, counts against the
+baseline, top templates and the matching signature. The AI summary runs on
+click. With the `anomaly_auto_summary` flag on (default off), anomalies at or
+above `webapp.ai.auto_summary_min_urgency` (default `urgent`) are summarized
+by a background queue. The queue runs 2 workers and batches up to 5 anomalies
+per call. Over budget, a batch is dropped. Anomaly detection never waits for
+the queue.
+
+**Zero-cost option: a local model.** Any OpenAI-compatible server on
+`localhost` works, for example [Ollama](https://ollama.com) (`ollama serve`,
+`ollama pull llama3.1:8b`). In Settings, or in config, set:
+
+```yaml
+webapp:
+  ai:
+    provider: openai
+    model: llama3.1:8b
+    base_url: http://localhost:11434/v1   # http is allowed only for localhost
+    prices: {"llama3.1:8b": {input: 0, output: 0}}   # optional: shows $0 instead of "unknown"
+```
+
+A local endpoint needs no API key. In Kubernetes, `localhost` means the
+web app pod itself, so run the model as a sidecar or add its Service host to
+`ai.allowedHosts` (that requires https). Small local models give weaker
+troubleshooting plans than hosted ones. The usage panel shows each source's
+share (AI calls, cache hits, signature hits) and the token cost.
+
 ### Binary
 
 One self-contained file per architecture (PyInstaller; Python and all

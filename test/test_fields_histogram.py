@@ -323,4 +323,5 @@ def test_http_explain_receives_exclusions(server, monkeypatch):
     conn.close()
     assert res.status == 200
     assert seen["filters"] == {"xns": ["app", "billing"]}
-    assert {row["namespace"] for row in seen["log_sample"]} == {"kube-system"}
+    # Compact input: templates of the sample (namespace patterns), not raw rows.
+    assert seen["templates"] and {t["namespace"] for t in seen["templates"]} == {"kube-system"}

@@ -1,0 +1,821 @@
+# Built-in signatures: known log patterns answered without an AI call.
+#
+# Each rule: id, match (message: regex on the log message, and/or
+# falco_rule: regex on a Falco event's rule name; case-insensitive), severity
+# (hint: error | warning | info), title, explanation, steps [{title, command,
+# explanation, risk}]. Commands may use {namespace}, {pod} and {container},
+# filled from the log record; a step whose placeholders cannot be filled is
+# shown without its command. Every command must be a registered read-only
+# kubectl diagnostic (webapp/api/actions.py); test_signatures.py checks this.
+#
+# Rules are tried in order; the first match wins, so specific rules come
+# before generic ones. Operators add rules with webapp.ai.signatures in
+# config.yaml (tried after these).
+
+rules:
+  # ── Pod lifecycle ──────────────────────────────────────────────────────────
+  - id: oom-killed
+    match:
+      message: '\bOOMKilled\b|exit(?:ed)? (?:with )?code:? 137\b|exitCode:? ?137\b|Out of memory: Kill(?:ed)? process|Memory cgroup out of memory'
+    severity: error
+    title: Container killed for exceeding its memory limit (OOMKilled, exit 137)
+    explanation: >-
+      The kernel's OOM killer stopped the container because it used more memory than its limit
+      (exit code 137 = SIGKILL). Either the limit is too low for the workload or the process leaks
+      memory. Compare the memory limit with actual usage before the kill, and check whether the
+      restarts line up with load.
+    steps:
+      - title: Check the last termination reason and limits
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows Last State (OOMKilled), restart count and the container's memory limit.
+        risk: read-only
+      - title: Read the logs from before the kill
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 200
+        explanation: The previous instance's last lines often show what was allocating memory.
+        risk: read-only
+      - title: Look for related events
+        command: kubectl -n {namespace} get events --field-selector involvedObject.name={pod}
+        explanation: Lists OOM and restart events for this pod in order.
+        risk: read-only
+
+  - id: crashloop-backoff
+    match:
+      message: 'CrashLoopBackOff|Back-off restarting failed container'
+    severity: error
+    title: Container keeps crashing (CrashLoopBackOff)
+    explanation: >-
+      The container exits shortly after starting and the kubelet waits longer between each restart.
+      The cause is in the container's own output or exit code: a crash at startup, a missing config
+      or secret, a failing dependency, or a killed process (OOM, failed liveness probe).
+    steps:
+      - title: See the exit code and last state
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Last State shows the exit code and reason of the previous run.
+        risk: read-only
+      - title: Read the crashed instance's output
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 200
+        explanation: The logs of the run that crashed usually name the error.
+        risk: read-only
+      - title: Check the pod's events
+        command: kubectl -n {namespace} get events --field-selector involvedObject.name={pod}
+        explanation: Shows probe failures, OOM kills or mount errors around the restarts.
+        risk: read-only
+
+  - id: image-pull
+    match:
+      message: 'ImagePullBackOff|ErrImagePull|Failed to pull image|ErrImageNeverPull|InvalidImageName|manifest unknown|pull access denied'
+    severity: error
+    title: Image cannot be pulled (ImagePullBackOff / ErrImagePull)
+    explanation: >-
+      The node could not download the container image: the name or tag is wrong, the registry
+      requires credentials (imagePullSecrets) that are missing or invalid, the registry is
+      unreachable from the node, or a rate limit was hit.
+    steps:
+      - title: See the exact pull error
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: The Events section quotes the registry's answer (not found, unauthorized, timeout).
+        risk: read-only
+      - title: Check the image reference and pull secrets
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows the image name/tag and imagePullSecrets the pod uses.
+        risk: read-only
+
+  - id: liveness-probe
+    match:
+      message: 'Liveness probe failed'
+    severity: warning
+    title: Liveness probe failing (the container will be restarted)
+    explanation: >-
+      The kubelet's liveness check did not get a healthy answer in time; after failureThreshold
+      failures the container is restarted. Common causes: the app is overloaded or deadlocked, the
+      probe's timeout is too short, or the probe path/port is wrong.
+    steps:
+      - title: Check probe settings and restart count
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the probe definition, failures and restarts.
+        risk: read-only
+      - title: Read the app's logs around the failures
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Slow requests or errors near the failures explain why the probe timed out.
+        risk: read-only
+
+  - id: readiness-probe
+    match:
+      message: 'Readiness probe failed'
+    severity: warning
+    title: Readiness probe failing (pod removed from Service endpoints)
+    explanation: >-
+      The pod does not pass its readiness check, so it receives no Service traffic until it does.
+      The container is not restarted. Usually the app is still starting, a dependency it checks is
+      down, or the probe is misconfigured.
+    steps:
+      - title: Check the probe and its failures
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the readiness probe, the failure message and the Ready condition.
+        risk: read-only
+      - title: Read the app's recent logs
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Errors about dependencies or startup show why it reports not ready.
+        risk: read-only
+
+  - id: startup-probe
+    match:
+      message: 'Startup probe failed'
+    severity: warning
+    title: Startup probe failing (slow or failed start)
+    explanation: >-
+      The container did not finish starting within the startup probe's budget
+      (failureThreshold × periodSeconds) and will be restarted. Either startup is slower than allowed
+      or the app fails during initialization.
+    steps:
+      - title: Check the probe budget and events
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Compare the probe budget with how long the container has been starting.
+        risk: read-only
+      - title: Read the startup output
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows how far initialization got.
+        risk: read-only
+
+  - id: failed-scheduling
+    match:
+      message: 'FailedScheduling|\d+/\d+ nodes are available|Insufficient (?:cpu|memory|ephemeral-storage)|didn''t match (?:Pod''s )?node affinity|untolerated taint'
+    severity: warning
+    title: Pod cannot be scheduled
+    explanation: >-
+      No node satisfies the pod's requirements: not enough free CPU or memory for its requests,
+      node selectors or affinity that match no node, taints it does not tolerate, or an unbound
+      PersistentVolumeClaim. The scheduler's message lists the reason per node group.
+    steps:
+      - title: Read the scheduler's reasons
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: The FailedScheduling event explains why each node was rejected.
+        risk: read-only
+      - title: Check pending pods in the namespace
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: Shows how many pods are Pending and where the others run.
+        risk: read-only
+
+  - id: evicted
+    match:
+      message: '\bEvicted\b|The node was low on resource|node had condition: \[(?:Disk|Memory|PID)Pressure\]'
+    severity: warning
+    title: Pod evicted under node resource pressure
+    explanation: >-
+      The kubelet evicted the pod because the node ran low on memory, disk or PIDs. Pods using more
+      than their requests are evicted first. The message names the resource and the container that
+      used the most.
+    steps:
+      - title: See the eviction message
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Status message names the starved resource and the usage that triggered it.
+        risk: read-only
+      - title: List pods and their nodes
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: Shows whether evictions cluster on one node.
+        risk: read-only
+
+  - id: failed-mount
+    match:
+      message: 'FailedMount|Unable to attach or mount volumes|MountVolume\.\w+ failed|FailedAttachVolume|timed out waiting for the condition.*volume'
+    severity: error
+    title: Volume cannot be mounted
+    explanation: >-
+      The kubelet could not attach or mount one of the pod's volumes: a missing ConfigMap/Secret,
+      a PVC that is not bound, a volume still attached to another node (ReadWriteOnce), or a
+      storage driver error.
+    steps:
+      - title: See which volume fails and why
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: The FailedMount event names the volume and the error.
+        risk: read-only
+      - title: Check namespace events for the volume
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Attach/detach and provisioning events appear here.
+        risk: read-only
+
+  - id: node-not-ready
+    match:
+      message: 'NodeNotReady|node "?[\w.-]+"? (?:is )?not ready|Kubelet stopped posting node status'
+    severity: error
+    title: Node not ready
+    explanation: >-
+      A node stopped reporting healthy: the kubelet is down, the node lost network to the control
+      plane, or it is under resource pressure. Pods on it are evicted after the toleration period.
+    steps:
+      - title: Find affected pods
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: Shows which pods run on the node that went NotReady.
+        risk: read-only
+      - title: Read recent events
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Shows NodeNotReady and the resulting evictions in order.
+        risk: read-only
+
+  # ── Network ────────────────────────────────────────────────────────────────
+  - id: dns-failure
+    match:
+      message: 'NXDOMAIN|no such host|Temporary failure in name resolution|Name or service not known|EAI_AGAIN|getaddrinfo ENOTFOUND|could not resolve host'
+    severity: error
+    title: DNS name cannot be resolved
+    explanation: >-
+      A host name did not resolve. Either the name is wrong (typo, wrong namespace in a
+      <service>.<namespace>.svc name, a Service that does not exist) or cluster DNS (CoreDNS) is
+      failing or unreachable from the pod.
+    steps:
+      - title: Check the pod's configuration for the host name
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Environment variables and config show which name the app looks up.
+        risk: read-only
+      - title: Look for related errors in the app's logs
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows which name fails and how often.
+        risk: read-only
+
+  - id: connection-refused
+    match:
+      message: 'connection refused|ECONNREFUSED|actively refused'
+    severity: error
+    title: Connection refused by the target
+    explanation: >-
+      The target address answered but nothing listens on that port: the destination pod is down,
+      restarting or not yet ready, the Service has no ready endpoints, or the port is wrong.
+    steps:
+      - title: Check the calling pod's view
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows the address and port being refused and since when.
+        risk: read-only
+      - title: Check pods in the namespace
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: A target pod that is restarting or not ready explains refused connections.
+        risk: read-only
+
+  - id: connection-timeout
+    match:
+      message: 'i/o timeout|context deadline exceeded|ETIMEDOUT|connection timed out|Connection timed out|read timeout|timed out after \d+'
+    severity: error
+    title: Network call timed out
+    explanation: >-
+      A request got no answer in time: the destination is overloaded or hung, a NetworkPolicy or
+      firewall drops the traffic, or the destination is unreachable. Repeated timeouts to one
+      address point at that service; timeouts to many point at the network or this pod.
+    steps:
+      - title: See which calls time out
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows the destination and timing of the timeouts.
+        risk: read-only
+      - title: Check the namespace's recent events
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Restarts or probe failures of the destination show up here.
+        risk: read-only
+
+  - id: connection-reset
+    match:
+      message: 'connection reset by peer|ECONNRESET|broken pipe|EPIPE|unexpected EOF'
+    severity: warning
+    title: Connection reset or closed by the other side
+    explanation: >-
+      The remote side closed the connection mid-request: it restarted, hit an idle or request
+      timeout, or a proxy/load balancer dropped the connection. Isolated resets during deployments
+      are normal; a steady stream is not.
+    steps:
+      - title: Correlate with restarts
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: Resets that line up with restarts of the peer have a simple cause.
+        risk: read-only
+      - title: Read surrounding log lines
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows which peer resets and how often.
+        risk: read-only
+
+  - id: address-in-use
+    match:
+      message: 'address already in use|EADDRINUSE|bind: address'
+    severity: error
+    title: Port already in use
+    explanation: >-
+      The process tried to listen on a port that is taken: two processes in the container (or two
+      containers in the pod) use the same port, or hostNetwork/hostPort collides with something on
+      the node.
+    steps:
+      - title: Check the pod's ports
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows containerPort, hostPort and hostNetwork settings.
+        risk: read-only
+      - title: Read the startup output
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 100
+        explanation: Shows which port and process failed to bind.
+        risk: read-only
+
+  - id: upstream-unavailable
+    match:
+      message: 'no healthy upstream|upstream connect error|503 Service Unavailable|502 Bad Gateway|upstream prematurely closed'
+    severity: error
+    title: Proxy has no healthy upstream (502/503)
+    explanation: >-
+      A proxy or ingress could not reach a healthy backend: the backend pods are not ready, the
+      Service selects no pods, or they are crashing. Check the backend rather than the proxy.
+    steps:
+      - title: Check backend pods
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: Not-ready or restarting backends cause 502/503.
+        risk: read-only
+      - title: Read recent events
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Probe failures and restarts of the backends show up here.
+        risk: read-only
+
+  - id: tls-certificate
+    match:
+      message: 'x509:|certificate has expired|certificate is not yet valid|certificate verify failed|unknown authority|certificate signed by unknown|tls: handshake failure|SSL routines|SSLError|PKIX path building failed'
+    severity: error
+    title: TLS certificate problem
+    explanation: >-
+      A TLS handshake failed: the server's certificate is expired or not yet valid, it is signed
+      by a CA the client does not trust (missing CA bundle in the image), or the host name does not
+      match the certificate. Clock skew on the node can also cause validity errors.
+    steps:
+      - title: Read the full TLS error
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The error names the host and whether it is expiry, trust or name mismatch.
+        risk: read-only
+      - title: Check mounted CA bundles and certificates
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows mounted Secrets/ConfigMaps that hold certificates or CA bundles.
+        risk: read-only
+
+  # ── Resources ──────────────────────────────────────────────────────────────
+  - id: disk-full
+    match:
+      message: 'No space left on device|ENOSPC|disk full|could not extend file|DiskPressure'
+    severity: error
+    title: Disk full (ENOSPC)
+    explanation: >-
+      A write failed because the filesystem is full: the container's writable layer or an emptyDir
+      (node disk), or a PersistentVolume. Find which mount is full; growing logs, temp files and
+      database WAL are common causes.
+    steps:
+      - title: Check volumes and limits
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows volumes, ephemeral-storage limits and eviction messages.
+        risk: read-only
+      - title: Read the failing writes
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The error usually names the path being written.
+        risk: read-only
+
+  - id: too-many-open-files
+    match:
+      message: 'too many open files|EMFILE|ENFILE'
+    severity: error
+    title: File descriptor limit reached (too many open files)
+    explanation: >-
+      The process hit its open-file limit (files and sockets). Usually a connection or file-handle
+      leak, or a limit (ulimit -n) too low for the load. Watch whether it recurs after restarts at
+      the same load.
+    steps:
+      - title: Read the app's logs before the error
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows what was being opened (sockets, files) when the limit was hit.
+        risk: read-only
+      - title: Check restarts and resource settings
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Restart history shows whether the leak builds up over time.
+        risk: read-only
+
+  - id: permission-denied
+    match:
+      message: 'permission denied|EACCES|Operation not permitted|EPERM|Access is denied'
+    severity: error
+    title: Permission denied
+    explanation: >-
+      The process lacks permission for a file, socket or system call: it runs as a non-root user
+      (runAsUser, fsGroup) that cannot access a mounted path, the root filesystem is read-only, or
+      a capability/seccomp setting blocks the call.
+    steps:
+      - title: Check the security context and mounts
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows runAsUser, fsGroup, readOnlyRootFilesystem and volume mounts.
+        risk: read-only
+      - title: See which path or call is denied
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The error names the path or operation.
+        risk: read-only
+
+  - id: rbac-forbidden
+    match:
+      message: 'is forbidden: User "[^"]+" cannot|forbidden: .*cannot (?:get|list|watch|create|update|patch|delete)'
+    severity: error
+    title: Kubernetes API call forbidden (RBAC)
+    explanation: >-
+      The pod's ServiceAccount is not allowed to perform this API call. The message names the user
+      (service account), verb, resource and namespace that a Role/RoleBinding would need to grant.
+    steps:
+      - title: Check which ServiceAccount the pod uses
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: spec.serviceAccountName is the identity in the error.
+        risk: read-only
+      - title: Read the denied calls
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Lists every verb/resource the app was refused.
+        risk: read-only
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  - id: postgres-auth-failed
+    match:
+      message: 'password authentication failed for user|no pg_hba\.conf entry for host|role "[^"]+" does not exist'
+    severity: error
+    title: PostgreSQL authentication failed
+    explanation: >-
+      A client could not log in: wrong password (often a Secret that was rotated in the database but
+      not in the client, or the reverse), a user that does not exist, or a pg_hba.conf rule that
+      rejects the client's address or auth method.
+    steps:
+      - title: Find the client being rejected
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The server log names the user, database and client address.
+        risk: read-only
+      - title: Check recent changes in the namespace
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Restarts after a Secret change often line up with the failures.
+        risk: read-only
+
+  - id: postgres-too-many-connections
+    match:
+      message: 'too many clients already|remaining connection slots are reserved|too many connections for role|sorry, too many clients'
+    severity: error
+    title: PostgreSQL connection limit reached
+    explanation: >-
+      The server refused new connections because max_connections (or a per-role limit) is
+      reached. Usually clients open more connections than needed (missing or oversized pools,
+      leaked connections, many replicas each with a pool) rather than the limit being too low.
+    steps:
+      - title: See when the limit is hit
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Shows how often connections are refused and for which users.
+        risk: read-only
+      - title: Check how many client pods run
+        command: kubectl -n {namespace} get pods -o wide
+        explanation: More replicas × pool size can exceed max_connections after a scale-up.
+        risk: read-only
+
+  - id: postgres-duplicate-key
+    match:
+      message: 'duplicate key value violates unique constraint'
+    severity: warning
+    title: PostgreSQL unique constraint violation (duplicate key)
+    explanation: >-
+      An INSERT or UPDATE would create a duplicate in a unique index. This is an application-level
+      error: a retried request, a race between two writers, or a sequence that is behind the table
+      after a restore. The constraint name says which table/column.
+    steps:
+      - title: See which constraint and how often
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The DETAIL line names the key; frequency tells a race from a one-off.
+        risk: read-only
+
+  - id: postgres-deadlock
+    match:
+      message: 'deadlock detected'
+    severity: warning
+    title: PostgreSQL deadlock detected
+    explanation: >-
+      Two transactions waited on each other's locks and PostgreSQL aborted one. Usually two code
+      paths update the same rows in a different order; the DETAIL lines name the processes and
+      relations. The aborted transaction should be retried by the client.
+    steps:
+      - title: Read the deadlock details
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 300
+        explanation: DETAIL and CONTEXT lines show the competing statements and locked relations.
+        risk: read-only
+
+  - id: postgres-relation-missing
+    match:
+      message: 'relation "[^"]+" does not exist|column "[^"]+" (?:of relation "[^"]+" )?does not exist'
+    severity: error
+    title: PostgreSQL table or column does not exist
+    explanation: >-
+      A query refers to a table or column that is not in the database it connected to: migrations
+      have not run (or ran against another database/schema), the search_path differs, or the app
+      version and schema version do not match after a deployment.
+    steps:
+      - title: See which statement fails
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: The STATEMENT line shows the query and the missing name.
+        risk: read-only
+      - title: Check recent rollouts
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: A new app version without its migration is a common cause.
+        risk: read-only
+
+  # ── Runtimes ───────────────────────────────────────────────────────────────
+  - id: go-nil-pointer
+    match:
+      message: 'invalid memory address or nil pointer dereference'
+    severity: error
+    title: Go nil pointer dereference (panic)
+    explanation: >-
+      The Go program used a nil pointer, map or interface and panicked; the process exits unless
+      the panic is recovered. The stack trace right after this line shows the function and line.
+    steps:
+      - title: Read the full stack trace
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 300
+        explanation: The goroutine trace after the panic names the failing function and file:line.
+        risk: read-only
+      - title: Check restarts
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Restart count shows how often the panic recurs.
+        risk: read-only
+
+  - id: go-panic
+    match:
+      message: '^panic: |goroutine \d+ \[running\]|fatal error: (?:concurrent map|all goroutines are asleep)'
+    severity: error
+    title: Go panic
+    explanation: >-
+      The Go program panicked. The first line after "panic:" is the reason; the goroutine stack
+      trace that follows shows where. Unrecovered panics crash the container.
+    steps:
+      - title: Read the panic and stack trace
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 300
+        explanation: The previous instance's output holds the whole trace.
+        risk: read-only
+      - title: Check restarts
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows whether the panic causes a crash loop.
+        risk: read-only
+
+  - id: python-traceback
+    match:
+      message: 'Traceback \(most recent call last\)'
+    severity: error
+    title: Python exception (traceback)
+    explanation: >-
+      The Python program raised an exception. The last line of the traceback is the exception type
+      and message; the frames above it lead to the code that raised it. Multi-line tracebacks are
+      one log entry here.
+    steps:
+      - title: Read the complete traceback
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 300
+        explanation: The exception type and message are the last lines of the traceback.
+        risk: read-only
+      - title: Check whether it crashes the container
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Restarts mean the exception was unhandled at the top level.
+        risk: read-only
+
+  - id: java-oom
+    match:
+      message: 'java\.lang\.OutOfMemoryError'
+    severity: error
+    title: Java OutOfMemoryError
+    explanation: >-
+      The JVM ran out of heap (or metaspace / native threads, per the message). Either -Xmx or the
+      container limit is too small for the workload, or objects leak. A heap above ~75% of the
+      container limit also risks an OOMKill from the kernel instead.
+    steps:
+      - title: Check memory limits and restarts
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Compare the container memory limit with the JVM heap settings.
+        risk: read-only
+      - title: Read the logs before the error
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 300
+        explanation: Shows the OOM type (heap, metaspace, threads) and GC activity before it.
+        risk: read-only
+
+  - id: segfault
+    match:
+      message: 'segmentation fault|SIGSEGV|core dumped|exit(?:ed)? (?:with )?code:? 139\b'
+    severity: error
+    title: Process crashed with a segmentation fault (exit 139)
+    explanation: >-
+      The process accessed invalid memory and was killed by SIGSEGV. Typical causes are native
+      library bugs, an image built for another CPU/libc, or memory corruption.
+    steps:
+      - title: Read the crash output
+        command: kubectl -n {namespace} logs {pod} -c {container} --previous --tail 200
+        explanation: Shows what ran just before the crash.
+        risk: read-only
+      - title: Check exit codes and image
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Exit code 139 and the image digest help reproduce it.
+        risk: read-only
+
+  # ── Falco (security) ───────────────────────────────────────────────────────
+  - id: falco-terminal-shell
+    match:
+      falco_rule: '^Terminal shell in container$'
+      message: 'A shell was spawned in a container with an attached terminal|Terminal shell in container'
+    severity: warning
+    title: 'Falco: interactive shell opened in a container'
+    explanation: >-
+      Someone opened a shell with a terminal in a running container (typically kubectl exec -it).
+      This is expected during debugging by an operator, and suspicious otherwise. Check who ran it
+      (Kubernetes audit log) and what the shell did next.
+    steps:
+      - title: Identify the container
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Confirms the workload and image that was entered.
+        risk: read-only
+      - title: Check other activity in the namespace
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Correlate with deployments or debugging sessions at that time.
+        risk: read-only
+
+  - id: falco-sensitive-file
+    match:
+      falco_rule: '^Read sensitive file (?:untrusted|trusted after startup)$'
+      message: 'Sensitive file opened for reading'
+    severity: warning
+    title: 'Falco: sensitive file read (e.g. /etc/shadow)'
+    explanation: >-
+      A process read a file holding credentials (/etc/shadow, /etc/sudoers, private keys). Package
+      managers and auth tools do this legitimately; anything else, especially after startup, needs
+      investigation. The event names the process, user and file.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the image and whether the pod was recently restarted or changed.
+        risk: read-only
+      - title: Review the container's recent output
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Look for activity around the event time.
+        risk: read-only
+
+  - id: falco-write-below-etc
+    match:
+      falco_rule: '^Write below etc$'
+      message: 'File below /etc opened for writing'
+    severity: warning
+    title: 'Falco: file written below /etc'
+    explanation: >-
+      A process modified configuration under /etc at runtime. Containers should treat /etc as
+      immutable; legitimate exceptions are entrypoints that render config. Unexpected writes can
+      indicate persistence or tampering.
+    steps:
+      - title: Identify the workload and image
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Check whether the image's entrypoint writes config at start.
+        risk: read-only
+
+  - id: falco-write-binary-dir
+    match:
+      falco_rule: '^Write below binary dir$'
+      message: 'File below a known binary directory opened for writing'
+    severity: error
+    title: 'Falco: file written to a binary directory'
+    explanation: >-
+      A process wrote into /bin, /sbin, /usr/bin or similar inside a running container. Outside of
+      image builds this is a strong sign of tampering or a dropped tool.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the image and start time of the affected container.
+        risk: read-only
+      - title: Review recent events
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Correlate with deployments or exec sessions.
+        risk: read-only
+
+  - id: falco-privileged-container
+    match:
+      falco_rule: '^Launch Privileged Container$'
+      message: 'Privileged container started'
+    severity: warning
+    title: 'Falco: privileged container started'
+    explanation: >-
+      A container started with privileged: true, which gives it host-level access. Expected for
+      some system components (CNI, storage, monitoring agents); for application workloads it should
+      be justified.
+    steps:
+      - title: Check the pod's security context
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows privileged, capabilities and host namespaces in use.
+        risk: read-only
+
+  - id: falco-k8s-api-contact
+    match:
+      falco_rule: '^Contact K8S API Server From Container$'
+      message: 'Unexpected connection to K8s API Server from container'
+    severity: warning
+    title: 'Falco: container contacted the Kubernetes API server'
+    explanation: >-
+      A container that is not expected to talk to the API server did. Controllers and operators do
+      this by design; for other workloads it can be reconnaissance with a mounted service account
+      token.
+    steps:
+      - title: Check the ServiceAccount and token mount
+        command: kubectl -n {namespace} get pod {pod} -o yaml
+        explanation: Shows serviceAccountName and automountServiceAccountToken.
+        risk: read-only
+      - title: Review the container's output
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Look for API client activity around the event.
+        risk: read-only
+
+  - id: falco-unexpected-connection
+    match:
+      falco_rule: '^Unexpected (?:outbound|inbound) connection (?:destination|source)$|^Outbound Connection to C2 Servers$'
+      message: 'Disallowed (?:outbound|inbound) connection|Outbound connection to C2 server'
+    severity: warning
+    title: 'Falco: unexpected network connection'
+    explanation: >-
+      A container connected to (or accepted a connection from) an address outside the allowed
+      list. Check whether the destination belongs to a known dependency; unknown external
+      destinations, especially from tools like curl or wget, need investigation.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows which application made the connection.
+        risk: read-only
+      - title: Review the container's output
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Application logs may show the request that caused it.
+        risk: read-only
+
+  - id: falco-drop-and-execute
+    match:
+      falco_rule: '^Drop and execute new binary in container$'
+      message: 'Executing binary not part of base image'
+    severity: error
+    title: 'Falco: binary not in the image was executed'
+    explanation: >-
+      A program that was not part of the container image (written at runtime) was executed. This
+      is a common step of an intrusion; legitimate cases are rare (some JIT/plugin systems).
+    steps:
+      - title: Identify the workload and image
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Note the image digest and start time for the investigation.
+        risk: read-only
+      - title: Review recent namespace events
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Correlate with exec sessions or changes.
+        risk: read-only
+
+  - id: falco-redirect-network
+    match:
+      falco_rule: '^Redirect STDOUT/STDIN to Network Connection in Container$'
+      message: 'Redirect stdout/stdin to network connection'
+    severity: error
+    title: 'Falco: shell I/O redirected to a network connection (reverse shell)'
+    explanation: >-
+      A process connected its standard input/output to a network socket, the pattern of a reverse
+      shell. Treat as a likely compromise unless it is a known tool.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Note the image, node and start time.
+        risk: read-only
+      - title: Review the container's output
+        command: kubectl -n {namespace} logs {pod} -c {container} --tail 200
+        explanation: Look for what ran before the redirect.
+        risk: read-only
+
+  - id: falco-clear-logs
+    match:
+      falco_rule: '^Clear Log Activities$'
+      message: 'Log files were tampered'
+    severity: warning
+    title: 'Falco: log files truncated or cleared'
+    explanation: >-
+      A process truncated or deleted log files, which can hide activity. Log rotation tools do
+      this legitimately; check the process name.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the container whose logs were cleared.
+        risk: read-only
+
+  - id: falco-search-credentials
+    match:
+      falco_rule: '^(?:Search Private Keys or Passwords|Find AWS Credentials)$'
+      message: 'Grep private keys or passwords activities|Find AWS Credentials'
+    severity: warning
+    title: 'Falco: search for private keys or credentials'
+    explanation: >-
+      A process searched the filesystem for private keys, passwords or cloud credentials (grep or
+      find with credential patterns), typical of credential harvesting.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the pod and image involved.
+        risk: read-only
+      - title: Check other activity in the namespace
+        command: kubectl -n {namespace} get events --sort-by .lastTimestamp
+        explanation: Correlate with exec sessions.
+        risk: read-only
+
+  - id: falco-package-management
+    match:
+      falco_rule: '^Launch Package Management Process in Container$'
+      message: 'Package management process launched in container'
+    severity: warning
+    title: 'Falco: package manager run inside a container'
+    explanation: >-
+      apt, yum, apk or pip ran in a running container. Containers should be immutable; installing
+      software at runtime is either a debugging session or an attacker adding tools.
+    steps:
+      - title: Identify the workload
+        command: kubectl -n {namespace} describe pod {pod}
+        explanation: Shows the image and whether an operator was debugging.
+        risk: read-only

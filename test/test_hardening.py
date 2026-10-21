@@ -460,7 +460,7 @@ import socket  # noqa: E402
 import time  # noqa: E402
 
 from webapp.api import server as server_mod  # noqa: E402
-from webapp.api.server import AppHTTPServer, LogscopeHandler, _cache_put  # noqa: E402
+from webapp.api.server import AppHTTPServer, LogscopeHandler  # noqa: E402
 
 
 def test_status_survives_a_failing_database(tmp_path, monkeypatch):
@@ -512,14 +512,16 @@ def test_oversized_and_out_of_range_inputs_are_client_errors(tmp_path):
         server.server_close()
 
 
-def test_explain_caches_are_bounded(monkeypatch):
-    monkeypatch.setattr(server_mod, "_EXPLAIN_CACHE_MAX_ENTRIES", 5)
-    cache: dict = {}
-    now = time.monotonic()
-    cache["expired"] = ({}, now - 1)
+def test_explain_cache_front_is_bounded(monkeypatch, tmp_path):
+    # The AI answer cache is persistent (state DB); its in-memory front is an LRU.
+    from webapp.api import ai_cache
+    from webapp.api.state import StateDB
+
+    monkeypatch.setattr(ai_cache, "FRONT_MAX_ENTRIES", 5)
+    cache = ai_cache.AiCache(StateDB(tmp_path / "s.sqlite"))
     for i in range(20):
-        _cache_put(cache, i, ({}, now + 60))
-    assert len(cache) == 5 and "expired" not in cache and list(cache) == [15, 16, 17, 18, 19]
+        cache._front_put(str(i), {"i": i})
+    assert list(cache._front) == ["15", "16", "17", "18", "19"]
 
 
 def test_requests_beyond_the_concurrency_cap_get_a_quick_503(tmp_path):
