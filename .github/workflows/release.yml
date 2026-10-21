@@ -103,7 +103,10 @@ jobs:
       - name: Build and push linux/amd64 + linux/arm64 (SBOM + provenance)
         run: |
           owner="${GITHUB_REPOSITORY_OWNER,,}"
-          make image-multi PUSH=1 VERSION="${GITHUB_REF_NAME}" \
+          # Tag "<version without v>" always; "latest" only for stable vX.Y.Z.
+          latest=0
+          [[ "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] && latest=1
+          make image-multi PUSH=1 LATEST="${latest}" VERSION="${GITHUB_REF_NAME}" \
             IMAGE="ghcr.io/${owner}/logscope" \
             SOURCE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
 

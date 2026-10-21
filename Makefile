@@ -26,6 +26,8 @@ PLATFORMS ?= linux/amd64,linux/arm64
 INCLUDE_KUBECTL ?= false
 PYTHON    ?= python3
 PUSH      ?= 0
+# LATEST=1 also tags $(IMAGE):latest (release CI sets it for stable vX.Y.Z tags only).
+LATEST    ?= 0
 DIST      ?= dist
 BIN        = $(DIST)/logscope-$(VERSION)-linux-$(ARCH)
 
@@ -72,7 +74,8 @@ image-multi:
 	@if [ "$(PUSH)" != "1" ]; then \
 	    echo "image-multi pushes $(IMAGE):$(TAG) for $(PLATFORMS); re-run with PUSH=1 to do it." >&2; exit 1; fi
 	docker buildx build --platform $(PLATFORMS) $(BUILD_ARGS) \
-	    --sbom=true --provenance=mode=max --push -t $(IMAGE):$(TAG) .
+	    --sbom=true --provenance=mode=max --push -t $(IMAGE):$(TAG) \
+	    $(if $(filter 1,$(LATEST)),-t $(IMAGE):latest) .
 
 smoke:
 	IMAGE=$(IMAGE) TAG=$(TAG) VERSION=$(VERSION) BIN=$(BIN) scripts/smoke.sh
