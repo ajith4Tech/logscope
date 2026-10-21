@@ -21,7 +21,7 @@
 
 [Unit]
 Description=Logscope web app (Kubernetes log viewer with anomaly insights)
-Documentation=https://github.com/owner/logscope
+Documentation=https://github.com/ajith4Tech/logscope
 After=network-online.target
 Wants=network-online.target
 

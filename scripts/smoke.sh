@@ -11,7 +11,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 VERSION="${VERSION:-$(make -s version)}"
-IMAGE="${IMAGE:-ghcr.io/owner/logscope}"
+IMAGE="${IMAGE:-ghcr.io/ajith4tech/logscope}"
 TAG="${TAG:-$(echo "${VERSION#v}" | tr '+' '-')}"
 ARCH="${ARCH:-$(uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/)}"
 BIN="${BIN:-dist/logscope-${VERSION}-linux-${ARCH}}"

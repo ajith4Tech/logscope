@@ -17,8 +17,8 @@ SHELL := /bin/bash
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.0.0+unknown)
 REVISION  ?= $(shell git rev-parse HEAD 2>/dev/null)
 CREATED   ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-SOURCE    ?= https://github.com/owner/logscope
-IMAGE     ?= ghcr.io/owner/logscope
+SOURCE    ?= https://github.com/ajith4Tech/logscope
+IMAGE     ?= ghcr.io/ajith4tech/logscope
 # Image tag: VERSION without a leading "v" ("+" is not allowed in tags).
 TAG       ?= $(subst +,-,$(patsubst v%,%,$(VERSION)))
 ARCH      ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')

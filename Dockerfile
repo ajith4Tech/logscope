@@ -120,7 +120,7 @@ FROM ${RUNTIME_IMAGE} AS runtime
 ARG VERSION=0.0.0+unknown
 ARG REVISION=
 ARG CREATED=
-ARG SOURCE=
+ARG SOURCE=https://github.com/ajith4Tech/logscope
 LABEL org.opencontainers.image.title="logscope" \
       org.opencontainers.image.description="Logscope web app: Kubernetes log viewer with anomaly insights" \
       org.opencontainers.image.licenses="Apache-2.0" \

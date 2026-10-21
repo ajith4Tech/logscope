@@ -143,7 +143,7 @@ logscope:
 # a distroless image whose entrypoint is the `logscope` binary. The container
 # uses the image's own command and arguments (`logscope serve ...`).
 image:
-  repository: ghcr.io/owner/logscope   # your registry/owner; or the name used with `make k3s-import`
+  repository: ghcr.io/ajith4tech/logscope   # your registry/owner; or the name used with `make k3s-import`
   tag: ""                       # "" = the chart's appVersion. Immutable tags only; never "latest".
   digest: ""                    # optional sha256:...; pins the image (used together with the tag)
   pullPolicy: IfNotPresent      # Never: image imported into k3s (make k3s-import), no registry
