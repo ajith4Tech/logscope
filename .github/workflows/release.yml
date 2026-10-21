@@ -1,0 +1,132 @@
+# Pull requests: pytest + smoke (image and onefile binary, nothing pushed).
+# Tags v*: onefile binaries for amd64 and arm64 (with sha256sums), multi-arch
+# image pushed to GHCR with SBOM and provenance, binaries attached to the
+# GitHub release. Third-party actions are pinned by commit SHA.
+name: release
+
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTEST_VERSION: "9.1.1"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install locked dependencies
+        run: |
+          python -m pip install --require-hashes --no-deps -r requirements.lock
+          python -m pip install "pytest==${PYTEST_VERSION}"
+      - name: pytest (helm is preinstalled on the runner)
+        run: make test PYTHON=python
+
+  smoke:
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # git describe
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker # --load straight into the local engine
+      - name: Smoke test (builds image + onefile binary; nothing is pushed)
+        run: make smoke IMAGE=logscope-ci
+
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver: docker
+      - name: Build onefile binary (native ${{ matrix.arch }})
+        run: make bin ARCH=${{ matrix.arch }} VERSION="${GITHUB_REF_NAME}"
+      - name: Binary runs
+        run: ./dist/logscope-${GITHUB_REF_NAME}-linux-${{ matrix.arch }} version
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logscope-${{ matrix.arch }}
+          path: dist/logscope-*
+          if-no-files-found: error
+
+  image:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: echo "${GHCR_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+      - name: Build and push linux/amd64 + linux/arm64 (SBOM + provenance)
+        run: |
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          make image-multi PUSH=1 VERSION="${GITHUB_REF_NAME}" \
+            IMAGE="ghcr.io/${owner}/logscope" \
+            SOURCE="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [binaries, image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: logscope-*
+          path: dist
+          merge-multiple: true
+      - name: sha256sums
+        working-directory: dist
+        run: |
+          sha256sum logscope-*-linux-amd64 logscope-*-linux-arm64 > sha256sums.txt
+          cat sha256sums.txt
+      - name: Create the GitHub release with the binaries
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --verify-tag --generate-notes \
+            dist/logscope-*-linux-amd64 dist/logscope-*-linux-arm64 dist/sha256sums.txt
