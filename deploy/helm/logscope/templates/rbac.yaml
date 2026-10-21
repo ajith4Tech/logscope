@@ -1,0 +1,60 @@
+{{- /*
+Optional Roles for kubectl actions (kubectl.enabled), off by default. One
+Role + RoleBinding per namespace in rbac.namespaces (default: the release
+namespace), bound to this release's ServiceAccount. Namespaced only.
+*/ -}}
+{{- if or .Values.rbac.readOnly.create .Values.rbac.rollout.create }}
+{{- $releaseNs := include "logscope.namespace" . }}
+{{- $sa := include "logscope.fullname" . }}
+{{- range $ns := (.Values.rbac.namespaces | default (list $releaseNs)) }}
+{{- range $kind := list "read" "rollout" }}
+{{- if or (and (eq $kind "read") $.Values.rbac.readOnly.create) (and (eq $kind "rollout") $.Values.rbac.rollout.create) }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ printf "%s-%s" $sa $kind | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" $ | nindent 4 }}
+rules:
+  {{- if eq $kind "read" }}
+  # kubectl get/describe pod, logs, get events, get/describe deployment, rollout status
+  - apiGroups: [""]
+    resources: [pods, pods/log, events]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  {{- else }}
+  # kubectl rollout restart / rollout undo deployment/<name> (mutating)
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, patch]
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ printf "%s-%s" $sa $kind | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "logscope.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ printf "%s-%s" $sa $kind | trunc 63 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $releaseNs }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

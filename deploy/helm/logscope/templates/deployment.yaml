@@ -26,7 +26,8 @@ spec:
         checksum/credentials: {{ include "logscope.webapp.credentialsChecksum" . }}
     spec:
       serviceAccountName: {{ include "logscope.fullname" . }}
-      automountServiceAccountToken: false
+      # Only kubectl actions (kubectl.enabled) need an API token.
+      automountServiceAccountToken: {{ include "logscope.kubectlEnabled" . | eq "true" }}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
@@ -37,9 +38,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: webapp
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          image: {{ include "logscope.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
-          args: ["--host", "0.0.0.0", "--port", "8000", "--config", "/etc/logscope/config.yaml"]
+          # Command and arguments come from the image:
+          #   logscope serve --host 0.0.0.0 --port 8000 --config /etc/logscope/config.yaml
           ports:
             - name: http
               containerPort: 8000
@@ -47,14 +49,19 @@ spec:
           env:
             - name: LOGSCOPE_WEBAPP_DB_PATH
               value: /data/logscope.sqlite
+            # Durable state (saved views): its own file on the same PVC, under
+            # its own subPath, so wiping the log cache never touches it.
+            - name: LOGSCOPE_WEBAPP_STATE_DB_PATH
+              value: /state/state.sqlite
             # SQLite spills large sorts and index builds to temp files. Keep them
             # on the PVC: on the /tmp emptyDir (sizeLimit) an index build on a
             # large database could get the pod evicted.
             - name: SQLITE_TMPDIR
               value: /data
-            # Fixed: the HTTP API has no authentication; never let it run kubectl.
+            # The HTTP API has no authentication: kubectl actions run only with
+            # kubectl.enabled (kubectl image + an explicit RBAC Role).
             - name: LOGSCOPE_ACTIONS_ENABLED
-              value: "false"
+              value: {{ include "logscope.kubectlEnabled" . | eq "true" | quote }}
             - name: LOGSCOPE_LOG_LEVEL
               value: {{ .Values.webapp.logLevel | quote }}
             - name: LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE
@@ -126,7 +133,11 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
-            # SQLite writes temp files here; the root filesystem is read-only.
+            - name: data
+              mountPath: /state
+              subPath: state
+            # SQLite (TMPDIR=/tmp in the image) writes temp files here; the
+            # root filesystem stays read-only.
             - name: tmp
               mountPath: /tmp
       volumes:

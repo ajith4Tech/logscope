@@ -2,7 +2,10 @@ apiVersion: v2
 name: logscope
 description: Logscope — Kubernetes log classification (Vector → S3) with a web viewer, anomaly insights and optional AI summaries
 type: application
-version: 0.2.0
+version: 0.3.0
+# Version of the Logscope image (the `logscope` binary). image.tag defaults
+# to this; release tags vX.Y.Z publish image tag X.Y.Z.
+appVersion: "0.3.0"
 dependencies:
   # Official Falco chart, vendored in charts/ (sha256 2a767d6a… from
   # falcosecurity.github.io/charts index) so installs need no network.

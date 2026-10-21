@@ -123,7 +123,7 @@ Vector and Falco keep running unchanged.
 | **S3 credentials: web app** | Read-only IAM key: `s3:ListBucket` (prefix-scoped) + `s3:GetObject` on `<bucket>/<prefix root>/*` | `s3.credentials.webapp` (existing Secret or inline) ⚙ |
 | **S3 credentials: Vector** | Write IAM key: `s3:PutObject`, `s3:AbortMultipartUpload`. An existing Vector install reads it from the Secret named by `sinks.s3.secret_name` in its `config.yaml` (default `vector-s3-creds`) | `s3.credentials.vector`, only if the chart manages Vector ⚙ |
 | **AI API key** | Key for the chosen provider, plus an explicit model ID | `ai.provider`, `ai.model`, `ai.apiKey` or `ai.existingSecret`, optional `ai.baseUrl` ⚙ |
-| **Image distribution** | Web app image built from `webapp/Dockerfile` with an immutable tag | `image.repository`, `image.tag` ⚙. Single node: import into k3s. Multi-node: push to a registry all nodes can pull from (+ `image.pullSecrets`) |
+| **Image distribution** | Distroless web app image built from the repository `Dockerfile` (`make image`; `logscope` binary, no shell) with an immutable tag | `image.repository`, `image.tag` (default: chart `appVersion`), optional `image.digest` ⚙. Single node: import into k3s (`make k3s-import`, `image.pullPolicy: Never`). Multi-node: push to a registry all nodes can pull from (`make image-multi PUSH=1`, + `image.pullSecrets`) |
 | **Outbound network** | DNS and HTTPS 443 from the nodes to S3 and the AI provider | Cluster or network firewall ⚙ |
 | **Storage** | A StorageClass for the PVC (`local-path` is the cluster default today) | `persistence.*` ⚙ |
 | **DNS** (optional) | A/AAAA/CNAME for the UI hostname → an address reaching Traefik on 80/443 | DNS provider; `ingress.host` ⚙ |
