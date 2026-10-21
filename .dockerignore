@@ -1,8 +1,42 @@
-# Allowlist: the only image built from this repo is the web app
-# (docker build -f webapp/Dockerfile .). Everything else — config.yaml,
-# deploy/k3s/s3-secret.yaml, logs/, backups/, .state/, .git — stays out of the
-# build context so it can never be copied into an image.
+# Build context allowlist: only what the image build (Dockerfile at the repo
+# root) needs. Everything else stays out so it can never be copied into an
+# image; packaging/check_bundle.py asserts the same on the built bundle.
 *
+!logscope/
 !webapp/
-webapp/**/__pycache__
-webapp/**/*.py[cod]
+!packaging/
+!config.example.yaml
+!requirements.txt
+!requirements.in
+!requirements-build.in
+!requirements.lock
+!requirements-build.lock
+
+# Excluded even inside the allowed directories (later rules win).
+**/__pycache__
+**/*.py[cod]
+# Generated at build time from the VERSION build arg; never a local copy.
+logscope/_version.py
+config.yaml
+**/config.yaml
+deploy/k3s/*secret*
+**/*secret*.yaml
+**/*.env
+logs/
+**/logs/
+backups/
+.state/
+**/.state/
+*.sqlite*
+**/*.sqlite*
+.git
+**/.git
+archive/
+test/
+**/test/
+.venv/
+venv/
+**/.venv/
+**/venv/
+.pytest_cache/
+**/.pytest_cache/
