@@ -30,3 +30,9 @@ venv/
 dist/
 build/
 logscope/_version.py
+
+# Rendered by `logscope render` from config.yaml — real cluster/S3 config, never commit
+deploy/vector.yaml
+deploy/values-*.yaml
+deploy/namespace.yaml
+deploy/backup-cronjob.yaml

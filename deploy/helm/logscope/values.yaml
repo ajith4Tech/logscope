@@ -17,7 +17,7 @@ namespace: ""
 # ---------------------------------------------------------------------------
 s3:
   bucket: ""              # REQUIRED, e.g. my-cluster-logs
-  region: ""              # REQUIRED, e.g. eu-north-1
+  region: ""              # REQUIRED, e.g. us-east-1
   # Object key layout. Must stay as-is unless every reader/writer changes too.
   keyPrefix: "k3s-logs/logs/{{ log_type }}/%Y/%m/%d/%H_%M_%S_"
   # Days of logs the web app keeps cached (match your bucket lifecycle rule;

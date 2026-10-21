@@ -96,14 +96,14 @@ def test_apply_lifecycle_put_preserves_others():
     client.exceptions.ClientError = type("ClientError", (Exception,), {})
 
     applied = L.apply_lifecycle(
-        client, bucket="logscope", prefix="k3s-logs/logs/", days=14
+        client, bucket="my-cluster-logs", prefix="k3s-logs/logs/", days=14
     )
     assert applied["Expiration"]["Days"] == 14
     assert applied["ID"] == "logscope-retention"
 
     client.put_bucket_lifecycle_configuration.assert_called_once()
     kwargs = client.put_bucket_lifecycle_configuration.call_args.kwargs
-    assert kwargs["Bucket"] == "logscope"
+    assert kwargs["Bucket"] == "my-cluster-logs"
     rules: list[dict[str, Any]] = kwargs["LifecycleConfiguration"]["Rules"]
     assert [r["ID"] for r in rules].count("logscope-retention") == 1
     assert any(r["ID"] == "unrelated-archive" for r in rules)
@@ -123,7 +123,7 @@ def test_apply_lifecycle_empty_bucket():
     client.exceptions.ClientError = ClientError
     client.get_bucket_lifecycle_configuration.side_effect = ClientError()
 
-    L.apply_lifecycle(client, bucket="logscope", prefix="k3s-logs/logs/", days=30)
+    L.apply_lifecycle(client, bucket="my-cluster-logs", prefix="k3s-logs/logs/", days=30)
     rules = client.put_bucket_lifecycle_configuration.call_args.kwargs[
         "LifecycleConfiguration"
     ]["Rules"]
