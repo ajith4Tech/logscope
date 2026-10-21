@@ -68,7 +68,8 @@ def _make_legacy_db(path: Path, rows: list[dict]) -> None:
 
 
 def _search(storage: LogStorage, q: str) -> list[int]:
-    return sorted(int(r["id"]) for r in storage.query_logs({"q": q}, limit=10_000)["items"])
+    # Raw FTS5 syntax: these tests compare the index against an oracle index.
+    return sorted(int(r["id"]) for r in storage.query_logs({"q": q, "qmode": "raw"}, limit=10_000)["items"])
 
 
 def _used_bytes(conn: sqlite3.Connection) -> int:
@@ -104,11 +105,9 @@ def test_new_database_uses_external_content_index_wal_and_incremental_vacuum(tmp
 def test_legacy_index_is_migrated_in_the_background_without_losing_search(tmp_path):
     db = tmp_path / "legacy.sqlite"
     _make_legacy_db(db, [_row(i) for i in range(3000)] + [_row(i, day=1) for i in range(500)])
-    probe = sqlite3.connect(db)
-    used_before = _used_bytes(probe)
-    probe.close()
-
     storage = LogStorage(db)
+    # Measured after opening, so both sides include the records indexes.
+    used_before = _used_bytes(storage.conn)
     assert storage.fts_layout == "migrating"
     expected = {q: _search(storage, q) for q in QUERIES}     # served by the legacy index
     assert all(expected[q] for q in ("bravo", "\"status=500\"", "fox*"))

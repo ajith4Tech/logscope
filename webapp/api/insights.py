@@ -133,9 +133,6 @@ class AnomalyStore:
                 "UPDATE anomalies SET ai_summarized_at = NULL "
                 "WHERE ai_steps IS NULL AND ai_summary IS NOT NULL AND status = 'new'"
             )
-            cur.execute(
-                "CREATE INDEX IF NOT EXISTS idx_records_ts_ns ON records(timestamp, namespace)"
-            )
             self._conn.commit()
 
     def upsert_anomaly(

@@ -8,10 +8,32 @@ const CONTEXT_LINE_CHOICES = [10, 25, 50];
 const PIPELINE_REFRESH_MS = 30000; // while the Pipeline tab is open
 const BACKGROUND_STATUS_REFRESH_MS = 5 * 60 * 1000; // header / badge otherwise
 const STATUS_STALE_MS = 90000; // status older than this is labelled as stale
+const LOG_PANELS_DEBOUNCE_MS = 300; // field sidebar + histogram refresh after filter changes
+const FIELD_EXCLUDE_MAX = 50; // values excluded per field (the server's limit)
+// Filter fields with their exclusion parameter (API and URL): values listed
+// there are left out, e.g. xns=kube-system,monitoring.
+const FILTER_EXCLUDES = [
+  ['scope', 'xscope'],
+  ['namespace', 'xns'],
+  ['pod', 'xpod'],
+  ['container', 'xctr'],
+  ['severity_bucket', 'xsev'],
+];
 
 const state = {
   filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
   facets: {},
+  // Values left out per filter field (Alt/Shift-click in the field sidebar).
+  exclude: { scope: [], namespace: [], pod: [], container: [], severity_bucket: [] },
+  // Field sidebar + histogram above the log list.
+  logPanels: {
+    timer: null,
+    abort: null, // AbortController of the in-flight refresh
+    stale: false, // filters changed while the Logs tab was hidden
+    histogram: null, // last /api/histogram response
+    prevRange: null, // range before the first histogram zoom (for "Reset range")
+    drag: null, // { from, to } bucket indexes while selecting
+  },
   dashboard: {
     data: null,
     loading: false,
@@ -72,6 +94,19 @@ const state = {
   context: { recordId: null, lines: 10, limitToRange: true, data: null, loading: false, error: '', requestId: 0, scrolled: false },
   pipeline: { fetchedAt: null, error: '', loading: false, requestId: 0, timer: null, backgroundTimer: null },
   focusAnomalyId: null,
+  // Saved views (/api/views). currentId: the open view (URL view=<id>).
+  views: {
+    list: [],
+    loaded: false,
+    error: '',
+    currentId: null,
+    search: '',
+    busy: false,
+    dialog: null, // { mode: 'save' | 'edit', viewId }
+    counts: new Map(), // id -> { total, errors } | { error } (dashboard strip, last hour)
+    countsAt: 0,
+    countsRequestId: 0,
+  },
   urlApplying: false,
   insightsPromise: null,
 };
@@ -96,6 +131,7 @@ function dashboardContextText() {
   if (filters.container) parts.push(`container=${filters.container}`);
   if (filters.severity_bucket) parts.push(`severity=${filters.severity_bucket}`);
   if (filters.q) parts.push(`search=${filters.q}`);
+  if (FILTER_EXCLUDES.some(([, param]) => filters[param])) parts.push('exclusions applied');
   if (filters.start || filters.before) parts.push('time range applied');
   return parts.length ? `Overview for ${parts.join(', ')}` : 'Overview for the current filter set';
 }
@@ -129,9 +165,11 @@ function switchTab(name, { history = 'push' } = {}) {
   if (name === 'dashboard' && !state.dashboard.loaded && !state.dashboard.loading) {
     loadDashboard().catch(() => {});
   }
+  if (name === 'dashboard') loadPinnedCounts();
   if (name === 'insights' && !state.insightsLoaded && !state.insightsLoading) {
     loadInsights().catch(() => {});
   }
+  if (name === 'logs' && state.logPanels.stale) scheduleLogPanels();
   if (name === 'actionable') {
     updateActionableSourceOptions();
     renderActionableWorkspace();
@@ -220,6 +258,16 @@ function fmtFreshness(value) {
   return `${minutes}m ago`;
 }
 
+// Exclusions as API parameters, comma-separated (Kubernetes names, scopes
+// and severities never contain commas).
+function excludeParams() {
+  const out = {};
+  for (const [field, param] of FILTER_EXCLUDES) {
+    if (state.exclude[field].length) out[param] = state.exclude[field].join(',');
+  }
+  return out;
+}
+
 function queryFromFilters(extra = {}) {
   const range = currentRange();
   const current = {
@@ -232,6 +280,7 @@ function queryFromFilters(extra = {}) {
     start: range.start,
     // Exclusive end: the API's "before" (entries strictly earlier).
     before: range.before,
+    ...excludeParams(),
     ...extra,
   };
   return Object.fromEntries(Object.entries(current).filter(([, v]) => v));
@@ -276,7 +325,8 @@ function escapeHtml(value) {
     .replaceAll('&', '&amp;')
     .replaceAll('<', '&lt;')
     .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;');
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
 }
 
 function dashboardStateEls() {
@@ -418,6 +468,7 @@ async function drillDownFromDashboard(action, value, severity = '') {
   if (action === 'hour') {
     const start = new Date(value);
     if (!Number.isFinite(start.getTime())) return;
+    forgetHistogramZoom();
     setExactRange(start.toISOString(), new Date(start.getTime() + HOUR_MS).toISOString());
     if (severity) setSelectValue(el('severity_bucket'), severity);
   } else if (action === 'severity') {
@@ -2347,6 +2398,7 @@ async function loadLogs(reset = true) {
     } else {
       state.dashboard.loaded = false;
     }
+    scheduleLogPanels();
   }
   return true;
 }
@@ -2395,6 +2447,7 @@ async function pollTail() {
     refreshLiveEnd();
     renderAll();
     flashNewRows(items.length, Boolean(data.truncated));
+    scheduleLogPanels();
   }
   state.lastUpdatedAt = data.last_updated_at;
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
@@ -2419,6 +2472,259 @@ function stopTailPolling() {
   if (state.liveTimer) window.clearInterval(state.liveTimer);
   state.liveTimer = null;
   state.tailRequestId += 1;
+}
+
+// ─── Field sidebar + histogram (Logs tab) ────────────────────────────────────
+// Both follow the applied filters: every Logs reload schedules one refresh
+// (debounced), and a newer refresh aborts the request still in flight.
+
+const FIELD_SIDEBAR = [
+  ['scope', 'Scope'],
+  ['namespace', 'Namespace'],
+  ['pod', 'Pod'],
+  ['container', 'Container'],
+  ['severity_bucket', 'Severity'],
+];
+const SEVERITY_NAMES = ['error', 'warning', 'info', 'debug', 'metrics'];
+const HISTOGRAM_SEVERITIES = ['error', 'warning', 'info', 'debug'];
+
+function scheduleLogPanels() {
+  const panels = state.logPanels;
+  window.clearTimeout(panels.timer);
+  if (state.activeTab !== 'logs') {
+    panels.stale = true; // refreshed when the Logs tab opens
+    return;
+  }
+  panels.stale = false;
+  panels.timer = window.setTimeout(() => {
+    loadLogPanels();
+  }, LOG_PANELS_DEBOUNCE_MS);
+}
+
+// Never rejects: each panel shows its own error.
+async function loadLogPanels() {
+  const panels = state.logPanels;
+  if (panels.abort) panels.abort.abort();
+  const controller = new AbortController();
+  panels.abort = controller;
+  refreshLiveEnd();
+  const qs = new URLSearchParams(queryFromFilters()).toString();
+  const [fields, histogram] = await Promise.allSettled([
+    fetchJson(`/api/fields?${qs}`, { signal: controller.signal }),
+    fetchJson(`/api/histogram?${qs}`, { signal: controller.signal }),
+  ]);
+  if (controller.signal.aborted) return; // superseded by a newer refresh
+  panels.abort = null;
+  if (fields.status === 'fulfilled') renderFieldSidebar(fields.value);
+  else el('fieldList').innerHTML = `<div class="field-error">Could not load fields: ${escapeHtml(fields.reason.message)}</div>`;
+  if (histogram.status === 'fulfilled') {
+    renderHistogram(histogram.value);
+  } else {
+    panels.histogram = null;
+    el('histogramBars').innerHTML = '';
+    el('histogramSummary').textContent = `Could not load the histogram: ${histogram.reason.message}`;
+  }
+}
+
+function currentFilterValue(field) {
+  return el(field).value.trim();
+}
+
+function renderFieldSidebar(data) {
+  const fields = (data && data.fields) || {};
+  const html = FIELD_SIDEBAR.map(([field, label]) => {
+    const info = fields[field] || { values: [] };
+    const excluded = state.exclude[field];
+    const active = currentFilterValue(field);
+    const total = Number(info.total) || 0;
+    const meta = info.partial
+      ? 'timed out'
+      : `${formatCount(info.distinct)} value${Number(info.distinct) === 1 ? '' : 's'} · ${formatCount(total)}`;
+    const chips = excluded.map((value) => `
+      <button type="button" class="field-chip" data-field-unexclude="${escapeHtml(field)}" data-value="${escapeHtml(value)}" title="Excluded — click to include again">
+        ≠ ${escapeHtml(dashboardLabel(value))} <span aria-hidden="true">✕</span>
+      </button>`).join('');
+    const rows = (info.values || []).map((item) => {
+      const value = String(item.value ?? '');
+      const count = Number(item.count) || 0;
+      const width = total > 0 ? Math.max(2, Math.round((count / total) * 100)) : 0;
+      const isActive = active !== '' && active === value;
+      const sevClass = field === 'severity_bucket' && SEVERITY_NAMES.includes(value) ? ` field-fill-${value}` : '';
+      return `
+        <button type="button" class="field-value${isActive ? ' active' : ''}" data-field="${escapeHtml(field)}" data-value="${escapeHtml(value)}" aria-pressed="${isActive ? 'true' : 'false'}"
+          title="${escapeHtml(isActive ? 'Click to clear this filter' : 'Click to filter · Alt/Shift-click to exclude')}">
+          <span class="field-value-label">${escapeHtml(dashboardLabel(value))}</span>
+          <span class="field-value-count">${formatCount(count)}</span>
+          <span class="field-value-track"><span class="field-value-fill${sevClass}" style="width:${width}%"></span></span>
+        </button>`;
+    }).join('');
+    const empty = !rows && !info.partial ? '<div class="field-empty">No values</div>' : '';
+    const partial = info.partial ? '<div class="field-empty">Took too long; narrow the filters to see values.</div>' : '';
+    return `
+      <section class="field-group">
+        <div class="field-group-head"><span class="field-name">${escapeHtml(label)}</span><span class="field-meta">${escapeHtml(meta)}</span></div>
+        ${chips ? `<div class="field-chips">${chips}</div>` : ''}
+        ${rows}${empty}${partial}
+      </section>`;
+  }).join('');
+  el('fieldList').innerHTML = html;
+  updateExcludedCount();
+}
+
+function updateExcludedCount() {
+  const count = FILTER_EXCLUDES.reduce((sum, [field]) => sum + state.exclude[field].length, 0);
+  const badge = el('fieldExcludedCount');
+  badge.hidden = count === 0;
+  badge.textContent = count ? `· ${count} excluded` : '';
+}
+
+function setFilterValue(field, value) {
+  if (field === 'pod' || field === 'container') el(field).value = value;
+  else setSelectValue(el(field), value);
+}
+
+// Click: filter on the value (again: clear that filter). Alt/Shift-click:
+// exclude it (and drop the filter if it was the selected value).
+function applyFieldValue(field, value, exclude) {
+  const excluded = state.exclude[field];
+  if (exclude) {
+    if (!excluded.includes(value) && excluded.length < FIELD_EXCLUDE_MAX) excluded.push(value);
+    if (currentFilterValue(field) === value) setFilterValue(field, '');
+  } else {
+    state.exclude[field] = excluded.filter((v) => v !== value);
+    setFilterValue(field, currentFilterValue(field) === value ? '' : value);
+  }
+  reloadLogs();
+}
+
+function renderHistogram(data) {
+  const panels = state.logPanels;
+  const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
+  const bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
+  panels.histogram = { buckets, bucketMs };
+  panels.drag = null;
+  hideHistogramTooltip();
+  const total = buckets.reduce((sum, b) => sum + (Number(b.total) || 0), 0);
+  const max = buckets.reduce((m, b) => Math.max(m, Number(b.total) || 0), 0);
+  el('histogramSummary').textContent = buckets.length
+    ? `${formatCount(total)} entries · ${formatBucketSize(bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
+    : 'No entries in this range';
+  el('histogramBars').innerHTML = buckets.map((b, index) => {
+    const count = Number(b.total) || 0;
+    const height = max > 0 && count > 0 ? Math.max(3, Math.round((count / max) * 100)) : 0;
+    const known = HISTOGRAM_SEVERITIES.reduce((sum, sev) => sum + (Number(b[sev]) || 0), 0);
+    const segments = HISTOGRAM_SEVERITIES
+      .concat('other')
+      .map((sev) => [sev, sev === 'other' ? Math.max(0, count - known) : Number(b[sev]) || 0])
+      .filter(([, n]) => n > 0)
+      .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
+      .join('');
+    return `<div class="hist-col" data-i="${index}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
+  }).join('');
+  el('histogramFrom').textContent = buckets.length ? formatTimestamp(buckets[0].t) : '';
+  el('histogramTo').textContent = buckets.length
+    ? formatTimestamp(new Date(Date.parse(buckets[buckets.length - 1].t) + bucketMs).toISOString())
+    : '';
+  updateHistogramReset();
+}
+
+function formatBucketSize(ms) {
+  const minutes = Math.round(ms / 60000);
+  return minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`;
+}
+
+function histogramIndexAt(clientX) {
+  const hist = state.logPanels.histogram;
+  if (!hist || !hist.buckets.length) return null;
+  const rect = el('histogramBars').getBoundingClientRect();
+  if (rect.width <= 0) return null;
+  const index = Math.floor(((clientX - rect.left) / rect.width) * hist.buckets.length);
+  return Math.min(hist.buckets.length - 1, Math.max(0, index));
+}
+
+function markHistogramSelection() {
+  const drag = state.logPanels.drag;
+  const lo = drag ? Math.min(drag.from, drag.to) : -1;
+  const hi = drag ? Math.max(drag.from, drag.to) : -1;
+  for (const col of el('histogramBars').children) {
+    const index = Number(col.dataset.i);
+    col.classList.toggle('selected', index >= lo && index <= hi);
+  }
+}
+
+function showHistogramTooltip(index, clientX) {
+  const hist = state.logPanels.histogram;
+  const bucket = hist?.buckets[index];
+  if (!bucket) return;
+  const tip = el('histogramTooltip');
+  const end = new Date(Date.parse(bucket.t) + hist.bucketMs).toISOString();
+  const lines = HISTOGRAM_SEVERITIES
+    .filter((sev) => Number(bucket[sev]) > 0)
+    .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
+    .join('');
+  tip.innerHTML = `
+    <div class="hist-tip-time">${escapeHtml(formatTimestamp(bucket.t))} – ${escapeHtml(formatTimestamp(end))}</div>
+    <div class="hist-tip-row"><b>${formatCount(bucket.total)}</b> entries</div>${lines}`;
+  tip.hidden = false;
+  const box = el('histogram').getBoundingClientRect();
+  const x = Math.min(Math.max(clientX - box.left + 12, 0), Math.max(0, box.width - tip.offsetWidth));
+  tip.style.left = `${x}px`;
+}
+
+function hideHistogramTooltip() {
+  el('histogramTooltip').hidden = true;
+}
+
+// A drag selects [first bucket, last bucket + size); a click zooms to one bucket.
+function applyHistogramSelection(from, to) {
+  const hist = state.logPanels.histogram;
+  if (!hist) return;
+  const lo = hist.buckets[Math.min(from, to)];
+  const hi = hist.buckets[Math.max(from, to)];
+  if (!lo || !hi) return;
+  if (!state.logPanels.prevRange) state.logPanels.prevRange = snapshotRange();
+  setExactRange(new Date(lo.t).toISOString(), new Date(Date.parse(hi.t) + hist.bucketMs).toISOString());
+  reloadLogs();
+}
+
+function snapshotRange() {
+  return {
+    preset: el('rangePreset').value,
+    rangeExact: state.rangeExact ? { ...state.rangeExact } : null,
+    start: el('start').value,
+    end: el('end').value,
+    endIsLive: state.endIsLive,
+  };
+}
+
+// Back to the range before the first zoom (relative presets re-anchor to
+// now); without one, back to Today.
+function resetHistogramRange() {
+  const prev = state.logPanels.prevRange;
+  state.logPanels.prevRange = null;
+  if (prev && RANGE_PRESETS[prev.preset]) {
+    el('rangePreset').value = prev.preset;
+    RANGE_PRESETS[prev.preset].apply();
+  } else if (prev) {
+    el('rangePreset').value = prev.preset;
+    el('start').value = prev.start;
+    el('end').value = prev.end;
+    state.endIsLive = prev.endIsLive;
+    state.rangeExact = prev.rangeExact;
+  } else {
+    el('rangePreset').value = 'today';
+    setDefaultDateRange();
+  }
+  reloadLogs();
+}
+
+function updateHistogramReset() {
+  el('histogramReset').hidden = !(state.logPanels.prevRange || state.rangeExact);
+}
+
+// A range picked outside the histogram ends any zoom.
+function forgetHistogramZoom() {
+  state.logPanels.prevRange = null;
 }
 
 // ─── Pipeline health (from /api/status) ──────────────────────────────────────
@@ -2831,12 +3137,15 @@ el('refreshPipeline').addEventListener('click', () => {
 //
 //   tab     dashboard | insights | actionable | pipeline   (logs when absent)
 //   scope, ns, pod, ctr, sev, q                             filters
+//   xscope, xns, xpod, xctr, xsev   values left out, comma-separated
 //   range   1h | 6h | 24h | 7d | all   (today when absent; relative to "now")
 //   from, to   ISO-8601 UTC, [from, to) — an exact range (either may be absent)
 //   rec     log entry id whose context is open (Logs)
 //   ctx     10 | 25 | 50 lines each side;  ctxall=1: context ignores the range
 //   anomaly anomaly id (expanded in Insights, or investigated in Actionable)
 //   line    log entry id investigated in Actionable
+//   view    open saved view id (its filters are the ones above; a difference
+//           marks the view as modified)
 
 const URL_RANGES = ['today', '1h', '6h', '24h', '7d', 'all'];
 const URL_FILTERS = [
@@ -2846,6 +3155,7 @@ const URL_FILTERS = [
   ['ctr', 'container', 253],
   ['sev', 'severity_bucket', 64],
 ];
+const URL_EXCLUDE_MAX_LENGTH = { scope: 100, namespace: 253, pod: 253, container: 253, severity_bucket: 64 };
 const URL_ID_RE = /^\d{1,15}$/;
 
 function cleanParam(value, maxLength) {
@@ -2876,12 +3186,18 @@ function parseUrlState(search) {
   } catch (_) {
     params = new URLSearchParams();
   }
-  const out = { tab: 'logs', filters: {}, q: '', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null };
+  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
   const tab = params.get('tab');
   if (TABS.includes(tab)) out.tab = tab;
   for (const [key, field, max] of URL_FILTERS) {
     const value = cleanParam(params.get(key), max);
     if (value) out.filters[field] = value;
+  }
+  for (const [field, param] of FILTER_EXCLUDES) {
+    const raw = params.get(param);
+    const values = typeof raw === 'string' && raw.length <= 20000 ? raw.split(',') : [];
+    const kept = values.map((v) => cleanParam(v, URL_EXCLUDE_MAX_LENGTH[field])).filter(Boolean);
+    out.exclude[field] = Array.from(new Set(kept)).slice(0, FIELD_EXCLUDE_MAX);
   }
   out.q = cleanParam(params.get('q'), 500);
   const range = params.get('range');
@@ -2896,6 +3212,7 @@ function parseUrlState(search) {
   out.ctxAll = params.get('ctxall') === '1';
   out.anomaly = cleanId(params.get('anomaly'));
   out.line = cleanId(params.get('line'));
+  out.view = cleanId(params.get('view'));
   return out;
 }
 
@@ -2905,6 +3222,9 @@ function buildUrlParams() {
   for (const [key, field] of URL_FILTERS) {
     const value = el(field).value.trim();
     if (value) params.set(key, value);
+  }
+  for (const [field, param] of FILTER_EXCLUDES) {
+    if (state.exclude[field].length) params.set(param, state.exclude[field].join(','));
   }
   const q = el('q').value.trim();
   if (q) params.set('q', q);
@@ -2917,6 +3237,7 @@ function buildUrlParams() {
     if (range.before) params.set('to', range.before);
     if (!range.start && !range.before) params.set('range', 'all');
   }
+  if (state.views.currentId !== null) params.set('view', String(state.views.currentId));
   if (state.activeTab === 'logs' && state.context.recordId !== null) {
     params.set('rec', String(state.context.recordId));
     if (state.context.lines !== 10) params.set('ctx', String(state.context.lines));
@@ -2933,6 +3254,7 @@ function buildUrlParams() {
 }
 
 function updateUrl(mode = 'replace') {
+  if (!state.urlApplying) renderViewBar();
   if (!mode || state.urlApplying) return;
   const qs = buildUrlParams().toString();
   const next = `${window.location.pathname}${qs ? `?${qs}` : ''}`;
@@ -2969,15 +3291,20 @@ async function fetchLogEntry(id) {
 }
 
 // Apply a parsed URL to the page: filters, range, tab, then the selected
-// entry / anomaly. Never adds history entries itself.
-async function applyUrlState(parsed) {
+// entry / anomaly. Adds a history entry only with history: 'push' (opening
+// a saved view); otherwise it replaces the current one.
+async function applyUrlState(parsed, { history = 'replace' } = {}) {
   state.urlApplying = true;
   try {
+    state.views.currentId = parsed.view;
+    if (state.views.loaded && !currentView()) state.views.currentId = null; // deleted since
     for (const field of ['scope', 'namespace', 'severity_bucket']) {
       setSelectValue(el(field), parsed.filters[field] || '');
     }
     el('pod').value = parsed.filters.pod || '';
     el('container').value = parsed.filters.container || '';
+    for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [...(parsed.exclude[field] || [])];
+    forgetHistogramZoom();
     el('q').value = parsed.q || '';
     if (parsed.from || parsed.to) {
       setExactRange(parsed.from, parsed.to);
@@ -3009,7 +3336,7 @@ async function applyUrlState(parsed) {
     state.urlApplying = false;
   }
   // Normalise the address bar (drops invalid or redundant parameters).
-  updateUrl('replace');
+  updateUrl(history);
 }
 
 window.addEventListener('popstate', () => {
@@ -3021,6 +3348,410 @@ window.addEventListener('popstate', () => {
 el('copyLinkBtn').addEventListener('click', () => {
   updateUrl('replace');
   copyToClipboard(window.location.href, el('copyLinkBtn'));
+});
+
+// ─── Saved views ─────────────────────────────────────────────────────────────
+// Named filter sets stored server-side (/api/views) in the URL's own keys.
+// A relative range (range=1h) stays relative, so a view reopens relative to
+// now; only an absolute range is stored as from/to. Opening a view applies
+// it like a link and adds view=<id> to the URL.
+
+const VIEW_FILTER_KEYS = ['scope', 'ns', 'pod', 'ctr', 'sev', 'q', 'qmode', 'xscope', 'xns', 'xpod', 'xctr', 'xsev', 'range', 'from', 'to'];
+const VIEW_EXCLUDE_KEYS = new Set(FILTER_EXCLUDES.map(([, param]) => param));
+// URL key -> API parameter (exclusion keys are the same in both).
+const VIEW_API_PARAMS = { scope: 'scope', ns: 'namespace', pod: 'pod', ctr: 'container', sev: 'severity_bucket', q: 'q', qmode: 'qmode' };
+const PINNED_CARDS_MAX = 12;
+const PINNED_COUNTS_TTL_MS = 60000;
+
+function currentView() {
+  return state.views.list.find((view) => view.id === state.views.currentId) || null;
+}
+
+// The filters on screen, in the URL form a view stores.
+function currentViewFilters() {
+  const params = buildUrlParams();
+  const out = {};
+  for (const key of VIEW_FILTER_KEYS) {
+    const value = params.get(key);
+    if (value) out[key] = value;
+  }
+  return out;
+}
+
+// Comparable form: fixed key order, exclusion lists order-insensitive.
+function viewFiltersKey(filters) {
+  return JSON.stringify(VIEW_FILTER_KEYS.filter((key) => filters?.[key]).map((key) => {
+    const value = String(filters[key]);
+    return [key, VIEW_EXCLUDE_KEYS.has(key) ? value.split(',').sort().join(',') : value];
+  }));
+}
+
+function viewRequest(method, url, payload) {
+  const options = { method };
+  if (payload !== undefined) {
+    options.headers = { 'Content-Type': 'application/json' };
+    options.body = JSON.stringify(payload);
+  }
+  return fetchJson(url, options);
+}
+
+// Never rejects: a failure is shown in the Views menu.
+async function loadViews() {
+  try {
+    const data = await fetchJson('/api/views');
+    state.views.list = Array.isArray(data.views) ? data.views : [];
+    state.views.loaded = true;
+    state.views.error = '';
+  } catch (err) {
+    state.views.error = `Could not load saved views: ${err.message}`;
+  }
+  state.views.countsAt = 0; // filters or pins may have changed
+  if (state.views.loaded && state.views.currentId !== null && !currentView()) {
+    state.views.currentId = null;
+    updateUrl('replace');
+  }
+  renderViews();
+  loadPinnedCounts();
+}
+
+function renderViews() {
+  el('viewsCount').textContent = state.views.loaded ? `(${state.views.list.length})` : '';
+  renderViewBar();
+  renderViewsMenu();
+  renderPinnedViews();
+}
+
+function renderViewBar() {
+  const view = currentView();
+  el('viewBar').hidden = !view;
+  if (!view) return;
+  el('viewBarName').textContent = view.name;
+  el('viewBar').title = view.description || view.name;
+  const modified = viewFiltersKey(currentViewFilters()) !== viewFiltersKey(view.filters);
+  el('viewModifiedDot').hidden = !modified;
+  el('viewRevertBtn').hidden = !modified;
+  el('viewUpdateBtn').hidden = !modified;
+}
+
+function renderViewsMenu() {
+  const errorBox = el('viewsError');
+  errorBox.hidden = !state.views.error;
+  errorBox.textContent = state.views.error;
+  const list = el('viewsList');
+  const search = state.views.search.trim().toLowerCase();
+  const all = state.views.list;
+  const shown = all.filter((view) => !search
+    || view.name.toLowerCase().includes(search)
+    || (view.description || '').toLowerCase().includes(search));
+  if (!shown.length) {
+    const text = all.length ? 'No views match.' : 'No saved views yet. Set filters, then “Save view”.';
+    list.innerHTML = `<div class="views-empty">${escapeHtml(text)}</div>`;
+    return;
+  }
+  list.innerHTML = shown.map((view) => {
+    const index = all.indexOf(view);
+    // Reorder within the pinned / unpinned group; not while filtering the list.
+    const canUp = !search && index > 0 && all[index - 1].pinned === view.pinned;
+    const canDown = !search && index < all.length - 1 && all[index + 1].pinned === view.pinned;
+    const id = Number(view.id);
+    const name = escapeHtml(view.name);
+    const description = view.description ? escapeHtml(view.description) : '';
+    const pinLabel = view.pinned ? 'Unpin from the dashboard' : 'Pin to the dashboard';
+    return `<div class="view-item${id === state.views.currentId ? ' current' : ''}" data-view-id="${id}">
+      <button type="button" class="view-item-open" data-view-action="open" title="${description || name}">
+        <span class="view-item-name">${name}</span>
+        ${description ? `<span class="view-item-desc">${description}</span>` : ''}
+      </button>
+      <button type="button" class="view-item-btn${view.pinned ? ' pinned' : ''}" data-view-action="pin" aria-pressed="${view.pinned ? 'true' : 'false'}" title="${pinLabel}" aria-label="${pinLabel}: ${name}">${view.pinned ? '★' : '☆'}</button>
+      <button type="button" class="view-item-btn" data-view-action="up" title="Move up" aria-label="Move ${name} up"${canUp ? '' : ' disabled'}>↑</button>
+      <button type="button" class="view-item-btn" data-view-action="down" title="Move down" aria-label="Move ${name} down"${canDown ? '' : ' disabled'}>↓</button>
+      <button type="button" class="view-item-btn" data-view-action="edit" title="Rename or edit" aria-label="Rename ${name}">✎</button>
+      <button type="button" class="view-item-btn" data-view-action="delete" title="Delete" aria-label="Delete ${name}">✕</button>
+    </div>`;
+  }).join('');
+}
+
+function showViewsError(err) {
+  state.views.error = err instanceof Error ? err.message : String(err);
+  renderViewsMenu();
+}
+
+// One mutation at a time; the list is reloaded afterwards (server order).
+async function runViewChange(change) {
+  if (state.views.busy) return;
+  state.views.busy = true;
+  try {
+    await change();
+    state.views.error = '';
+  } catch (err) {
+    showViewsError(err);
+  } finally {
+    state.views.busy = false;
+    await loadViews();
+  }
+}
+
+async function openView(view, { tab = state.activeTab } = {}) {
+  const params = new URLSearchParams(view.filters || {});
+  if (tab !== 'logs') params.set('tab', tab);
+  params.set('view', String(view.id));
+  await applyUrlState(parseUrlState(params.toString()), { history: 'push' });
+  viewRequest('POST', `/api/views/${Number(view.id)}/use`).then((data) => {
+    if (data?.view) view.last_used_at = data.view.last_used_at;
+  }).catch(() => {});
+}
+
+function moveView(view, delta) {
+  const group = state.views.list.filter((item) => item.pinned === view.pinned);
+  const from = group.indexOf(view);
+  const to = from + delta;
+  if (from < 0 || to < 0 || to >= group.length) return Promise.resolve();
+  group.splice(from, 1);
+  group.splice(to, 0, view);
+  return runViewChange(async () => {
+    for (const [order, item] of group.entries()) {
+      if (item.sort_order !== order) await viewRequest('PATCH', `/api/views/${Number(item.id)}`, { sort_order: order });
+    }
+  });
+}
+
+function setViewsMenuOpen(open) {
+  el('viewsMenu').hidden = !open;
+  el('viewsMenuBtn').setAttribute('aria-expanded', open ? 'true' : 'false');
+  if (open) {
+    renderViewsMenu();
+    el('viewsSearch').focus();
+  }
+}
+
+// mode 'save': save the current filters (update the open view, or a new
+// one); 'edit': rename / describe / pin `view` without touching its filters.
+function openSaveViewDialog(mode, view = null) {
+  const target = mode === 'edit' ? view : currentView();
+  state.views.dialog = { mode, viewId: target ? target.id : null };
+  el('saveViewTitle').textContent = mode === 'edit' ? 'Edit view' : 'Save view';
+  el('saveViewName').value = target?.name || '';
+  el('saveViewDescription').value = target?.description || '';
+  el('saveViewPinned').checked = Boolean(target?.pinned);
+  el('saveViewSubmit').textContent = mode === 'save' && target ? 'Update' : 'Save';
+  el('saveViewSubmit').title = mode === 'save' && target ? 'Save the current filters into the open view' : '';
+  el('saveViewAsNew').hidden = !(mode === 'save' && target);
+  el('saveViewError').hidden = true;
+  el('saveViewModal').showModal();
+  el('saveViewName').focus();
+  el('saveViewName').select();
+}
+
+async function submitSaveView(asNew) {
+  const dialog = state.views.dialog;
+  if (!dialog || state.views.busy) return;
+  const body = {
+    name: el('saveViewName').value.trim(),
+    description: el('saveViewDescription').value.trim(),
+    pinned: el('saveViewPinned').checked,
+  };
+  if (dialog.mode === 'save') body.filters = currentViewFilters();
+  const errorBox = el('saveViewError');
+  if (!body.name) {
+    errorBox.textContent = 'Enter a name.';
+    errorBox.hidden = false;
+    return;
+  }
+  state.views.busy = true;
+  try {
+    let saved;
+    if (asNew || dialog.viewId === null) {
+      saved = (await viewRequest('POST', '/api/views', body)).view;
+    } else {
+      saved = (await viewRequest('PATCH', `/api/views/${Number(dialog.viewId)}`, body)).view;
+    }
+    el('saveViewModal').close();
+    state.views.dialog = null;
+    if (dialog.mode === 'save' && saved) {
+      state.views.currentId = saved.id;
+      updateUrl('replace');
+    }
+  } catch (err) {
+    errorBox.textContent = err.message;
+    errorBox.hidden = false;
+    return;
+  } finally {
+    state.views.busy = false;
+  }
+  await loadViews();
+}
+
+function openDeleteViewDialog(view) {
+  state.views.dialog = { mode: 'delete', viewId: view.id };
+  el('deleteViewText').textContent = `Delete the saved view “${view.name}”? This cannot be undone.`;
+  el('deleteViewModal').showModal();
+}
+
+// ── Dashboard strip: pinned views with their last-hour counts ──
+
+function viewApiParams(filters, extra = {}) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters || {})) {
+    if (VIEW_API_PARAMS[key]) params.set(VIEW_API_PARAMS[key], value);
+    else if (VIEW_EXCLUDE_KEYS.has(key)) params.set(key, value);
+  }
+  for (const [key, value] of Object.entries(extra)) params.set(key, value);
+  return params;
+}
+
+function renderPinnedViews() {
+  const pinned = state.views.list.filter((view) => view.pinned);
+  el('pinnedViews').hidden = !pinned.length;
+  if (!pinned.length) {
+    el('pinnedViewsCards').innerHTML = '';
+    return;
+  }
+  const cards = pinned.slice(0, PINNED_CARDS_MAX).map((view) => {
+    const counts = state.views.counts.get(view.id);
+    let body;
+    if (!counts) {
+      body = '<span>…</span>';
+    } else if (counts.error) {
+      body = `<span class="pinned-view-note">Counts unavailable: ${escapeHtml(counts.error)}</span>`;
+    } else {
+      body = `<span>${formatCount(counts.total)} logs</span><span class="pinned-view-errors">${formatCount(counts.errors)} errors</span>`;
+    }
+    const title = view.description ? `${view.description}\n\nOpen in Logs` : 'Open in Logs';
+    return `<button type="button" class="pinned-view-card" data-pinned-view-id="${Number(view.id)}" title="${escapeHtml(title)}">
+      <span class="pinned-view-name">${escapeHtml(view.name)}</span>
+      <span class="pinned-view-counts">${body}</span>
+    </button>`;
+  });
+  if (pinned.length > PINNED_CARDS_MAX) {
+    cards.push(`<div class="pinned-view-note">${pinned.length - PINNED_CARDS_MAX} more pinned views in the Views menu</div>`);
+  }
+  el('pinnedViewsCards').innerHTML = cards.join('');
+}
+
+// Last-hour total and error count per pinned card (the view's own range is
+// not used). Only while the dashboard is shown; never rejects.
+async function loadPinnedCounts({ force = false } = {}) {
+  if (state.activeTab !== 'dashboard' || !state.views.loaded) return;
+  if (!force && state.views.countsAt && Date.now() - state.views.countsAt < PINNED_COUNTS_TTL_MS) return;
+  state.views.countsAt = Date.now();
+  const requestId = ++state.views.countsRequestId;
+  const pinned = state.views.list.filter((view) => view.pinned).slice(0, PINNED_CARDS_MAX);
+  if (!pinned.length) return;
+  const start = new Date(Date.now() - HOUR_MS).toISOString();
+  const results = await Promise.allSettled(pinned.map((view) => (
+    fetchJson(`/api/histogram?${viewApiParams(view.filters, { start }).toString()}`)
+  )));
+  if (requestId !== state.views.countsRequestId) return;
+  const counts = new Map();
+  pinned.forEach((view, index) => {
+    const result = results[index];
+    if (result.status !== 'fulfilled') {
+      counts.set(view.id, { error: result.reason?.message || 'request failed' });
+      return;
+    }
+    const buckets = Array.isArray(result.value?.buckets) ? result.value.buckets : [];
+    counts.set(view.id, {
+      total: buckets.reduce((sum, bucket) => sum + Number(bucket.total || 0), 0),
+      errors: buckets.reduce((sum, bucket) => sum + Number(bucket.error || 0), 0),
+    });
+  });
+  state.views.counts = counts;
+  renderPinnedViews();
+}
+
+el('saveViewBtn').addEventListener('click', () => openSaveViewDialog('save'));
+el('viewsMenuBtn').addEventListener('click', () => setViewsMenuOpen(el('viewsMenu').hidden));
+el('viewsSearch').addEventListener('input', () => {
+  state.views.search = el('viewsSearch').value;
+  renderViewsMenu();
+});
+el('viewsList').addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-view-action]') : null;
+  if (!(button instanceof HTMLButtonElement) || button.disabled) return;
+  const id = Number(button.closest('[data-view-id]')?.dataset.viewId);
+  const view = state.views.list.find((item) => item.id === id);
+  if (!view) return;
+  const action = button.dataset.viewAction;
+  if (action === 'open') {
+    setViewsMenuOpen(false);
+    openView(view).catch(showViewsError);
+  } else if (action === 'pin') {
+    runViewChange(() => viewRequest('PATCH', `/api/views/${id}`, { pinned: !view.pinned }));
+  } else if (action === 'up' || action === 'down') {
+    moveView(view, action === 'up' ? -1 : 1);
+  } else if (action === 'edit') {
+    openSaveViewDialog('edit', view);
+  } else if (action === 'delete') {
+    openDeleteViewDialog(view);
+  }
+});
+document.addEventListener('click', (event) => {
+  if (el('viewsMenu').hidden || !(event.target instanceof Node)) return;
+  if (el('viewsMenu').contains(event.target) || el('viewsMenuBtn').contains(event.target)) return;
+  if (el('saveViewModal').open || el('deleteViewModal').open) return;
+  setViewsMenuOpen(false);
+});
+window.addEventListener('keydown', (event) => {
+  if (event.key !== 'Escape' || el('viewsMenu').hidden) return;
+  if (el('saveViewModal').open || el('deleteViewModal').open) return;
+  setViewsMenuOpen(false);
+  el('viewsMenuBtn').focus();
+});
+// Typing in the filters marks the open view as modified right away.
+for (const type of ['input', 'change']) {
+  document.querySelector('.filters').addEventListener(type, (event) => {
+    if (event.target instanceof Element && !event.target.closest('#viewsMenu')) renderViewBar();
+  });
+}
+el('viewRevertBtn').addEventListener('click', () => {
+  const view = currentView();
+  if (view) openView(view).catch(showViewsError);
+});
+el('viewUpdateBtn').addEventListener('click', () => {
+  const view = currentView();
+  if (view) runViewChange(() => viewRequest('PATCH', `/api/views/${Number(view.id)}`, { filters: currentViewFilters() }));
+});
+el('viewCloseBtn').addEventListener('click', () => {
+  state.views.currentId = null;
+  updateUrl('replace');
+  renderViews();
+});
+el('saveViewSubmit').addEventListener('click', () => submitSaveView(false));
+el('saveViewAsNew').addEventListener('click', () => submitSaveView(true));
+el('saveViewModal').querySelector('form').addEventListener('submit', (event) => {
+  event.preventDefault(); // Enter in the name field
+  submitSaveView(false);
+});
+el('saveViewCancel').addEventListener('click', () => {
+  el('saveViewModal').close();
+  state.views.dialog = null;
+});
+el('deleteViewCancel').addEventListener('click', () => {
+  el('deleteViewModal').close();
+  state.views.dialog = null;
+});
+el('deleteViewConfirm').addEventListener('click', () => {
+  const dialog = state.views.dialog;
+  el('deleteViewModal').close();
+  state.views.dialog = null;
+  if (!dialog || dialog.mode !== 'delete') return;
+  runViewChange(async () => {
+    await viewRequest('DELETE', `/api/views/${Number(dialog.viewId)}`);
+    if (state.views.currentId === dialog.viewId) {
+      state.views.currentId = null;
+      updateUrl('replace');
+    }
+  });
+});
+el('pinnedViewsCards').addEventListener('click', (event) => {
+  const card = event.target instanceof Element ? event.target.closest('[data-pinned-view-id]') : null;
+  if (!(card instanceof HTMLElement)) return;
+  const view = state.views.list.find((item) => item.id === Number(card.dataset.pinnedViewId));
+  if (view) {
+    openView(view, { tab: 'logs' }).catch((err) => {
+      el('health').textContent = err.message;
+    });
+  }
 });
 
 // ─── Init ────────────────────────────────────────────────────────────────────
@@ -3051,6 +3782,7 @@ async function init() {
   await loadFacets();
   // Facets first, so values from the link select existing options.
   await applyUrlState(parsed);
+  loadViews();
   startTailPolling();
   startBackgroundStatusRefresh();
   if (!state.insightsLoaded && !state.insightsLoading) loadInsights().catch(() => { });
@@ -3071,11 +3803,13 @@ el('apply').addEventListener('click', () => reloadLogs());
 // Typing an End time makes the range end there (no longer "now"). Editing
 // either bound drops exact bounds from a link or drilldown.
 el('end').addEventListener('change', () => {
+  forgetHistogramZoom();
   state.endIsLive = !el('end').value;
   state.rangeExact = null;
   el('rangePreset').value = 'custom';
 });
 el('start').addEventListener('change', () => {
+  forgetHistogramZoom();
   if (state.rangeExact) {
     state.endIsLive = !state.rangeExact.before;
     state.rangeExact = null;
@@ -3122,6 +3856,7 @@ window.addEventListener('keydown', (event) => {
   }
 });
 el('todayShortcut').addEventListener('click', () => {
+  forgetHistogramZoom();
   el('rangePreset').value = 'today';
   setDefaultDateRange();
   reloadLogs();
@@ -3132,6 +3867,8 @@ el('clearFilters').addEventListener('click', () => {
   el('pod').value = '';
   el('container').value = '';
   el('severity_bucket').value = '';
+  for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [];
+  forgetHistogramZoom();
   el('q').value = '';
   el('rangePreset').value = 'today';
   setDefaultDateRange();
@@ -3144,6 +3881,7 @@ el('securityShortcut').addEventListener('click', () => {
 el('rangePreset').addEventListener('change', () => {
   const preset = RANGE_PRESETS[el('rangePreset').value];
   if (!preset) return;
+  forgetHistogramZoom();
   preset.apply();
   reloadLogs();
 });
@@ -3162,6 +3900,7 @@ el('refreshDashboard').addEventListener('click', () => {
   loadDashboard().catch((err) => {
     el('health').textContent = err.message;
   });
+  loadPinnedCounts({ force: true });
 });
 document.addEventListener('click', async (event) => {
   const target = event.target;
@@ -3186,10 +3925,72 @@ document.addEventListener('click', async (event) => {
     start.setHours(0, 0, 0, 0);
     const end = new Date(start);
     end.setDate(end.getDate() + 1); // exclusive: up to the next local midnight
+    forgetHistogramZoom();
     setExactRange(start.toISOString(), end.toISOString()); // a fixed past day
     reloadLogs();
   }
 });
+el('fieldSidebarToggle').addEventListener('click', () => {
+  const collapsed = el('logsBody').classList.toggle('fields-collapsed');
+  const toggle = el('fieldSidebarToggle');
+  toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+  toggle.textContent = collapsed ? '›' : '‹';
+  toggle.title = collapsed ? 'Show fields' : 'Hide fields';
+  toggle.setAttribute('aria-label', toggle.title);
+  el('fieldSidebarBody').hidden = collapsed;
+});
+el('fieldList').addEventListener('mousedown', (event) => {
+  if (event.shiftKey) event.preventDefault(); // no text selection on Shift-click
+});
+el('fieldList').addEventListener('click', (event) => {
+  const target = event.target instanceof Element ? event.target : null;
+  const chip = target?.closest('[data-field-unexclude]');
+  if (chip instanceof HTMLElement) {
+    const field = chip.dataset.fieldUnexclude;
+    if (!state.exclude[field]) return;
+    state.exclude[field] = state.exclude[field].filter((v) => v !== chip.dataset.value);
+    reloadLogs();
+    return;
+  }
+  const button = target?.closest('[data-field][data-value]');
+  if (!(button instanceof HTMLElement) || !state.exclude[button.dataset.field]) return;
+  event.preventDefault();
+  applyFieldValue(button.dataset.field, button.dataset.value ?? '', event.altKey || event.shiftKey);
+});
+el('histogramBars').addEventListener('pointerdown', (event) => {
+  if (event.button !== 0) return;
+  const index = histogramIndexAt(event.clientX);
+  if (index === null) return;
+  event.preventDefault();
+  el('histogramBars').setPointerCapture(event.pointerId);
+  state.logPanels.drag = { from: index, to: index };
+  markHistogramSelection();
+});
+el('histogramBars').addEventListener('pointermove', (event) => {
+  const index = histogramIndexAt(event.clientX);
+  if (index === null) return;
+  const drag = state.logPanels.drag;
+  if (drag && drag.to !== index) {
+    drag.to = index;
+    markHistogramSelection();
+  }
+  showHistogramTooltip(index, event.clientX);
+});
+el('histogramBars').addEventListener('pointerup', () => {
+  const drag = state.logPanels.drag;
+  if (!drag) return;
+  state.logPanels.drag = null;
+  markHistogramSelection();
+  applyHistogramSelection(drag.from, drag.to);
+});
+el('histogramBars').addEventListener('pointercancel', () => {
+  state.logPanels.drag = null;
+  markHistogramSelection();
+});
+el('histogramBars').addEventListener('pointerleave', () => {
+  if (!state.logPanels.drag) hideHistogramTooltip();
+});
+el('histogramReset').addEventListener('click', () => resetHistogramRange());
 el('newRowsBanner').addEventListener('click', () => {
   el('newRowsBanner').classList.remove('show');
 });
