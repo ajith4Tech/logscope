@@ -21,7 +21,6 @@ const FILTER_EXCLUDES = [
 ];
 
 const state = {
-  filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
   facets: {},
   // Values left out per filter field (Alt/Shift-click in the field sidebar).
   exclude: { scope: [], namespace: [], pod: [], container: [], severity_bucket: [] },
@@ -141,12 +140,13 @@ function dashboardContextText() {
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
-const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'pipeline', 'settings'];
+const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'alerts', 'pipeline', 'settings'];
 const TAB_IDS = {
   dashboard: ['tabDashboard', 'panelDashboard'],
   logs: ['tabLogs', 'panelLogs'],
   insights: ['tabInsights', 'panelInsights'],
   actionable: ['tabActionable', 'panelActionable'],
+  alerts: ['tabAlerts', 'panelAlerts'],
   pipeline: ['tabPipeline', 'panelPipeline'],
   settings: ['tabSettings', 'panelSettings'],
 };
@@ -179,6 +179,7 @@ function switchTab(name, { history = 'push' } = {}) {
     renderActionableWorkspace();
   }
   if (name === 'settings') openSettings();
+  if (name === 'alerts') loadAlerts();
   if (name === 'pipeline') {
     startPipelinePolling();
   } else {
@@ -273,6 +274,12 @@ function excludeParams() {
   return out;
 }
 
+// "raw" (FTS syntax) only while there is a search; phrase is the default
+// and is left out of the API and the URL.
+function currentQmode() {
+  return el('qmodeRaw').checked && el('q').value.trim() ? 'raw' : '';
+}
+
 function queryFromFilters(extra = {}) {
   const range = currentRange();
   const current = {
@@ -282,6 +289,7 @@ function queryFromFilters(extra = {}) {
     container: el('container').value,
     severity_bucket: el('severity_bucket').value,
     q: el('q').value.trim(),
+    qmode: currentQmode(),
     start: range.start,
     // Exclusive end: the API's "before" (entries strictly earlier).
     before: range.before,
@@ -486,8 +494,8 @@ async function drillDownFromDashboard(action, value, severity = '') {
     el('scope').value = 'security';
   } else if (action === 'search') {
     el('q').value = value;
+    el('qmodeRaw').checked = false;
   }
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   // One history entry for the whole drilldown (tab + filters + range).
@@ -1357,6 +1365,7 @@ function renderAnomalies() {
 function fillAnomalyDetail(container, anomaly) {
   container.innerHTML = '';
   const evidence = anomaly.evidence || {};
+  if (anomaly.evidence_error) addDetailBlock(container, 'Evidence unavailable', anomaly.evidence_error);
   const ts = anomaly.template_summary;
   if (ts) {
     const lines = [ts.headline];
@@ -1421,8 +1430,8 @@ function openAnomalyLogs(anomaly) {
     : anomaly.type === 'severity_shift' ? (anomaly.severity || '') : '';
   setSelectValue(el('severity_bucket'), severity);
   el('q').value = '';
+  el('qmodeRaw').checked = false;
   if (windowRange) setExactRange(windowRange.start, windowRange.before);
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   switchTab('logs', { history: null });
@@ -2625,10 +2634,6 @@ async function pollTail() {
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
 }
 
-function syncFiltersFromUi() {
-  state.filters = queryFromFilters();
-}
-
 function startTailPolling() {
   stopTailPolling();
   state.tailRequestId += 1;
@@ -3257,6 +3262,7 @@ async function refreshStatus() {
     if (requestId !== state.pipeline.requestId) return status;
     state.lastStatus = status;
     applyAiStatus(status);
+    updateAlertsBadge(status);
     state.pipeline.fetchedAt = Date.now();
     state.pipeline.error = '';
     updateHealthFromStatus(status);
@@ -3312,8 +3318,9 @@ el('refreshPipeline').addEventListener('click', () => {
 // drilldowns, opening context) add a history entry; refinements (context
 // size, expanding an anomaly) replace the current one.
 //
-//   tab     dashboard | insights | actionable | pipeline   (logs when absent)
+//   tab     dashboard | insights | actionable | alerts | pipeline   (logs when absent)
 //   scope, ns, pod, ctr, sev, q                             filters
+//   qmode   raw: q is full-text query syntax (phrase when absent)
 //   xscope, xns, xpod, xctr, xsev   values left out, comma-separated
 //   range   1h | 6h | 24h | 7d | all   (today when absent; relative to "now")
 //   from, to   ISO-8601 UTC, [from, to) — an exact range (either may be absent)
@@ -3363,7 +3370,7 @@ function parseUrlState(search) {
   } catch (_) {
     params = new URLSearchParams();
   }
-  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
+  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
   const tab = params.get('tab');
   if (TABS.includes(tab)) out.tab = tab;
   for (const [key, field, max] of URL_FILTERS) {
@@ -3377,6 +3384,7 @@ function parseUrlState(search) {
     out.exclude[field] = Array.from(new Set(kept)).slice(0, FIELD_EXCLUDE_MAX);
   }
   out.q = cleanParam(params.get('q'), 500);
+  if (out.q && params.get('qmode') === 'raw') out.qmode = 'raw';
   const range = params.get('range');
   if (URL_RANGES.includes(range)) out.range = range;
   out.from = cleanTime(params.get('from'));
@@ -3405,6 +3413,7 @@ function buildUrlParams() {
   }
   const q = el('q').value.trim();
   if (q) params.set('q', q);
+  if (currentQmode()) params.set('qmode', currentQmode());
   const preset = el('rangePreset').value;
   if (!state.rangeExact && URL_RANGES.includes(preset)) {
     if (preset !== 'today') params.set('range', preset);
@@ -3483,6 +3492,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [...(parsed.exclude[field] || [])];
     forgetHistogramZoom();
     el('q').value = parsed.q || '';
+    el('qmodeRaw').checked = parsed.qmode === 'raw';
     if (parsed.from || parsed.to) {
       setExactRange(parsed.from, parsed.to);
     } else {
@@ -3493,7 +3503,6 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     state.context.lines = parsed.ctx;
     state.context.limitToRange = !parsed.ctxAll;
     state.focusAnomalyId = parsed.anomaly;
-    syncFiltersFromUi();
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });
@@ -3642,6 +3651,7 @@ function renderViewsMenu() {
       <button type="button" class="view-item-btn${view.pinned ? ' pinned' : ''}" data-view-action="pin" aria-pressed="${view.pinned ? 'true' : 'false'}" title="${pinLabel}" aria-label="${pinLabel}: ${name}">${view.pinned ? '★' : '☆'}</button>
       <button type="button" class="view-item-btn" data-view-action="up" title="Move up" aria-label="Move ${name} up"${canUp ? '' : ' disabled'}>↑</button>
       <button type="button" class="view-item-btn" data-view-action="down" title="Move down" aria-label="Move ${name} down"${canDown ? '' : ' disabled'}>↓</button>
+      <button type="button" class="view-item-btn" data-view-action="alert" title="Create an alert on this view" aria-label="Create an alert on ${name}">🔔</button>
       <button type="button" class="view-item-btn" data-view-action="edit" title="Rename or edit" aria-label="Rename ${name}">✎</button>
       <button type="button" class="view-item-btn" data-view-action="delete" title="Delete" aria-label="Delete ${name}">✕</button>
     </div>`;
@@ -3856,6 +3866,9 @@ el('viewsList').addEventListener('click', (event) => {
     runViewChange(() => viewRequest('PATCH', `/api/views/${id}`, { pinned: !view.pinned }));
   } else if (action === 'up' || action === 'down') {
     moveView(view, action === 'up' ? -1 : 1);
+  } else if (action === 'alert') {
+    setViewsMenuOpen(false);
+    openAlertForm({ viewId: view.id });
   } else if (action === 'edit') {
     openSaveViewDialog('edit', view);
   } else if (action === 'delete') {
@@ -3931,6 +3944,710 @@ el('pinnedViewsCards').addEventListener('click', (event) => {
   }
 });
 
+// ─── Alerts ──────────────────────────────────────────────────────────────────
+// Rules on saved views (/api/alerts/...). Reads are open; creating, editing
+// and deleting rules or channels needs the admin token (the Settings tab's,
+// kept in sessionStorage); muting does not, so on-call can silence a rule.
+
+const ALERT_STATE_LABELS = { ok: 'ok', pending: 'pending', firing: 'firing', unknown: 'unknown', resolved: 'resolved', disabled: 'disabled' };
+const ALERT_METRIC_LABELS = { count: 'entries', error_count: 'error entries', distinct_pods: 'distinct pods' };
+const alertsState = {
+  rules: [], channels: [], watermark: null, loaded: false, loading: false, error: '',
+  expanded: new Set(), history: new Map(), editingId: null, backtestTimer: null, backtestId: 0, requestId: 0,
+};
+
+function updateAlertsBadge(status) {
+  const firing = Number(status?.alerts?.firing || 0);
+  const badge = el('alertsBadge');
+  badge.hidden = !(firing > 0);
+  badge.textContent = firing > 0 ? String(firing) : '';
+  badge.title = firing > 0 ? `${firing} alert rule${firing === 1 ? '' : 's'} firing` : '';
+}
+
+// fetch for /api/alerts; admin requests carry the Settings admin token.
+async function alertsRequest(url, { method = 'GET', body, admin = false } = {}) {
+  const headers = {};
+  if (admin) headers.Authorization = `Bearer ${settingsToken()}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (err) {
+    throw new Error(`Network error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) throw new SettingsAuthError(data.error || 'A valid admin token is required');
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`);
+    err.field = data.field;
+    throw err;
+  }
+  return data;
+}
+
+async function loadAlerts() {
+  const requestId = ++alertsState.requestId;
+  alertsState.loading = true;
+  try {
+    const [rules, channels] = await Promise.all([
+      alertsRequest('/api/alerts/rules'), alertsRequest('/api/alerts/channels'),
+    ]);
+    if (requestId !== alertsState.requestId) return;
+    alertsState.rules = Array.isArray(rules.rules) ? rules.rules : [];
+    alertsState.watermark = rules.watermark || null;
+    alertsState.channels = Array.isArray(channels.channels) ? channels.channels : [];
+    alertsState.loaded = true;
+    alertsState.error = '';
+    updateAlertsBadge({ alerts: { firing: rules.firing } });
+  } catch (err) {
+    if (requestId === alertsState.requestId) alertsState.error = `Could not load alerts: ${err.message}`;
+  } finally {
+    if (requestId === alertsState.requestId) alertsState.loading = false;
+  }
+  if (!state.views.loaded) await loadViews();
+  renderAlerts();
+}
+
+function alertMinutes(seconds) {
+  const minutes = Number(seconds) / 60;
+  return minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
+}
+
+function alertConditionText(rule) {
+  const metric = ALERT_METRIC_LABELS[rule.metric] || rule.metric;
+  const per = rule.group_by !== 'none' ? ` per ${rule.group_by}` : '';
+  const times = Number(rule.for_evals) > 1 ? `, ${rule.for_evals}× in a row` : '';
+  return `${metric}${per} ${rule.op} ${rule.threshold} over ${alertMinutes(rule.window_s)} (every ${alertMinutes(rule.interval_s)}${times})`;
+}
+
+// Small bar sparkline (inline SVG) of the latest evaluations.
+function alertSparkMarkup(values, threshold) {
+  const points = (Array.isArray(values) ? values : []).map(Number).filter(Number.isFinite);
+  if (!points.length) return '<span class="alert-spark-empty">—</span>';
+  const max = Math.max(...points, Number(threshold) || 0, 1);
+  const width = 3;
+  const gap = 1;
+  const height = 18;
+  const bars = points.map((value, i) => {
+    const h = Math.max(1, Math.round((value / max) * height));
+    return `<rect x="${i * (width + gap)}" y="${height - h}" width="${width}" height="${h}"></rect>`;
+  }).join('');
+  const t = Number(threshold);
+  const line = Number.isFinite(t) && t > 0
+    ? `<line x1="0" x2="${points.length * (width + gap)}" y1="${height - Math.round((t / max) * height)}" y2="${height - Math.round((t / max) * height)}"></line>` : '';
+  return `<svg class="alert-spark" width="${points.length * (width + gap)}" height="${height}" viewBox="0 0 ${points.length * (width + gap)} ${height}" aria-hidden="true">${bars}${line}</svg>`;
+}
+
+function alertBadgeMarkup(status) {
+  const stateName = ALERT_STATE_LABELS[status?.state] || 'unknown';
+  const badges = [`<span class="alert-badge alert-badge-${escapeHtml(stateName)}">${escapeHtml(stateName)}</span>`];
+  if (status?.muted) badges.push('<span class="alert-badge alert-badge-muted">muted</span>');
+  return badges.join(' ');
+}
+
+function alertWatermarkText(mark) {
+  if (!mark) return 'Rules on saved views, evaluated up to the ingest watermark.';
+  if (!mark.at) return 'Waiting for the first complete S3 poll: rules report unknown until then.';
+  const lag = Number(mark.lag_secs);
+  const text = `Data complete up to ${formatTimestamp(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
+  return mark.stale ? `${text} The pipeline is stale: absence rules (<, <=) report unknown.` : text;
+}
+
+function renderAlerts() {
+  el('alertsSubtitle').textContent = alertWatermarkText(alertsState.watermark);
+  const errorBox = el('alertsError');
+  errorBox.hidden = !alertsState.error;
+  errorBox.textContent = alertsState.error;
+  const list = el('alertsList');
+  if (!alertsState.rules.length) {
+    list.innerHTML = `<div class="empty-state">${escapeHtml(alertsState.loaded
+      ? 'No alert rules yet. Save a view, then “Create alert” here or from the Views menu (🔔).'
+      : 'Loading…')}</div>`;
+    return;
+  }
+  const viewNames = new Map(state.views.list.map((view) => [view.id, view.name]));
+  list.innerHTML = alertsState.rules.map((rule) => {
+    const id = Number(rule.id);
+    const status = rule.status || {};
+    const lastValue = status.last_value === null || status.last_value === undefined ? '—' : String(status.last_value);
+    const viewName = rule.view_id === null ? '(no view)' : viewNames.get(rule.view_id) || `view #${Number(rule.view_id)}`;
+    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatTimestamp(rule.mute_until)}` : '';
+    const notes = [];
+    if (rule.disabled_reason) notes.push(rule.disabled_reason);
+    if (status.unknown_reason) notes.push(`Unknown: ${status.unknown_reason}`);
+    if (status.overflow) notes.push(`${status.overflow} more groups than max_groups were not evaluated`);
+    const groups = (status.groups || []).filter((g) => g.group && g.state !== 'ok').slice(0, 10);
+    const expanded = alertsState.expanded.has(id);
+    return `<div class="alert-rule" data-alert-id="${id}">
+      <div class="alert-rule-main">
+        <div class="alert-rule-title">${alertBadgeMarkup(status)} <span class="alert-rule-name">${escapeHtml(rule.name)}</span></div>
+        <div class="alert-rule-meta">${escapeHtml(viewName)} · ${escapeHtml(alertConditionText(rule))} · urgency ${escapeHtml(rule.urgency)}${escapeHtml(muteText)}</div>
+        ${notes.length ? `<div class="alert-rule-note">${notes.map(escapeHtml).join(' · ')}</div>` : ''}
+        ${groups.length ? `<div class="alert-groups">${groups.map((g) => `<span class="chip alert-group alert-group-${escapeHtml(g.state)}">${escapeHtml(g.group)}: ${escapeHtml(String(g.value ?? '—'))}</span>`).join('')}</div>` : ''}
+      </div>
+      <div class="alert-rule-value" title="Latest value">${escapeHtml(lastValue)}</div>
+      <div class="alert-rule-spark" title="Latest evaluations">${alertSparkMarkup(status.spark, rule.threshold)}</div>
+      <div class="alert-rule-actions">
+        ${status.muted
+          ? '<button type="button" class="ghost" data-alert-action="unmute">Unmute</button>'
+          : `<details class="alert-mute"><summary class="ghost-like">Mute</summary>
+              <div class="alert-mute-menu">
+                <button type="button" data-alert-action="mute" data-mute="1h">1 hour</button>
+                <button type="button" data-alert-action="mute" data-mute="4h">4 hours</button>
+                <button type="button" data-alert-action="mute" data-mute="24h">24 hours</button>
+                <span class="alert-inline"><input type="number" min="1" max="720" step="1" placeholder="hours" aria-label="Custom mute in hours" data-mute-hours />
+                <button type="button" data-alert-action="mute" data-mute="custom">Mute</button></span>
+              </div></details>`}
+        <button type="button" class="ghost" data-alert-action="history" aria-expanded="${expanded ? 'true' : 'false'}">History</button>
+        <button type="button" class="ghost" data-alert-action="edit">Edit</button>
+        <button type="button" class="ghost" data-alert-action="delete">Delete</button>
+      </div>
+      ${expanded ? `<div class="alert-history">${alertHistoryMarkup(alertsState.history.get(id))}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function alertHistoryMarkup(history) {
+  if (!history) return '<div class="subtle">Loading…</div>';
+  if (history.error) return `<div class="views-error">${escapeHtml(history.error)}</div>`;
+  if (!history.items.length) return '<div class="subtle">No state changes recorded yet (kept 30 days).</div>';
+  const rows = history.items.map((e) => `<tr>
+      <td>${escapeHtml(formatTimestamp(e.ts))}</td>
+      <td>${escapeHtml(e.group_key || '—')}</td>
+      <td>${escapeHtml(e.from_state || '—')} → <b>${escapeHtml(e.state)}</b>${e.muted ? ' (muted)' : ''}</td>
+      <td>${escapeHtml(e.value === null || e.value === undefined ? '—' : String(e.value))}</td>
+      <td>${alertDeliveryMarkup(e)}${e.detail ? ` <span class="subtle">${escapeHtml(e.detail)}</span>` : ''}</td>
+    </tr>`).join('');
+  return `<table class="alert-history-table"><thead><tr><th>When</th><th>Group</th><th>State</th><th>Value</th><th>Notification</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Delivery status of one history row: sent, queued / retrying (with the next
+// attempt), failed_final, superseded; "Retry now" (admin) when retryable.
+const ALERT_DELIVERY_LABELS = {
+  no: '—', sent: 'sent', queued: 'queued', retrying: 'retrying', failed: 'failed',
+  failed_final: 'failed (gave up)', superseded: 'superseded',
+};
+
+function alertDeliveryMarkup(e) {
+  const label = ALERT_DELIVERY_LABELS[e.notified] || String(e.notified || '—');
+  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(e.notified || 'no')}">${escapeHtml(label)}</span>`];
+  const attempts = Number(e.attempts || 0);
+  if (attempts > 1 || (attempts && e.notified !== 'sent')) parts.push(`<span class="subtle">${attempts} attempt${attempts === 1 ? '' : 's'}</span>`);
+  if ((e.notified === 'retrying' || e.notified === 'queued') && e.next_attempt_at) {
+    parts.push(`<span class="subtle">next ${escapeHtml(formatTimestamp(e.next_attempt_at))}</span>`);
+  }
+  if (e.error) parts.push(`<span class="alert-error-text">${escapeHtml(e.error)}</span>`);
+  if (e.retryable) parts.push(`<button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`);
+  return parts.join(' ');
+}
+
+async function loadAlertHistory(id) {
+  try {
+    const data = await alertsRequest(`/api/alerts/events?rule=${encodeURIComponent(id)}&limit=25`);
+    alertsState.history.set(id, { items: Array.isArray(data.items) ? data.items : [] });
+  } catch (err) {
+    alertsState.history.set(id, { error: err.message, items: [] });
+  }
+  renderAlerts();
+}
+
+async function alertAction(rule, action, button) {
+  const id = Number(rule.id);
+  try {
+    if (action === 'mute') {
+      let duration = button.dataset.mute;
+      if (duration === 'custom') {
+        const hours = Number(button.closest('.alert-mute-menu')?.querySelector('[data-mute-hours]')?.value);
+        if (!Number.isFinite(hours) || hours <= 0 || hours > 720) throw new Error('Enter 1 to 720 hours');
+        duration = Math.round(hours * 3600);
+      }
+      await alertsRequest(`/api/alerts/rules/${id}/mute`, { method: 'POST', body: { duration } });
+    } else if (action === 'unmute') {
+      await alertsRequest(`/api/alerts/rules/${id}/mute`, { method: 'DELETE' });
+    } else if (action === 'history') {
+      if (alertsState.expanded.has(id)) {
+        alertsState.expanded.delete(id);
+        renderAlerts();
+      } else {
+        alertsState.expanded.add(id);
+        renderAlerts();
+        await loadAlertHistory(id);
+      }
+      return;
+    } else if (action === 'edit') {
+      openAlertForm({ rule });
+      return;
+    } else if (action === 'delete') {
+      if (!window.confirm(`Delete the alert rule “${rule.name}” and its history?`)) return;
+      await alertsRequest(`/api/alerts/rules/${id}`, { method: 'DELETE', admin: true });
+    } else if (action === 'retry') {
+      const eventId = Number(button.dataset.eventId);
+      if (!Number.isInteger(eventId)) return;
+      button.disabled = true;
+      await alertsRequest(`/api/alerts/events/${eventId}/retry`, { method: 'POST', admin: true });
+      // The delivery thread picks it up right away; show the outcome shortly.
+      await loadAlertHistory(id);
+      window.setTimeout(() => { if (alertsState.expanded.has(id)) loadAlertHistory(id); }, 3000);
+      return;
+    }
+    await loadAlerts();
+  } catch (err) {
+    alertsState.error = err instanceof SettingsAuthError
+      ? `${action === 'retry' ? 'Retrying' : 'Deleting'} needs the admin token: unlock the Settings tab first.`
+      : `${err.message}`;
+    renderAlerts();
+  }
+}
+
+// ── Rule form with a live backtest ──
+
+function renderAlertChannels(selected) {
+  const box = el('alertChannelList');
+  if (!alertsState.channels.length) {
+    box.innerHTML = '<div class="subtle">No channels yet: add one under Channels. Events are still recorded.</div>';
+    return;
+  }
+  box.innerHTML = alertsState.channels.map((channel) => {
+    const id = Number(channel.id);
+    const checked = selected.includes(id) ? ' checked' : '';
+    return `<label class="toggle"><input type="checkbox" data-alert-channel="${id}"${checked} /> ${escapeHtml(channel.name)} <span class="subtle">(${escapeHtml(channel.type)}${channel.read_only ? ', environment' : ''})</span></label>`;
+  }).join('');
+}
+
+async function openAlertForm({ viewId = null, rule = null } = {}) {
+  if (!state.views.loaded) await loadViews();
+  if (!alertsState.loaded) await loadAlerts();
+  alertsState.editingId = rule ? Number(rule.id) : null;
+  el('alertFormTitle').textContent = rule ? 'Edit alert' : 'Create alert';
+  const select = el('alertView');
+  select.innerHTML = state.views.list.map((view) => `<option value="${Number(view.id)}">${escapeHtml(view.name)}</option>`).join('');
+  const chosen = rule?.view_id ?? viewId ?? state.views.currentId ?? state.views.list[0]?.id ?? null;
+  if (chosen !== null) select.value = String(chosen);
+  const viewName = state.views.list.find((view) => view.id === Number(chosen))?.name || '';
+  el('alertName').value = rule?.name || (viewName ? `${viewName}: too many entries` : '');
+  el('alertMetric').value = rule?.metric || 'count';
+  el('alertOp').value = rule?.op || '>';
+  el('alertThreshold').value = rule ? String(rule.threshold) : '10';
+  el('alertWindow').value = String((rule?.window_s || 300) / 60);
+  el('alertInterval').value = String((rule?.interval_s || 60) / 60);
+  el('alertFor').value = String(rule?.for_evals || 1);
+  el('alertGroupBy').value = rule?.group_by || 'none';
+  el('alertUrgency').value = rule?.urgency || 'high';
+  el('alertRenotify').value = String(rule ? rule.renotify_s / 3600 : 6);
+  el('alertResolved').checked = rule ? Boolean(rule.notify_resolved) : true;
+  el('alertAi').checked = Boolean(rule?.ai_summary);
+  el('alertEnabled').checked = rule ? Boolean(rule.enabled) : true;
+  renderAlertChannels(rule?.channel_ids || []);
+  el('alertTokenField').hidden = Boolean(settingsToken());
+  el('alertToken').value = '';
+  el('alertFormError').hidden = true;
+  el('alertBacktest').textContent = state.views.list.length ? '' : 'Save a view first: alerts count what a saved view matches.';
+  el('alertModal').showModal();
+  el('alertName').focus();
+  scheduleAlertBacktest();
+}
+
+function alertFormBody() {
+  const minutes = (id) => Math.round(Number(el(id).value) * 60);
+  return {
+    name: el('alertName').value.trim(),
+    view_id: el('alertView').value ? Number(el('alertView').value) : null,
+    metric: el('alertMetric').value,
+    op: el('alertOp').value,
+    threshold: Number(el('alertThreshold').value),
+    window_s: minutes('alertWindow'),
+    interval_s: minutes('alertInterval'),
+    for_evals: Math.round(Number(el('alertFor').value)),
+    group_by: el('alertGroupBy').value,
+    urgency: el('alertUrgency').value,
+    renotify_s: Math.round(Number(el('alertRenotify').value) * 3600),
+    notify_resolved: el('alertResolved').checked,
+    ai_summary: el('alertAi').checked,
+    enabled: el('alertEnabled').checked,
+    channel_ids: Array.from(el('alertChannelList').querySelectorAll('[data-alert-channel]'))
+      .filter((box) => box.checked).map((box) => Number(box.dataset.alertChannel)),
+  };
+}
+
+function scheduleAlertBacktest() {
+  window.clearTimeout(alertsState.backtestTimer);
+  alertsState.backtestTimer = window.setTimeout(runAlertBacktest, 500);
+}
+
+async function runAlertBacktest() {
+  const body = alertFormBody();
+  if (body.view_id === null) return;
+  const requestId = ++alertsState.backtestId;
+  const box = el('alertBacktest');
+  box.textContent = 'Backtesting the last 7 days…';
+  try {
+    const result = await alertsRequest('/api/alerts/backtest', {
+      method: 'POST',
+      body: {
+        view_id: body.view_id, metric: body.metric, op: body.op, threshold: body.threshold,
+        window_s: body.window_s, interval_s: body.interval_s, for_evals: body.for_evals, range_s: 604800,
+      },
+    });
+    if (requestId !== alertsState.backtestId) return;
+    const fired = Number(result.fired || 0);
+    const series = (result.series || []).map((point) => Number(point.value));
+    const last = (result.fires || []).slice(-3).map((f) => formatTimestamp(f.at)).join(', ');
+    box.innerHTML = `<div><b>Would have fired ${escapeHtml(String(fired))} time${fired === 1 ? '' : 's'} in 7 days</b>${body.group_by !== 'none' ? ' (all groups together)' : ''}${result.approximate ? ' · approximate' : ''}</div>
+      ${last ? `<div class="subtle">Latest: ${escapeHtml(last)}</div>` : ''}
+      <div class="alert-backtest-spark">${alertSparkMarkup(series.slice(-200), body.threshold)}</div>`;
+  } catch (err) {
+    if (requestId !== alertsState.backtestId) return;
+    box.textContent = `Backtest unavailable: ${err.message}`;
+  }
+}
+
+async function submitAlertForm() {
+  const body = alertFormBody();
+  const errorBox = el('alertFormError');
+  errorBox.hidden = true;
+  const token = el('alertToken').value.trim();
+  if (token) setSettingsToken(token);
+  if (!body.name) {
+    errorBox.textContent = 'Enter a name.';
+    errorBox.hidden = false;
+    return;
+  }
+  const id = alertsState.editingId;
+  try {
+    await alertsRequest(id === null ? '/api/alerts/rules' : `/api/alerts/rules/${id}`, {
+      method: id === null ? 'POST' : 'PATCH', body, admin: true,
+    });
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      setSettingsToken('');
+      el('alertTokenField').hidden = false;
+      errorBox.textContent = 'Saving an alert needs the admin token (the same one as the Settings tab).';
+    } else {
+      errorBox.textContent = err.field ? `${err.field}: ${err.message}` : err.message;
+    }
+    errorBox.hidden = false;
+    return;
+  }
+  el('alertModal').close();
+  await loadAlerts();
+}
+
+// ── Channels (admin) ──
+
+function renderChannels() {
+  const list = el('channelsList');
+  if (!alertsState.channels.length) {
+    list.innerHTML = '<div class="subtle">No channels yet.</div>';
+    return;
+  }
+  list.innerHTML = alertsState.channels.map((channel) => {
+    const id = Number(channel.id);
+    const readOnly = Boolean(channel.read_only);
+    return `<div class="channel-row" data-channel-id="${id}">
+      <span class="channel-name">${escapeHtml(channel.name)}</span>
+      <span class="subtle">${escapeHtml(channel.type)} · ${escapeHtml(channel.url_hint || '')}${channel.has_secret ? ' · signed' : ''}${readOnly ? ' · from the environment, read-only' : ''}</span>
+      <span class="channel-actions">
+        <button type="button" class="ghost" data-channel-action="test">Test</button>
+        ${readOnly ? '' : '<button type="button" class="ghost" data-channel-action="delete">Delete</button>'}
+      </span>
+      <span class="channel-result" data-channel-result></span>
+    </div>`;
+  }).join('');
+}
+
+async function openChannels() {
+  if (!alertsState.loaded) await loadAlerts();
+  renderChannels();
+  el('channelTokenField').hidden = Boolean(settingsToken());
+  el('channelError').hidden = true;
+  el('channelsModal').showModal();
+}
+
+function channelAuthFailed() {
+  setSettingsToken('');
+  el('channelTokenField').hidden = false;
+  el('channelError').textContent = 'Channel changes need the admin token (the same one as the Settings tab).';
+  el('channelError').hidden = false;
+}
+
+async function addChannel() {
+  const token = el('channelToken').value.trim();
+  if (token) setSettingsToken(token);
+  const body = { name: el('channelName').value.trim(), type: el('channelType').value, url: el('channelUrl').value.trim() };
+  const secret = el('channelSecret').value;
+  if (secret) body.secret = secret;
+  el('channelError').hidden = true;
+  try {
+    await alertsRequest('/api/alerts/channels', { method: 'POST', body, admin: true });
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      channelAuthFailed();
+    } else {
+      el('channelError').textContent = err.field ? `${err.field}: ${err.message}` : err.message;
+      el('channelError').hidden = false;
+    }
+    return;
+  }
+  el('channelName').value = '';
+  el('channelUrl').value = '';
+  el('channelSecret').value = '';
+  await loadAlerts();
+  renderChannels();
+}
+
+el('alertsRefresh').addEventListener('click', () => loadAlerts());
+el('alertsCreateBtn').addEventListener('click', () => openAlertForm());
+el('alertsChannelsBtn').addEventListener('click', () => openChannels());
+el('alertsList').addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-alert-action]') : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const id = Number(button.closest('[data-alert-id]')?.dataset.alertId);
+  const rule = alertsState.rules.find((item) => Number(item.id) === id);
+  if (rule) alertAction(rule, button.dataset.alertAction, button);
+});
+el('alertForm').addEventListener('input', (event) => {
+  if (event.target instanceof HTMLElement && ['alertName', 'alertToken'].includes(event.target.id)) return;
+  scheduleAlertBacktest();
+});
+el('alertForm').addEventListener('change', () => scheduleAlertBacktest());
+el('alertForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  submitAlertForm();
+});
+el('alertCancel').addEventListener('click', () => el('alertModal').close());
+el('channelForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  addChannel();
+});
+el('channelsClose').addEventListener('click', () => el('channelsModal').close());
+el('channelsList').addEventListener('click', async (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-channel-action]') : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const row = button.closest('[data-channel-id]');
+  const id = Number(row?.dataset.channelId);
+  const result = row?.querySelector('[data-channel-result]');
+  const token = el('channelToken').value.trim();
+  if (token) setSettingsToken(token);
+  try {
+    if (button.dataset.channelAction === 'test') {
+      if (result) result.textContent = 'Sending…';
+      const data = await alertsRequest(`/api/alerts/channels/${id}/test`, { method: 'POST', admin: true });
+      if (result) result.textContent = data.ok ? 'Delivered' : `Failed: ${data.error || 'unknown error'}`;
+    } else if (button.dataset.channelAction === 'delete') {
+      if (!window.confirm('Delete this channel? Rules stop sending to it.')) return;
+      await alertsRequest(`/api/alerts/channels/${id}`, { method: 'DELETE', admin: true });
+      await loadAlerts();
+      renderChannels();
+    }
+  } catch (err) {
+    if (err instanceof SettingsAuthError) channelAuthFailed();
+    else if (result) result.textContent = err.message;
+  }
+});
+
+// ─── Ask: natural-language filters ───────────────────────────────────────────
+// POST /api/ai/filters turns a request into proposed filters (URL form, see
+// VIEW_FILTER_KEYS). The proposal is only previewed; Apply writes it into the
+// filter controls and the URL like opening a link. Shown while AI is
+// configured and nl_filters is on.
+
+const ASK_KEY_LABELS = {
+  scope: 'Scope', ns: 'Namespace', pod: 'Pod', ctr: 'Container', sev: 'Severity',
+  q: 'Search', qmode: 'Search mode',
+  xscope: 'Not scope', xns: 'Not namespace', xpod: 'Not pod', xctr: 'Not container', xsev: 'Not severity',
+  range: 'Range', from: 'From', to: 'To',
+};
+const ASK_RANGE_LABELS = { today: 'Today', '1h': 'Last hour', '6h': 'Last 6 hours', '24h': 'Last 24 hours', '7d': 'Last 7 days', all: 'All time' };
+const askState = { requestId: 0, loading: false, proposal: null, text: '' };
+
+function renderAskBox() {
+  const on = aiFeatureOn('nl_filters');
+  el('askBox').hidden = !on;
+  if (!on) dismissAsk();
+}
+
+function askValueText(key, value) {
+  if (key === 'range') return ASK_RANGE_LABELS[value] || value;
+  if (key === 'from' || key === 'to') return formatTimestamp(value);
+  return value;
+}
+
+// Changes from the filters on screen: added / removed / changed chips. The
+// default range (today) and search mode (phrase) are absent in both forms.
+function askChanges(current, proposed) {
+  const changes = [];
+  for (const key of VIEW_FILTER_KEYS) {
+    const before = current[key] || '';
+    const after = proposed[key] || '';
+    if (before === after) continue;
+    if (VIEW_EXCLUDE_KEYS.has(key) && before && after
+      && before.split(',').sort().join(',') === after.split(',').sort().join(',')) continue;
+    changes.push({ key, kind: !before ? 'added' : !after ? 'removed' : 'changed', before, after });
+  }
+  return changes;
+}
+
+function askChipMarkup(change) {
+  const label = escapeHtml(ASK_KEY_LABELS[change.key] || change.key);
+  const before = escapeHtml(askValueText(change.key, change.before));
+  const after = escapeHtml(askValueText(change.key, change.after));
+  const sign = { added: '+', removed: '−', changed: '~' }[change.kind];
+  const value = change.kind === 'added' ? after
+    : change.kind === 'removed' ? `<s>${before}</s>`
+      : `<s>${before}</s> → ${after}`;
+  return `<span class="chip ask-chip ask-chip-${change.kind}" title="${escapeHtml(change.kind)}"><b>${sign}</b> ${label}: ${value}</span>`;
+}
+
+function renderAskPreview() {
+  const box = el('askPreview');
+  const proposal = askState.proposal;
+  if (!proposal) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  const filters = proposal.filters && typeof proposal.filters === 'object' ? proposal.filters : {};
+  const changes = askChanges(currentViewFilters(), filters);
+  const warnings = Array.isArray(proposal.warnings) ? proposal.warnings : [];
+  const confidence = Number(proposal.confidence);
+  const confidenceText = proposal.confidence !== null && proposal.confidence !== undefined && Number.isFinite(confidence)
+    ? `${Math.round(confidence * 100)}% confident` : '';
+  const chips = changes.length
+    ? `<div class="ask-chips">${changes.map(askChipMarkup).join('')}</div>`
+    : '<div class="ask-note">Same as the filters already applied.</div>';
+  box.innerHTML = `
+    ${proposal.explanation ? `<p class="ask-explanation">${escapeHtml(proposal.explanation)}</p>` : ''}
+    ${confidenceText || proposal.cached ? `<div class="ask-meta">${escapeHtml([confidenceText, proposal.cached ? 'cached answer' : ''].filter(Boolean).join(' · '))}</div>` : ''}
+    ${chips}
+    ${warnings.length ? `<ul class="ask-warnings">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+    <div class="ask-actions">
+      <button type="button" data-ask-action="apply"${changes.length ? '' : ' disabled'}>Apply</button>
+      <button type="button" class="ghost" data-ask-action="save">Apply &amp; save as view</button>
+      <button type="button" class="ghost" data-ask-action="dismiss">Dismiss</button>
+    </div>`;
+  box.hidden = false;
+}
+
+function setAskStatus(text, kind = '') {
+  const status = el('askStatus');
+  status.hidden = !text;
+  status.textContent = text;
+  status.className = `ask-status${kind ? ` ask-status-${kind}` : ''}`;
+}
+
+function dismissAsk() {
+  askState.requestId += 1; // a reply still in flight is ignored
+  askState.loading = false;
+  askState.proposal = null;
+  el('askSubmit').disabled = false;
+  el('askSubmit').textContent = 'Ask';
+  setAskStatus('');
+  renderAskPreview();
+}
+
+async function submitAsk() {
+  const text = el('askInput').value.trim();
+  if (!text || askState.loading) return;
+  if (text.length > 500) {
+    setAskStatus('Keep the request under 500 characters.', 'error');
+    return;
+  }
+  const requestId = ++askState.requestId;
+  askState.loading = true;
+  askState.proposal = null;
+  askState.text = text;
+  renderAskPreview();
+  el('askSubmit').disabled = true;
+  el('askSubmit').textContent = 'Asking…';
+  setAskStatus('Working out the filters…');
+  let tz = 'UTC';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) {}
+  let res = null;
+  let data = {};
+  let networkError = '';
+  try {
+    res = await fetch('/api/ai/filters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, tz, current: currentViewFilters() }),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (err) {
+    networkError = err instanceof Error ? err.message : String(err);
+  }
+  if (requestId !== askState.requestId) return;
+  askState.loading = false;
+  el('askSubmit').disabled = false;
+  el('askSubmit').textContent = 'Ask';
+  if (networkError) {
+    setAskStatus(`Network error: ${networkError}`, 'error');
+    return;
+  }
+  if (!res.ok) {
+    if (res.status === 403 && data.error === 'ai_feature_disabled') {
+      state.aiFeatures = { ...state.aiFeatures, nl_filters: false };
+      renderAskBox();
+      return;
+    }
+    if (res.status === 503 && data.error === 'ai_disabled') {
+      setAskStatus('No AI provider is configured (Settings → AI).', 'error');
+      return;
+    }
+    if (res.status === 503 && data.error === 'budget') {
+      setAskStatus(data.message || 'The daily AI budget is used up; try again after 00:00 UTC.', 'error');
+      return;
+    }
+    const message = typeof data.error === 'string' && data.error ? data.error : `${res.status} ${res.statusText}`;
+    setAskStatus(`Could not work out filters: ${message}`, 'error');
+    return;
+  }
+  setAskStatus('');
+  askState.proposal = data;
+  renderAskPreview();
+}
+
+// Writes the proposal into the filter controls and the URL (same tab; the
+// open view, if any, shows as modified).
+async function applyAsk() {
+  const proposal = askState.proposal;
+  if (!proposal) return;
+  const params = new URLSearchParams();
+  for (const key of VIEW_FILTER_KEYS) {
+    const value = proposal.filters?.[key];
+    if (typeof value === 'string' && value) params.set(key, value);
+  }
+  if (state.activeTab !== 'logs') params.set('tab', state.activeTab);
+  if (state.views.currentId !== null) params.set('view', String(state.views.currentId));
+  await applyUrlState(parseUrlState(params.toString()), { history: 'push' });
+}
+
+el('askForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  submitAsk();
+});
+el('askPreview').addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-ask-action]') : null;
+  if (!(button instanceof HTMLButtonElement) || button.disabled) return;
+  const action = button.dataset.askAction;
+  if (action === 'dismiss') {
+    dismissAsk();
+    return;
+  }
+  const proposal = askState.proposal;
+  const text = askState.text;
+  applyAsk().then(() => {
+    dismissAsk();
+    if (action !== 'save') return;
+    state.views.currentId = null; // a new view, not an update of the open one
+    updateUrl('replace');
+    openSaveViewDialog('save');
+    el('saveViewName').value = text.slice(0, 80);
+    el('saveViewDescription').value = (proposal?.explanation || '').slice(0, 500);
+    el('saveViewName').select();
+  }).catch((err) => setAskStatus(`Could not apply the filters: ${err.message}`, 'error'));
+});
+
 // ─── AI features and the Settings tab ────────────────────────────────────────
 
 // A feature's buttons show only when AI is configured and the feature is on.
@@ -3952,6 +4669,7 @@ function applyAiStatus(status) {
   badge.title = warnings.join('\n');
   if (!changed) return;
   updateExplainButton();
+  renderAskBox();
   if (state.items && state.items.length) renderAll();
   if (state.insightsLoaded) renderAnomalies();
 }
@@ -3979,7 +4697,7 @@ const FEATURE_LABELS = {
   explain_filtered: ['Explain these logs', 'AI summary of the currently filtered logs'],
   anomaly_auto_summary: ['Automatic anomaly summaries', 'Every detected anomaly is summarized in the background (uses the deep model)'],
   anomaly_manual_summary: ['Summarize anomaly on request', 'The ✦ Summarize button on Insights rows (uses the deep model)'],
-  nl_filters: ['Natural-language filters', 'Reserved for natural-language search; no button uses it yet'],
+  nl_filters: ['Natural-language filters', 'The Ask box above the filters: proposes filters from a plain-language request'],
   deep_analysis: ['Deep analysis', 'Every "Deep analysis" run (deep model), whatever it explains'],
   settings_test: ['Connection tests', 'Settings → Test connection'],
 };
@@ -4198,7 +4916,7 @@ function budgetsCardMarkup(data) {
   const budgets = data.budgets || {};
   const calls = budgets.daily_calls || {};
   const valueOf = (v) => (v === null || v === undefined ? '' : String(v));
-  const callInputs = (data.budget_features || data.features || []).filter((f) => f !== 'nl_filters').map((name) => `
+  const callInputs = (data.budget_features || data.features || []).map((name) => `
       <label class="settings-field settings-field-compact">
         <span class="settings-label">${escapeHtml((FEATURE_LABELS[name] || [name])[0])}</span>
         <input type="number" min="0" step="1" data-budget-calls="${escapeHtml(name)}" value="${escapeHtml(valueOf(calls[name]))}" placeholder="no limit" />
@@ -4472,7 +5190,6 @@ async function init() {
 
 // Applying filters is a navigation: one history entry, results view shown.
 function reloadLogs() {
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   updateUrl('push');
@@ -4550,9 +5267,15 @@ el('clearFilters').addEventListener('click', () => {
   for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [];
   forgetHistogramZoom();
   el('q').value = '';
+  el('qmodeRaw').checked = false;
   el('rangePreset').value = 'today';
   setDefaultDateRange();
   reloadLogs();
+});
+// Switching the search mode re-runs a search that is already there.
+el('qmodeRaw').addEventListener('change', () => {
+  if (el('q').value.trim()) reloadLogs();
+  else updateUrl('replace');
 });
 el('securityShortcut').addEventListener('click', () => {
   el('scope').value = 'security';
@@ -4681,14 +5404,6 @@ el('openInActionableBtn').addEventListener('click', () => {
   switchTab('actionable');
 });
 
-const actionableAnalyzeLogsBtn = el('actionableAnalyzeLogsBtn');
-if (actionableAnalyzeLogsBtn) {
-  actionableAnalyzeLogsBtn.addEventListener('click', async () => {
-    await runExplain();
-    switchTab('actionable');
-  });
-}
-
 el('actionableRefreshBtn').addEventListener('click', async () => {
   const selVal = el('actionableSourceSelect').value;
   if (selVal && selVal.startsWith('anomaly-')) {
@@ -4726,16 +5441,24 @@ el('actionableResetStepsBtn').addEventListener('click', () => {
   resetActionableSteps();
 });
 
-el('confirmCancelBtn').addEventListener('click', () => {
-  el('actionConfirmModal').close();
+// Every way out of the confirm dialog except "Execute" drops the pending
+// mutation: the Cancel button, Esc (the dialog's cancel event) and a click on
+// the backdrop. A stale confirmation must never run later.
+function dismissConfirmModal() {
   state.actionable.pendingMutation = null;
+  const modal = el('actionConfirmModal');
+  if (modal.open) modal.close();
+}
+
+el('confirmCancelBtn').addEventListener('click', dismissConfirmModal);
+el('actionConfirmModal').addEventListener('cancel', dismissConfirmModal);
+el('actionConfirmModal').addEventListener('click', (event) => {
+  // A click on the dialog element itself (not its content) is the backdrop.
+  if (event.target === el('actionConfirmModal')) dismissConfirmModal();
 });
 
 el('confirmExecuteBtn').addEventListener('click', () => {
-  el('actionConfirmModal').close();
   const pending = state.actionable.pendingMutation;
-  if (pending) {
-    state.actionable.pendingMutation = null;
-    executeActionableStep(pending.key, pending);
-  }
+  dismissConfirmModal();
+  if (pending) executeActionableStep(pending.key, pending);
 });

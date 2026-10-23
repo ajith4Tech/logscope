@@ -15,8 +15,9 @@ import json
 import logging
 import threading
 from collections import deque
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from .config import URGENCY_ORDER
 from .explain import Explainer, anomaly_cache_key, decorate, meta_of

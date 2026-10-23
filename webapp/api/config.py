@@ -8,11 +8,13 @@ from typing import Any
 import yaml
 
 from .state import STATE_DB_ENV, default_state_db_path
-
+from .storage import CACHE_DB_ENV, default_cache_db_path
 
 DEFAULT_BACKEND = {
     "poll_interval_secs": 30,
-    "db_path": "/tmp/logscope-webapp.sqlite",
+    # The log cache (rebuildable from S3). None = $XDG_CACHE_HOME/logscope/
+    # cache.sqlite (~/.cache/logscope/...); never /tmp. $LOGSCOPE_WEBAPP_DB_PATH wins.
+    "db_path": None,
     # Durable state (saved views) in its own file; never in /tmp. None =
     # $XDG_DATA_HOME/logscope/state.sqlite (~/.local/share/logscope/...).
     "state_db_path": None,
@@ -88,6 +90,17 @@ DEFAULT_MATTERMOST = {
     "max_age_hours": 6,
 }
 
+DEFAULT_ALERTS = {
+    # Seconds subtracted from the ingest watermark (see alerts.watermark):
+    # objects can land in S3 a little after the poll that should have seen them.
+    "watermark_margin_secs": 120,
+    # Vector's S3 batch timeout (batch.timeout_secs; scripts/render.py and the
+    # chart use 600): an event is in S3 at most this long after it happened.
+    "s3_batch_timeout_secs": 600,
+    # How often the evaluator looks for due rules.
+    "eval_tick_secs": 30,
+}
+
 # Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
 # against min_urgency.
 URGENCY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
@@ -159,8 +172,19 @@ class MattermostConfig:
 
 
 @dataclass(frozen=True)
+class AlertsConfig:
+    # IANA zone for times in notifications (webapp.display_tz).
+    display_tz: str = "UTC"
+    # Public URL of the UI for deep links (webapp.public_url, else
+    # webapp.mattermost.link_base_url). Empty = no links.
+    public_url: str = ""
+    watermark_margin_secs: int = 120
+    s3_batch_timeout_secs: int = 600
+    eval_tick_secs: float = 30
+
+
+@dataclass(frozen=True)
 class AppConfig:
-    root: Path
     s3_bucket: str
     s3_region: str
     s3_key_prefix: str
@@ -174,6 +198,7 @@ class AppConfig:
     insights: InsightsConfig
     ai: AiConfig
     mattermost: MattermostConfig
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -225,8 +250,8 @@ def load_app_config(config_path: Path) -> AppConfig:
     mattermost.update(webapp.get("mattermost") or {})
     # Container deployments mount persistent storage at a different path than
     # the local-dev default; same LOGSCOPE_* override style as scripts/render.py.
-    if os.environ.get("LOGSCOPE_WEBAPP_DB_PATH"):
-        backend["db_path"] = os.environ["LOGSCOPE_WEBAPP_DB_PATH"]
+    if os.environ.get(CACHE_DB_ENV, "").strip():
+        backend["db_path"] = os.environ[CACHE_DB_ENV].strip()
     if os.environ.get(STATE_DB_ENV):
         backend["state_db_path"] = os.environ[STATE_DB_ENV]
     retention_days = backend.get("retention_days")
@@ -298,8 +323,24 @@ def load_app_config(config_path: Path) -> AppConfig:
         if float(mattermost[key]) <= 0:
             raise ValueError(f"webapp.mattermost.{key} must be > 0, got {mattermost[key]!r}")
 
+    alerts = dict(DEFAULT_ALERTS)
+    alerts.update(webapp.get("alerts") or {})
+    for key, minimum in (("watermark_margin_secs", 0), ("s3_batch_timeout_secs", 1), ("eval_tick_secs", 1)):
+        if float(alerts[key]) < minimum:
+            raise ValueError(f"webapp.alerts.{key} must be >= {minimum}, got {alerts[key]!r}")
+    display_tz = str(webapp.get("display_tz") or "UTC").strip()
+    try:
+        from zoneinfo import ZoneInfo
+
+        if display_tz.upper() != "UTC":
+            ZoneInfo(display_tz)
+    except Exception:
+        raise ValueError(f"webapp.display_tz must be an IANA time zone name, got {display_tz!r}") from None
+    public_url = str(webapp.get("public_url") or "").strip().rstrip("/") or link_base_url
+    if public_url and not public_url.lower().startswith(("https://", "http://")):
+        raise ValueError("webapp.public_url must start with https:// or http://")
+
     return AppConfig(
-        root=config_path.resolve().parent,
         s3_bucket=str(s3_cfg["bucket"]),
         s3_region=str(s3_cfg["region"]),
         s3_key_prefix=str(s3_cfg["key_prefix"]),
@@ -311,7 +352,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         falco_namespace=str(falco["namespace"]) if falco.get("enabled") and falco.get("namespace") else None,
         webapp=BackendConfig(
             poll_interval_secs=int(backend["poll_interval_secs"]),
-            db_path=Path(str(backend["db_path"])).expanduser(),
+            db_path=Path(str(backend["db_path"] or default_cache_db_path())).expanduser(),
             page_size_default=int(backend["page_size_default"]),
             page_size_max=int(backend["page_size_max"]),
             s3_lookback_secs=int(backend["s3_lookback_secs"]),
@@ -355,6 +396,13 @@ def load_app_config(config_path: Path) -> AppConfig:
             link_base_url=link_base_url,
             renotify_after_hours=float(mattermost["renotify_after_hours"]),
             max_age_hours=float(mattermost["max_age_hours"]),
+        ),
+        alerts=AlertsConfig(
+            display_tz=display_tz,
+            public_url=public_url,
+            watermark_margin_secs=int(alerts["watermark_margin_secs"]),
+            s3_batch_timeout_secs=int(alerts["s3_batch_timeout_secs"]),
+            eval_tick_secs=float(alerts["eval_tick_secs"]),
         ),
     )
 

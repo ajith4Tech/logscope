@@ -5,7 +5,9 @@ import binascii
 import functools
 import json
 import logging
+import math
 import os
+import re
 import shutil
 import sqlite3
 import threading
@@ -68,14 +70,22 @@ _PREFIX_ERRORS_MAX = 50
 _PREFIX_ERROR_CHARS = 300
 
 # Secondary indexes on records for filtered queries (field filter + time
-# range or time ordering). The UNIQUE key only serves ingest dedupe.
+# range or time ordering). The UNIQUE key only serves ingest dedupe. Every
+# time filter and ordering uses ts_epoch (UTC seconds), never the text.
 _RECORD_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS idx_records_ts_ns ON records(timestamp, namespace)",
-    "CREATE INDEX IF NOT EXISTS idx_records_ns_ts ON records(namespace, timestamp)",
-    "CREATE INDEX IF NOT EXISTS idx_records_sev_ts ON records(severity_bucket, timestamp)",
-    "CREATE INDEX IF NOT EXISTS idx_records_scope_ts ON records(scope, timestamp)",
-    "CREATE INDEX IF NOT EXISTS idx_records_pod_ts ON records(pod, timestamp)",
+    "CREATE INDEX IF NOT EXISTS idx_records_epoch ON records(ts_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_records_ns_epoch ON records(namespace, ts_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_records_sev_epoch ON records(severity_bucket, ts_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_records_scope_epoch ON records(scope, ts_epoch)",
+    "CREATE INDEX IF NOT EXISTS idx_records_pod_epoch ON records(pod, ts_epoch)",
 )
+# Text-timestamp indexes of older versions; dropped at start.
+_LEGACY_RECORD_INDEXES = (
+    "idx_records_ts_ns", "idx_records_ns_ts", "idx_records_sev_ts", "idx_records_scope_ts", "idx_records_pod_ts",
+)
+# Rows given a ts_epoch per locked step when backfilling a database written
+# by an older version (see backfill_ts_step).
+TS_BACKFILL_BATCH = 5000
 
 # Filter fields: (record column, exclusion parameter). An exclusion parameter
 # holds values to leave out, e.g. xns=kube-system.
@@ -101,7 +111,7 @@ HISTOGRAM_MAX_BUCKETS = 1000
 _HISTOGRAM_SEVERITIES = ("error", "warning", "info", "debug")
 
 _RECORD_COLUMNS = (
-    "id, timestamp, severity_bucket, scope, namespace, pod, container, message, raw_line, "
+    "id, timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container, message, raw_line, "
     "source_key, source_etag, line_number, is_falco"
 )
 
@@ -109,6 +119,19 @@ _RECORD_COLUMNS = (
 # the disk as low (SQLite needs room for its WAL, temp files and growth).
 DISK_LOW_FREE_BYTES = 256 * 1024 * 1024
 DISK_LOW_FREE_FRACTION = 0.05
+
+
+CACHE_DB_ENV = "LOGSCOPE_WEBAPP_DB_PATH"
+
+
+def default_cache_db_path() -> Path:
+    """$XDG_CACHE_HOME/logscope/cache.sqlite, else ~/.cache/logscope/. A
+    relative XDG_CACHE_HOME is ignored, as the XDG spec requires. Never /tmp:
+    the cache survives reboots (and is not world-readable). Overridden by
+    webapp.backend.db_path and $LOGSCOPE_WEBAPP_DB_PATH."""
+    xdg = os.environ.get("XDG_CACHE_HOME", "").strip()
+    base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".cache"
+    return base / "logscope" / "cache.sqlite"
 
 
 def open_connection(db_path: Path) -> sqlite3.Connection:
@@ -200,25 +223,68 @@ def _has_word_chars(token: str) -> bool:
     return any(ch.isalnum() for ch in token)
 
 
-def _parse_iso(value: str | None) -> datetime | None:
-    """An ISO-8601 time from a request (UTC when it has no offset)."""
-    if not value:
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+# ISO-8601 / RFC 3339 event times as log pipelines write them: "T" or a space
+# between date and time, optional seconds, any number of fraction digits
+# (Vector writes nanoseconds), and Z, UTC, +HH:MM, +HHMM, +HH or no zone.
+_EVENT_TIME_RE = re.compile(
+    r"^\s*(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d+))?)?)?"
+    r"\s*(Z|z|UTC|[+-]\d{2}(?::?\d{2})?)?\s*$"
+)
+
+
+def to_epoch(value: Any) -> float | None:
+    """UTC epoch seconds of an event time, or None when it does not parse.
+    A time without a zone is UTC. Fractions beyond microseconds are dropped.
+    One conversion path for record times and request bounds, so the same
+    instant always yields the same float."""
+    match = _EVENT_TIME_RE.match(str(value or ""))
+    if not match:
         return None
+    year, month, day, hour, minute, second, fraction, zone = match.groups()
     try:
-        moment = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    except ValueError:
-        raise ValueError(f"Invalid time {str(value)[:40]!r}") from None
-    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+        moment = datetime(int(year), int(month), int(day), int(hour or 0), int(minute or 0), int(second or 0),
+                          int((fraction or "0")[:6].ljust(6, "0")), tzinfo=timezone.utc)
+    except ValueError:  # e.g. month 13 or a leap second
+        return None
+    if zone and zone not in ("Z", "z", "UTC"):
+        digits = zone[1:].replace(":", "")
+        hours, minutes = int(digits[:2]), int(digits[2:4] or 0)
+        if hours > 14 or minutes > 59:
+            return None
+        offset = timedelta(hours=hours, minutes=minutes)
+        moment = moment - offset if zone[0] == "+" else moment + offset
+    return (moment - _EPOCH).total_seconds()
 
 
-def _encode_cursor(ts: str, record_id: int) -> str:
-    payload = json.dumps({"ts": ts, "id": record_id}, separators=(",", ":")).encode("utf-8")
+def iso_from_epoch(epoch: float) -> str:
+    return _iso_ms(datetime.fromtimestamp(epoch, timezone.utc))
+
+
+def _param_epoch(value: Any) -> float | None:
+    """A time bound from a request as epoch seconds; ValueError (a 400) when
+    it is not a time."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    epoch = to_epoch(value)
+    if epoch is None:
+        raise ValueError(f"Invalid time {str(value)[:40]!r}")
+    return epoch
+
+
+def _encode_cursor(epoch: float, record_id: int) -> str:
+    payload = json.dumps({"e": epoch, "id": record_id}, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
 
 
-def decode_cursor(cursor: str | None) -> tuple[str, int] | None:
-    """Decode a paging cursor. Anything that is not a cursor this server issued
-    raises ValueError, which the HTTP layer reports as a 400."""
+def decode_cursor(cursor: str | None) -> tuple[float, int] | None:
+    """Decode a paging cursor into (ts_epoch, id). A cursor from an older
+    version carries the text timestamp ("ts"), which is converted. Anything
+    that is not a cursor this server issued raises ValueError, which the HTTP
+    layer reports as a 400."""
     if not cursor:
         return None
     try:
@@ -229,17 +295,22 @@ def decode_cursor(cursor: str | None) -> tuple[str, int] | None:
         raise ValueError("Invalid cursor") from None
     if not isinstance(data, dict):
         raise ValueError("Invalid cursor")
-    ts, record_id = data.get("ts"), data.get("id")
-    if not isinstance(ts, str) or not ts or isinstance(record_id, bool) or not isinstance(record_id, int):
+    record_id = data.get("id")
+    if isinstance(record_id, bool) or not isinstance(record_id, int) or not 0 <= record_id <= MAX_SQLITE_INT:
         raise ValueError("Invalid cursor")
-    if not 0 <= record_id <= MAX_SQLITE_INT or len(ts) > 64:
+    epoch = data.get("e")
+    if "e" not in data:
+        ts = data.get("ts")
+        epoch = to_epoch(ts) if isinstance(ts, str) and len(ts) <= 64 else None
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
         raise ValueError("Invalid cursor")
-    return ts, record_id
+    return float(epoch), record_id
 
 
 class LogStorage:
     def __init__(self, db_path: Path, *, journal_mode: str = "wal"):
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not db_path.parent.exists():
+            os.makedirs(db_path.parent, mode=0o700, exist_ok=True)  # cached log lines: owner only
         self.db_path = db_path
         self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
         self._conn.row_factory = sqlite3.Row
@@ -251,6 +322,9 @@ class LogStorage:
         self.fts_layout = ""
         self._legacy_fts = False  # a standalone index from an older version still exists
         self.fts_migration_error: str | None = None  # set by the server's migration loop
+        # Rows from an older version still without ts_epoch (see backfill_ts_step).
+        self.ts_backfill_pending = False
+        self.ts_backfill_error: str | None = None  # set by the server's backfill loop
         self.journal_mode = ""
         with self._lock:
             self._configure(journal_mode)
@@ -278,6 +352,7 @@ class LogStorage:
             CREATE TABLE IF NOT EXISTS records (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
+                ts_epoch REAL,
                 severity_bucket TEXT NOT NULL,
                 scope TEXT NOT NULL,
                 namespace TEXT NOT NULL,
@@ -341,10 +416,63 @@ class LogStorage:
             )
             """
         )
+        columns = {str(row[1]) for row in cur.execute("PRAGMA table_info(records)")}
+        if "ts_epoch" not in columns:
+            # Older database: existing rows are filled in by backfill_ts_step.
+            cur.execute("ALTER TABLE records ADD COLUMN ts_epoch REAL")
+        for name in _LEGACY_RECORD_INDEXES:
+            cur.execute(f"DROP INDEX IF EXISTS {name}")
         for statement in _RECORD_INDEXES:
             cur.execute(statement)
+        self.ts_backfill_pending = cur.execute(
+            "SELECT 1 FROM records WHERE ts_epoch IS NULL LIMIT 1").fetchone() is not None
         self._init_fts(cur)
         self._conn.commit()
+
+    @_locked
+    def backfill_ts_step(self, batch: int = TS_BACKFILL_BATCH) -> int:
+        """Give one batch of rows written by an older version their ts_epoch.
+        Returns the rows updated (0 when none are left). Each step commits and
+        releases the lock, and finds its rows by ts_epoch IS NULL, so a
+        restart resumes where it stopped. A timestamp that does not parse
+        gets its S3 object's time (else the row's ingest time) and is
+        counted like one at ingest."""
+        rows = self._conn.execute(
+            "SELECT id, timestamp, source_key, source_etag, ingested_at FROM records "
+            "WHERE ts_epoch IS NULL ORDER BY id LIMIT ?", (batch,)
+        ).fetchall()
+        if not rows:
+            self.ts_backfill_pending = False
+            return 0
+        updates: list[tuple[float, int]] = []
+        object_times: dict[tuple[str, str], float | None] = {}
+        fallbacks = 0
+        for row in rows:
+            epoch = to_epoch(row["timestamp"])
+            if epoch is None:
+                ident = (str(row["source_key"]), str(row["source_etag"]))
+                if ident not in object_times:
+                    found = self._conn.execute(
+                        "SELECT last_modified FROM ingested_objects WHERE key = ? AND etag = ? LIMIT 1", ident
+                    ).fetchone()
+                    object_times[ident] = to_epoch(found[0]) if found else None
+                epoch = object_times[ident]
+                if epoch is None:
+                    epoch = to_epoch(row["ingested_at"]) or time.time()
+                fallbacks += 1
+            updates.append((epoch, int(row["id"])))
+        self._conn.executemany("UPDATE records SET ts_epoch = ? WHERE id = ?", updates)
+        if fallbacks:
+            self._add_ts_fallbacks(fallbacks)
+        self._conn.commit()
+        return len(updates)
+
+    def _add_ts_fallbacks(self, count: int) -> None:
+        current = int(self._get_state("ts_fallback_count") or 0)
+        self._set_state("ts_fallback_count", str(current + count))
+
+    def ts_backfill_remaining(self) -> int:
+        return int(self._conn.execute("SELECT COUNT(*) FROM records WHERE ts_epoch IS NULL").fetchone()[0])
 
     def _table_sql(self, name: str) -> str | None:
         row = self._conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
@@ -646,16 +774,27 @@ class LogStorage:
             return 0
         cur = self._conn.cursor()
         inserted = 0
+        fallbacks = 0
         for record in records:
+            # make_record fills ts_epoch (the S3 object's time when the line's
+            # timestamp does not parse, flagged ts_fallback); callers that
+            # leave it out get the timestamp parsed here, else the time now.
+            epoch = record.get("ts_epoch")
+            fallback = bool(record.get("ts_fallback"))
+            if epoch is None:
+                epoch = to_epoch(record["timestamp"])
+                if epoch is None:
+                    epoch, fallback = time.time(), True
             cur.execute(
                 """
                 INSERT OR IGNORE INTO records(
-                    timestamp, severity_bucket, scope, namespace, pod, container,
+                    timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container,
                     message, raw_line, source_key, source_etag, line_number, is_falco, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["timestamp"],
+                    float(epoch),
                     record["severity_bucket"],
                     record["scope"],
                     record["namespace"],
@@ -672,8 +811,11 @@ class LogStorage:
             )
             if cur.rowcount:
                 inserted += 1
+                fallbacks += fallback
                 if self.fts_enabled:
                     self._fts_index_row(cur, int(cur.lastrowid), record["message"], record["raw_line"])
+        if fallbacks:
+            self._add_ts_fallbacks(fallbacks)
         self._conn.commit()
         return inserted
 
@@ -729,17 +871,17 @@ class LogStorage:
             if excluded:
                 clauses.append(f"{field} NOT IN (SELECT value FROM json_each(?))")
                 args.append(json.dumps(list(excluded)))
-        start = params.get("start")
-        end = params.get("end")
-        before = params.get("before")
-        if start:
-            clauses.append("timestamp >= ?")
+        start = _param_epoch(params.get("start"))
+        end = _param_epoch(params.get("end"))
+        before = _param_epoch(params.get("before"))
+        if start is not None:
+            clauses.append("ts_epoch >= ?")
             args.append(start)
-        if end:  # inclusive end (API compatibility)
-            clauses.append("timestamp <= ?")
+        if end is not None:  # inclusive end (API compatibility)
+            clauses.append("ts_epoch <= ?")
             args.append(end)
-        if before:  # exclusive end: the UI's [start, before) convention
-            clauses.append("timestamp < ?")
+        if before is not None:  # exclusive end: the UI's [start, before) convention
+            clauses.append("ts_epoch < ?")
             args.append(before)
         q = params.get("q")
         if q:
@@ -787,23 +929,23 @@ class LogStorage:
                     args.extend([_like_pattern(token)] * 2)
 
     @_locked
-    def query_logs(self, params: dict[str, Any], *, limit: int, cursor: tuple[str, int] | None = None, direction: str = "desc") -> dict[str, Any]:
+    def query_logs(self, params: dict[str, Any], *, limit: int, cursor: tuple[float, int] | None = None,
+                   direction: str = "desc") -> dict[str, Any]:
         where_sql, args = self._build_filters(params)
         if cursor:
-            ts, record_id = cursor
+            epoch, record_id = cursor
             if direction == "desc":
-                where_sql += " AND (timestamp < ? OR (timestamp = ? AND id < ?))"
+                where_sql += " AND (ts_epoch < ? OR (ts_epoch = ? AND id < ?))"
             else:
-                where_sql += " AND (timestamp > ? OR (timestamp = ? AND id > ?))"
-            args.extend([ts, ts, record_id])
+                where_sql += " AND (ts_epoch > ? OR (ts_epoch = ? AND id > ?))"
+            args.extend([epoch, epoch, record_id])
         order = "DESC" if direction == "desc" else "ASC"
         rows = self._conn.execute(
             f"""
-            SELECT id, timestamp, severity_bucket, scope, namespace, pod, container, message, raw_line,
-                   source_key, source_etag, line_number, is_falco
+            SELECT {_RECORD_COLUMNS}
             FROM records
             WHERE {where_sql}
-            ORDER BY timestamp {order}, id {order}
+            ORDER BY ts_epoch {order}, id {order}
             LIMIT ?
             """,
             (*args, limit + 1),
@@ -811,7 +953,11 @@ class LogStorage:
         has_more = len(rows) > limit
         rows = rows[:limit]
         items = [dict(row) for row in rows]
-        next_cursor = _encode_cursor(items[-1]["timestamp"], int(items[-1]["id"])) if items else None
+        next_cursor = None
+        if items and items[-1]["ts_epoch"] is not None:
+            next_cursor = _encode_cursor(float(items[-1]["ts_epoch"]), int(items[-1]["id"]))
+        elif items:
+            has_more = False  # rows still waiting for the ts_epoch backfill sort last and cannot be paged past
         return {"items": items, "next_cursor": next_cursor, "has_more": has_more, "max_id": self._max_id()}
 
     def _max_id(self) -> int:
@@ -835,8 +981,7 @@ class LogStorage:
         where_sql, args = self._build_filters(params)
         rows = self._conn.execute(
             f"""
-            SELECT id, timestamp, severity_bucket, scope, namespace, pod, container, message, raw_line,
-                   source_key, source_etag, line_number, is_falco
+            SELECT {_RECORD_COLUMNS}
             FROM records
             WHERE {where_sql} AND id > ? AND id <= ?
             ORDER BY id DESC
@@ -850,6 +995,131 @@ class LogStorage:
             "last_id": upper,
             "truncated": truncated,
         }
+
+    # -- alerts ---------------------------------------------------------------------
+
+    _ALERT_METRICS = {
+        "count": "COUNT(*)",
+        "error_count": "COALESCE(SUM(severity_bucket = 'error'), 0)",
+        "distinct_pods": "COUNT(DISTINCT pod)",
+    }
+    _ALERT_GROUPS = {"none": "''", "namespace": "namespace", "pod": "pod"}
+
+    @_locked
+    def alert_metric(self, params: dict[str, Any], *, metric: str, group_by: str = "none", max_groups: int = 20,
+                     lowest_first: bool = False, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[str, Any]:
+        """One alert evaluation: the metric over the filtered entries (params
+        carry the window as start/end), per group. At most max_groups groups,
+        the most extreme first (highest, or lowest with lowest_first);
+        `overflow` counts the rest. TimeoutError past timeout_secs."""
+        expr = self._ALERT_METRICS[metric]
+        group = self._ALERT_GROUPS[group_by]
+        where_sql, args = self._build_filters(params)
+        order = "ASC" if lowest_first else "DESC"
+        try:
+            with self._time_limit(timeout_secs):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT g, value, COUNT(*) OVER () FROM (
+                        SELECT {group} AS g, {expr} AS value FROM records WHERE {where_sql} GROUP BY g
+                    ) ORDER BY value {order}, g LIMIT ?
+                    """,
+                    (*args, max(1, int(max_groups))),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "interrupted" in str(exc):
+                raise TimeoutError("alert query timed out") from None
+            raise
+        total = int(rows[0][2]) if rows else 0
+        groups = {str(row[0] or ""): float(row[1] or 0) for row in rows}
+        if group_by == "none" and not groups:
+            groups = {"": 0.0}
+        return {"groups": groups, "overflow": max(0, total - len(rows))}
+
+    @_locked
+    def metric_series(self, params: dict[str, Any], *, start_epoch: int, end_epoch: int, bucket_secs: int,
+                      pods: bool = False, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[int, Any]:
+        """Histogram buckets for a backtest: {bucket index: (total, errors)}
+        over [start_epoch, end_epoch), or with pods {index: set of pods}.
+        Same bucketing as query_histogram (epoch seconds, aligned to
+        start_epoch). TimeoutError past timeout_secs."""
+        base = {key: value for key, value in params.items() if key not in ("start", "end", "before")}
+        where_sql, args = self._build_filters(base)
+        select = "bucket, pod" if pods else "bucket, COUNT(*), COALESCE(SUM(severity_bucket = 'error'), 0)"
+        group = "bucket, pod" if pods else "bucket"
+        try:
+            with self._time_limit(timeout_secs):
+                rows = self._conn.execute(
+                    f"""
+                    SELECT {select} FROM (
+                        SELECT CAST((ts_epoch - ?) / ? AS INTEGER) AS bucket, severity_bucket, pod FROM records
+                        WHERE {where_sql} AND ts_epoch >= ? AND ts_epoch < ?
+                    ) GROUP BY {group}
+                    """,
+                    (start_epoch, bucket_secs, *args, start_epoch, end_epoch),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "interrupted" in str(exc):
+                raise TimeoutError("backtest query timed out") from None
+            raise
+        out: dict[int, Any] = {}
+        for row in rows:
+            if pods:
+                out.setdefault(int(row[0]), set()).add(str(row[1]))
+            else:
+                out[int(row[0])] = (int(row[1]), int(row[2]))
+        return out
+
+    @_locked
+    def set_prefix_listed(self, prefix: str, at: str) -> None:
+        """The poll start time of the latest complete listing of a prefix
+        (alerts.watermark)."""
+        current = self._prefix_listed()
+        current[prefix] = at
+        self._set_state("prefix_listed_ok", json.dumps(current, separators=(",", ":"), sort_keys=True))
+        self._conn.commit()
+
+    def _prefix_listed(self) -> dict[str, str]:
+        try:
+            value = json.loads(self._get_state("prefix_listed_ok") or "{}")
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @_locked
+    def prefix_progress(self) -> dict[str, dict[str, Any]]:
+        """Per prefix: last listed key (cursor), latest complete listing, and
+        the oldest object still failing (key, last_modified)."""
+        out: dict[str, dict[str, Any]] = {}
+        for prefix, at in self._prefix_listed().items():
+            out.setdefault(prefix, {})["listed_ok_at"] = at
+        for row in self._conn.execute("SELECT prefix, last_key FROM prefix_state"):
+            out.setdefault(str(row[0]), {})["cursor"] = str(row[1])
+        for row in self._conn.execute(
+            "SELECT prefix, MIN(key), MIN(last_modified) FROM object_failures GROUP BY prefix"
+        ):
+            out.setdefault(str(row[0]), {})["failing"] = {"key": str(row[1]), "last_modified": str(row[2])}
+        return out
+
+    @_locked
+    def top_values(self, field: str, *, limit: int = FACET_VALUES_MAX, start: str | None = None) -> list[str]:
+        """The most frequent non-empty values of one filter field, optionally
+        only from entries at or after `start`."""
+        if field not in dict(FILTER_FIELDS):
+            raise ValueError(f"Unknown filter field {field!r}")
+        where_sql, args = self._build_filters({"start": start} if start else {})
+        rows = self._conn.execute(
+            f"""
+            SELECT {field} AS value, COUNT(*) AS count
+            FROM records
+            WHERE {where_sql} AND {field} IS NOT NULL AND {field} != ''
+            GROUP BY {field}
+            ORDER BY count DESC, value ASC
+            LIMIT ?
+            """,
+            (*args, max(1, min(int(limit), FACET_VALUES_MAX))),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
 
     @_locked
     def query_facets(self, params: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
@@ -927,37 +1197,27 @@ class LogStorage:
     def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
         """Entry counts per time bucket (total and per severity) over the
         filtered range, every bucket present. Buckets are aligned to the
-        bucket size in UTC epoch seconds; record times are normalized with
-        SQLite's date functions, so offsets and fractional seconds land in
-        the right bucket. Without a start the range begins at the oldest
-        matching entry; without an end it stops at now."""
-        end_dt = _parse_iso(params.get("before"))
-        if end_dt is None and params.get("end"):
-            inclusive = _parse_iso(params.get("end"))
-            end_dt = inclusive + timedelta(seconds=1) if inclusive else None
-        end_epoch = int((end_dt or now or datetime.now(timezone.utc)).timestamp())
-        start_dt = _parse_iso(params.get("start"))
-        # The range is applied on epoch seconds below. The text comparison
-        # kept here is widened by a day (more than any UTC offset) so the
-        # timestamp indexes still narrow the scan.
+        bucket size in UTC epoch seconds (ts_epoch), so offsets and
+        fractional seconds land in the right bucket. Without a start the
+        range begins at the oldest matching entry; without an end it stops
+        at now."""
+        end_bound = _param_epoch(params.get("before"))
+        if end_bound is None and params.get("end"):
+            end_bound = _param_epoch(params.get("end")) + 1
+        if end_bound is None:
+            end_bound = (now or datetime.now(timezone.utc)).timestamp()
+        end_epoch = math.floor(end_bound)
+        start_bound = _param_epoch(params.get("start"))
         where_sql, args = self._build_filters(
             {key: value for key, value in params.items() if key not in ("start", "end", "before")}
         )
-        if start_dt is not None:
-            where_sql += " AND timestamp >= ?"
-            args.append(_iso_ms(start_dt - timedelta(days=1)))
-        if end_dt is not None:
-            where_sql += " AND timestamp < ?"
-            args.append(_iso_ms(end_dt + timedelta(days=1)))
-        if start_dt is not None:
-            start_epoch = int(start_dt.timestamp())
+        if start_bound is not None:
+            start_epoch = math.floor(start_bound)
         else:
-            row = self._conn.execute(
-                f"SELECT MIN(CAST(strftime('%s', timestamp) AS INTEGER)) FROM records WHERE {where_sql}", args
-            ).fetchone()
+            row = self._conn.execute(f"SELECT MIN(ts_epoch) FROM records WHERE {where_sql}", args).fetchone()
             if row[0] is None:
                 return {"bucket_secs": HISTOGRAM_BUCKET_SECS[0], "buckets": [], "truncated": False}
-            start_epoch = int(row[0])
+            start_epoch = math.floor(row[0])
         span = max(1, end_epoch - start_epoch)
         bucket_secs = next(
             (size for size in HISTOGRAM_BUCKET_SECS if span / size <= HISTOGRAM_TARGET_BUCKETS),
@@ -972,13 +1232,9 @@ class LogStorage:
         severity_sql = ", ".join(f"SUM(severity_bucket = '{sev}')" for sev in _HISTOGRAM_SEVERITIES)
         rows = self._conn.execute(
             f"""
-            SELECT (ep - ?) / ? AS bucket, COUNT(*), {severity_sql}
-            FROM (
-                SELECT CAST(strftime('%s', timestamp) AS INTEGER) AS ep, severity_bucket
-                FROM records
-                WHERE {where_sql}
-            )
-            WHERE ep >= ? AND ep < ?
+            SELECT CAST((ts_epoch - ?) / ? AS INTEGER) AS bucket, COUNT(*), {severity_sql}
+            FROM records
+            WHERE {where_sql} AND ts_epoch >= ? AND ts_epoch < ?
             GROUP BY bucket
             """,
             (origin, bucket_secs, *args, max(origin, start_epoch), min(origin + count * bucket_secs, end_epoch)),
@@ -1080,7 +1336,7 @@ class LogStorage:
 
         timeline_total_rows = self._conn.execute(
             f"""
-            SELECT substr(timestamp, 1, 13) || ':00:00Z' AS bucket,
+            SELECT strftime('%Y-%m-%dT%H:00:00Z', CAST(ts_epoch AS INTEGER), 'unixepoch') AS bucket,
                    COUNT(*) AS total_count
             FROM records
             WHERE {where_sql}
@@ -1092,7 +1348,7 @@ class LogStorage:
 
         timeline_error_rows = self._conn.execute(
             f"""
-            SELECT substr(timestamp, 1, 13) || ':00:00Z' AS bucket,
+            SELECT strftime('%Y-%m-%dT%H:00:00Z', CAST(ts_epoch AS INTEGER), 'unixepoch') AS bucket,
                    COUNT(*) AS error_count
             FROM records
             WHERE {error_where_sql}
@@ -1104,9 +1360,13 @@ class LogStorage:
 
         timeline_map: dict[str, dict[str, Any]] = {}
         for row in timeline_total_rows:
+            if row[0] is None:  # not yet backfilled
+                continue
             bucket = str(row[0])
             timeline_map[bucket] = {"timestamp": bucket, "total_logs": int(row[1] or 0), "error_logs": 0}
         for row in timeline_error_rows:
+            if row[0] is None:
+                continue
             bucket = str(row[0])
             entry = timeline_map.setdefault(bucket, {"timestamp": bucket, "total_logs": 0, "error_logs": 0})
             entry["error_logs"] = int(row[1] or 0)
@@ -1131,24 +1391,32 @@ class LogStorage:
             "timeline": [timeline_map[key] for key in sorted(timeline_map)],
         }
 
-    def prune_records_before(self, cutoff: str, *, batch: int = PRUNE_BATCH) -> int:
-        """Delete cached records (and their FTS rows) older than cutoff, in
-        batches that each commit and release the lock. The S3 source objects
-        past retention are expired by the bucket lifecycle rule, so their
-        ingest bookkeeping is dropped too. Returns records removed."""
+    def prune_records_before(self, cutoff: str | float, *, batch: int = PRUNE_BATCH) -> int:
+        """Delete cached records (and their FTS rows) whose event time is
+        before cutoff (epoch seconds or an ISO time), in batches that each
+        commit and release the lock. The S3 source objects past retention are
+        expired by the bucket lifecycle rule, so their ingest bookkeeping is
+        dropped too. Returns records removed."""
+        cutoff_epoch = _param_epoch(cutoff)
+        if cutoff_epoch is None:
+            raise ValueError("A prune cutoff is required")
+        # Rows still waiting for their ts_epoch would never be pruned; finish
+        # the backfill first (batched, so the lock is released in between).
+        while self.ts_backfill_pending and self.backfill_ts_step():
+            pass
         removed = 0
         while True:
-            count = self._prune_batch(cutoff, batch)
+            count = self._prune_batch(cutoff_epoch, batch)
             removed += count
             if count < batch:
                 break
-        self._prune_bookkeeping(cutoff, release=bool(removed))
+        self._prune_bookkeeping(cutoff_epoch, release=bool(removed))
         return removed
 
     @_locked
-    def _prune_batch(self, cutoff: str, batch: int) -> int:
+    def _prune_batch(self, cutoff: float, batch: int) -> int:
         ids = [int(row[0]) for row in self._conn.execute(
-            "SELECT id FROM records WHERE timestamp < ? LIMIT ?", (cutoff, batch)
+            "SELECT id FROM records WHERE ts_epoch < ? LIMIT ?", (cutoff, batch)
         )]
         if not ids:
             return 0
@@ -1160,10 +1428,12 @@ class LogStorage:
         return len(ids)
 
     @_locked
-    def _prune_bookkeeping(self, cutoff: str, *, release: bool) -> None:
-        self._conn.execute("DELETE FROM ingested_objects WHERE last_modified < ?", (cutoff,))
+    def _prune_bookkeeping(self, cutoff: float, *, release: bool) -> None:
+        # S3 LastModified times (UTC, ISO); compared as epoch seconds.
+        older = "CAST(strftime('%s', last_modified) AS INTEGER) < ?"
+        self._conn.execute(f"DELETE FROM ingested_objects WHERE {older}", (math.floor(cutoff),))
         # Objects past retention are expired from the bucket; stop retrying them.
-        self._conn.execute("DELETE FROM object_failures WHERE last_modified < ?", (cutoff,))
+        self._conn.execute(f"DELETE FROM object_failures WHERE {older}", (math.floor(cutoff),))
         self._conn.commit()
         if release:
             self._release_free_pages()
@@ -1195,50 +1465,47 @@ class LogStorage:
         anchor = dict(anchor_row)
         lines_before = max(0, min(int(lines_before), CONTEXT_LINES_MAX))
         lines_after = max(0, min(int(lines_after), CONTEXT_LINES_MAX))
-        ts = str(anchor["timestamp"])
         group = (anchor["namespace"], anchor["pod"], anchor["container"])
+        start_epoch = _param_epoch(start)
+        before_epoch = _param_epoch(before)
 
-        # Lower / upper time bounds: the search window around the record,
-        # narrowed by the caller's range. Bounds are ISO strings compared the
-        # same way as every other timestamp filter.
-        lower: str | None = None
-        upper: str | None = None
-        limited_by_window = False
-        try:
-            moment = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if moment.tzinfo is None:
-                moment = moment.replace(tzinfo=timezone.utc)
-            lower = _iso_ms(moment - timedelta(seconds=window_secs))
-            upper = _iso_ms(moment + timedelta(seconds=window_secs))
-            limited_by_window = True
-        except ValueError:
-            pass  # unparseable timestamp: only the row limits apply
-        lower_from_range = bool(start and (lower is None or start > lower))
-        upper_from_range = bool(before and (upper is None or before < upper))
+        # Lower / upper time bounds (epoch seconds): the search window around
+        # the record, narrowed by the caller's range.
+        anchor_epoch = anchor["ts_epoch"]
+        lower: float | None = None
+        upper: float | None = None
+        limited_by_window = anchor_epoch is not None
+        if anchor_epoch is not None:
+            lower = float(anchor_epoch) - window_secs
+            upper = float(anchor_epoch) + window_secs
+        else:
+            anchor_epoch = 0.0  # not yet backfilled: only the row limits apply
+        lower_from_range = start_epoch is not None and (lower is None or start_epoch > lower)
+        upper_from_range = before_epoch is not None and (upper is None or before_epoch < upper)
         if lower_from_range:
-            lower = start
+            lower = start_epoch
         if upper_from_range:
-            upper = before
+            upper = before_epoch
 
         group_sql = "namespace = ? AND pod = ? AND container = ?"
         earlier_sql = f"SELECT {_RECORD_COLUMNS} FROM records WHERE {group_sql} " \
-            "AND (timestamp < ? OR (timestamp = ? AND id < ?))"
-        earlier_args: list[Any] = [*group, ts, ts, record_id]
+            "AND (ts_epoch < ? OR (ts_epoch = ? AND id < ?))"
+        earlier_args: list[Any] = [*group, anchor_epoch, anchor_epoch, record_id]
         if lower is not None:
-            earlier_sql += " AND timestamp >= ?"
+            earlier_sql += " AND ts_epoch >= ?"
             earlier_args.append(lower)
         earlier = self._conn.execute(
-            earlier_sql + " ORDER BY timestamp DESC, id DESC LIMIT ?", (*earlier_args, lines_before + 1)
+            earlier_sql + " ORDER BY ts_epoch DESC, id DESC LIMIT ?", (*earlier_args, lines_before + 1)
         ).fetchall() if lines_before else []
 
         later_sql = f"SELECT {_RECORD_COLUMNS} FROM records WHERE {group_sql} " \
-            "AND (timestamp > ? OR (timestamp = ? AND id > ?))"
-        later_args: list[Any] = [*group, ts, ts, record_id]
+            "AND (ts_epoch > ? OR (ts_epoch = ? AND id > ?))"
+        later_args: list[Any] = [*group, anchor_epoch, anchor_epoch, record_id]
         if upper is not None:
-            later_sql += " AND timestamp < ?"
+            later_sql += " AND ts_epoch < ?"
             later_args.append(upper)
         later = self._conn.execute(
-            later_sql + " ORDER BY timestamp ASC, id ASC LIMIT ?", (*later_args, lines_after + 1)
+            later_sql + " ORDER BY ts_epoch ASC, id ASC LIMIT ?", (*later_args, lines_after + 1)
         ).fetchall() if lines_after else []
 
         return {
@@ -1253,8 +1520,8 @@ class LogStorage:
             # Where the search stopped when a side came back short: entries
             # beyond these bounds were not searched.
             "bounds": {
-                "from": lower,
-                "to": upper,
+                "from": iso_from_epoch(lower) if lower is not None else None,
+                "to": iso_from_epoch(upper) if upper is not None else None,
                 "from_is_range": lower_from_range,
                 "to_is_range": upper_from_range,
                 "window_secs": window_secs if limited_by_window else None,
@@ -1282,13 +1549,9 @@ class LogStorage:
 
     @property
     def conn(self) -> sqlite3.Connection:
-        """Read access to the shared records connection (used by InsightsJob).
-        Hold `lock` while using it from another thread."""
+        """The shared records connection, for maintenance and tests. Other
+        threads read through their own connection (open_connection)."""
         return self._conn
-
-    @property
-    def lock(self) -> threading.RLock:
-        return self._lock
 
     def ping(self, timeout: float = 2.0) -> bool:
         """True when the connection answers. False when another thread holds
@@ -1315,8 +1578,13 @@ class LogStorage:
         last_error = self._get_state("last_error")
         total_records = int(self._conn.execute("SELECT COUNT(*) FROM records").fetchone()[0])
         total_objects = int(self._conn.execute("SELECT COUNT(*) FROM ingested_objects").fetchone()[0])
-        latest_record_timestamp = self._conn.execute("SELECT MAX(timestamp) FROM records").fetchone()[0]
+        latest = self._conn.execute(
+            "SELECT timestamp FROM records WHERE ts_epoch IS NOT NULL ORDER BY ts_epoch DESC LIMIT 1").fetchone()
+        latest_record_timestamp = latest[0] if latest else None
         return {
+            # Records whose timestamp did not parse; their ts_epoch is the S3
+            # object's time (counted at ingest and by the backfill).
+            "timestamp_fallbacks": int(self._get_state("ts_fallback_count") or 0),
             "last_polled_at": last_polled_at,
             "last_successful_ingest_at": last_successful_ingest_at,
             "last_object_last_modified": last_object_last_modified,
@@ -1371,4 +1639,7 @@ class LogStorage:
                 "SELECT COUNT(*) FROM records WHERE id > ? AND id <= ?", (done, upper)
             ).fetchone()[0])
             out["fts_migration"] = {"rows_remaining": remaining, "last_error": self.fts_migration_error}
+        if self.ts_backfill_pending:
+            # Until done, these rows are left out of time-filtered queries.
+            out["ts_backfill"] = {"rows_remaining": self.ts_backfill_remaining(), "last_error": self.ts_backfill_error}
         return out

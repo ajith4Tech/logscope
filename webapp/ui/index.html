@@ -45,12 +45,24 @@
             <button id="viewCloseBtn" type="button" class="link-btn" title="Stop following this view (filters stay as they are)" aria-label="Close view">✕</button>
           </span>
         </div>
+        <div id="askBox" class="ask-box" hidden>
+          <form id="askForm" class="ask-form" autocomplete="off">
+            <label for="askInput" class="ask-label">Ask</label>
+            <div class="ask-row">
+              <input id="askInput" type="search" maxlength="500" placeholder="e.g. errors in payments since 9am" title="Describe the logs you want; the proposed filters are shown before anything is applied" />
+              <button id="askSubmit" type="submit" class="ghost">Ask</button>
+            </div>
+          </form>
+          <div id="askStatus" class="ask-status" role="status" hidden></div>
+          <div id="askPreview" class="ask-preview" hidden></div>
+        </div>
         <label>Scope <select id="scope"></select></label>
         <label>Namespace <select id="namespace"></select></label>
         <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
         <label>Container <input id="container" type="text" placeholder="All — type to search" autocomplete="off" /></label>
         <label>Severity <select id="severity_bucket"></select></label>
         <label>Search <input id="q" type="search" placeholder="error, trace, rule name, etc." /></label>
+        <label class="toggle qmode-toggle" title="Raw full-text syntax: AND, OR, NOT, &quot;quoted phrases&quot;, prefix*"><input id="qmodeRaw" type="checkbox" /> Raw query syntax</label>
         <div class="time-grid">
           <label>Start <input id="start" type="datetime-local" title="Entries at or after this time" /></label>
           <label>End <input id="end" type="datetime-local" title="Entries before this time (the end is exclusive)" /></label>
@@ -86,6 +98,10 @@
           <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable">
             <span class="tab-icon"></span> Actionable
             <span id="actionableBadge" class="tab-badge" hidden></span>
+          </button>
+          <button id="tabAlerts" class="tab" role="tab" aria-selected="false" aria-controls="panelAlerts">
+            <span class="tab-icon"></span> Alerts
+            <span id="alertsBadge" class="tab-badge" title="Alert rules firing" hidden></span>
           </button>
           <button id="tabPipeline" class="tab" role="tab" aria-selected="false" aria-controls="panelPipeline">
             <span class="tab-icon"></span> Pipeline
@@ -421,6 +437,23 @@
           <div id="pipelineContent" class="pipeline-grid"></div>
         </div>
 
+        <!-- Alerts panel: rules on saved views (writes need the admin token; muting does not) -->
+        <div id="panelAlerts" class="panel alerts-panel" role="tabpanel" hidden>
+          <div class="panel-head">
+            <div>
+              <h2>Alerts</h2>
+              <div class="subtle" id="alertsSubtitle">Rules on saved views, evaluated up to the ingest watermark.</div>
+            </div>
+            <div class="settings-head-actions">
+              <button id="alertsChannelsBtn" type="button" class="ghost" title="Notification channels (admin token)">Channels</button>
+              <button id="alertsRefresh" type="button" class="ghost">Refresh</button>
+              <button id="alertsCreateBtn" type="button">Create alert</button>
+            </div>
+          </div>
+          <div id="alertsError" class="views-error" role="alert" hidden></div>
+          <div id="alertsList" class="alerts-list"></div>
+        </div>
+
         <!-- Settings panel (admin token required) -->
         <div id="panelSettings" class="panel settings-panel" role="tabpanel" hidden>
           <div class="panel-head">
@@ -489,6 +522,72 @@
         <button id="saveViewCancel" type="button" class="ghost">Cancel</button>
         <button id="saveViewAsNew" type="button" class="ghost">Save as new</button>
         <button id="saveViewSubmit" type="button" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="alertModal" class="confirm-modal alert-modal">
+    <form id="alertForm" method="dialog" class="confirm-modal-box alert-modal-box" novalidate autocomplete="off">
+      <div class="confirm-modal-head"><h3 id="alertFormTitle">Create alert</h3></div>
+      <div class="alert-form-grid">
+        <label class="view-field alert-span">Name <input id="alertName" type="text" maxlength="80" required /></label>
+        <label class="view-field alert-span">Saved view <select id="alertView"></select></label>
+        <label class="view-field">Measure
+          <select id="alertMetric">
+            <option value="count">Entries (count)</option>
+            <option value="error_count">Error entries</option>
+            <option value="distinct_pods">Distinct pods</option>
+          </select>
+        </label>
+        <label class="view-field">Condition
+          <span class="alert-inline">
+            <select id="alertOp"><option value="&gt;">&gt;</option><option value="&gt;=">&gt;=</option><option value="&lt;">&lt;</option><option value="&lt;=">&lt;=</option></select>
+            <input id="alertThreshold" type="number" step="any" value="10" />
+          </span>
+        </label>
+        <label class="view-field">Window (minutes) <input id="alertWindow" type="number" min="5" max="1440" step="1" value="5" /></label>
+        <label class="view-field">Every (minutes) <input id="alertInterval" type="number" min="1" max="60" step="1" value="1" /></label>
+        <label class="view-field">Consecutive breaches <input id="alertFor" type="number" min="1" max="10" step="1" value="1" /></label>
+        <label class="view-field">Group by
+          <select id="alertGroupBy"><option value="none">Nothing</option><option value="namespace">Namespace</option><option value="pod">Pod</option></select>
+        </label>
+        <label class="view-field">Urgency
+          <select id="alertUrgency"><option value="low">low</option><option value="medium">medium</option><option value="high" selected>high</option><option value="urgent">urgent</option></select>
+        </label>
+        <label class="view-field">Remind every (hours, 0 = never) <input id="alertRenotify" type="number" min="0" max="168" step="0.5" value="6" /></label>
+        <label class="toggle alert-span"><input id="alertResolved" type="checkbox" checked /> Notify when resolved</label>
+        <label class="toggle alert-span"><input id="alertAi" type="checkbox" /> Add an AI summary (fast model, metered as alert_summary; skipped when over budget)</label>
+        <label class="toggle alert-span"><input id="alertEnabled" type="checkbox" checked /> Enabled</label>
+        <fieldset class="alert-span alert-channels"><legend>Channels</legend><div id="alertChannelList"></div></fieldset>
+        <label class="view-field alert-span" id="alertTokenField" hidden>Admin token <input id="alertToken" type="password" autocomplete="off" /></label>
+      </div>
+      <div id="alertBacktest" class="alert-backtest" role="status"></div>
+      <div id="alertFormError" class="views-error" role="alert" hidden></div>
+      <div class="confirm-modal-actions">
+        <button id="alertCancel" type="button" class="ghost">Cancel</button>
+        <button id="alertSubmit" type="submit" class="primary">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="channelsModal" class="confirm-modal alert-modal">
+    <form id="channelForm" method="dialog" class="confirm-modal-box alert-modal-box" novalidate autocomplete="off">
+      <div class="confirm-modal-head"><h3>Notification channels</h3></div>
+      <p class="confirm-modal-text">URLs and secrets are write-only: only the last six characters of a URL are shown. Changes need the admin token.</p>
+      <div id="channelsList" class="channels-list"></div>
+      <div class="alert-form-grid">
+        <label class="view-field">Name <input id="channelName" type="text" maxlength="80" /></label>
+        <label class="view-field">Type
+          <select id="channelType"><option value="mattermost">Mattermost</option><option value="slack">Slack</option><option value="webhook">Webhook (JSON)</option></select>
+        </label>
+        <label class="view-field alert-span">Webhook URL (https) <input id="channelUrl" type="password" maxlength="2000" /></label>
+        <label class="view-field alert-span">Signing secret <span class="muted">(webhook only, optional: X-Logscope-Signature)</span> <input id="channelSecret" type="password" maxlength="256" /></label>
+        <label class="view-field alert-span" id="channelTokenField" hidden>Admin token <input id="channelToken" type="password" autocomplete="off" /></label>
+      </div>
+      <div id="channelError" class="views-error" role="alert" hidden></div>
+      <div class="confirm-modal-actions">
+        <button id="channelsClose" type="button" class="ghost">Close</button>
+        <button id="channelAdd" type="submit" class="primary">Add channel</button>
       </div>
     </form>
   </dialog>

@@ -15,8 +15,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
 from .actions import step_execution_fields
 from .ai_cache import AiCache
@@ -136,7 +137,7 @@ def decorate(result: dict[str, Any], *, source: str, tier: str | None, cache_key
 
 def filtered_cache_key(tier: str, digest: dict[str, Any]) -> str:
     shape = sorted([t["template_id"], count_bucket(t["count"])] for t in digest["templates"])
-    return f"filtered:{tier}:" + hashlib.sha1(json.dumps(shape).encode()).hexdigest()
+    return f"filtered:{tier}:" + hashlib.sha1(json.dumps(shape).encode(), usedforsecurity=False).hexdigest()
 
 
 def line_cache_key(tier: str, record: dict[str, Any]) -> tuple[str, str]:
@@ -147,7 +148,8 @@ def line_cache_key(tier: str, record: dict[str, Any]) -> tuple[str, str]:
 def anomaly_cache_key(tier: str, anomaly: dict[str, Any]) -> str:
     # Namespace pattern included: error spikes have an empty rule_key, and a
     # summary for one namespace must not answer for another.
-    rule = hashlib.sha1(normalize_message(anomaly.get("rule_key") or "").encode()).hexdigest()[:16]
+    rule = hashlib.sha1(normalize_message(anomaly.get("rule_key") or "").encode(),
+                        usedforsecurity=False).hexdigest()[:16]
     return f"anomaly:{tier}:{anomaly.get('type') or ''}:{namespace_pattern(anomaly.get('namespace'))}:{rule}"
 
 

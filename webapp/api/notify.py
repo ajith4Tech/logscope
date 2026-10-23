@@ -1,4 +1,5 @@
-"""Optional Mattermost notifications for Insights anomalies.
+"""Optional Mattermost notifications for Insights anomalies (delivery shared
+with alerts through channels.py).
 
 When a notification is sent
   * Once per anomaly occurrence: an anomaly row plus the hourly window it was
@@ -30,13 +31,16 @@ import logging
 import os
 import sqlite3
 import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
-from urllib import error, request
+from typing import Any
 from urllib.parse import urlencode
 
 from .ai_summary import redact_text
+
+# Delivery is shared with alerts (channels.py); re-exported for callers.
+from .channels import DeliveryError, post_webhook  # noqa: F401
 from .config import URGENCY_ORDER, AppConfig
 from .storage import SQLITE_BUSY_TIMEOUT_SECS, utc_stamp
 
@@ -44,19 +48,13 @@ logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_SECS = 30
 SEND_TIMEOUT_SECS = 10
+QUEUE_BATCH = 200
 MAX_ATTEMPTS = 5
 RETRY_BASE_SECS = 60
 RETRY_MAX_SECS = 3600
 MAX_SENDS_PER_RUN = 10
 # Notification rows are bookkeeping; older ones are deleted.
 KEEP_DAYS = 30
-_TRANSIENT_HTTP = {408, 425, 429, 500, 502, 503, 504}
-
-
-class DeliveryError(Exception):
-    def __init__(self, message: str, *, transient: bool):
-        super().__init__(message)
-        self.transient = transient
 
 
 def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
@@ -87,6 +85,22 @@ def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
         return "medium"
     return "low"
 
+
+# anomaly_urgency as a SQL expression over anomalies `a` (URGENCY_ORDER
+# ranks), so the queue can filter and order by urgency in the query.
+URGENCY_RANK_SQL = """
+CASE a.type
+  WHEN 'new_falco_rule' THEN CASE a.severity WHEN 'error' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END
+  WHEN 'error_rate_spike' THEN 2
+  WHEN 'severity_shift' THEN
+    CASE WHEN CAST(COALESCE(json_extract(a.evidence, '$.current_share'), 0) AS REAL)
+              > CAST(COALESCE(json_extract(a.evidence, '$.baseline_share'), 0) AS REAL)
+         THEN CASE a.severity WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END
+         ELSE 0 END
+  WHEN 'message_frequency' THEN 1
+  ELSE 0
+END
+"""
 
 _TYPE_LABELS = {
     "error_rate_spike": "Error spike",
@@ -163,29 +177,6 @@ def format_message(anomaly: dict[str, Any], evidence: dict[str, Any], urgency: s
     return "\n".join(lines)
 
 
-class _NoRedirect(request.HTTPRedirectHandler):
-    def redirect_request(self, *args, **kwargs):  # never re-post the payload elsewhere
-        return None
-
-
-def post_webhook(url: str, payload: dict[str, Any], timeout: float = SEND_TIMEOUT_SECS) -> None:
-    """POST to an incoming webhook. Raises DeliveryError whose message never
-    contains the URL (it is a credential)."""
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = request.Request(url, data=body, method="POST", headers={
-        "Content-Type": "application/json", "User-Agent": "logscope-webapp/1.0",
-    })
-    opener = request.build_opener(_NoRedirect)
-    try:
-        with opener.open(req, timeout=timeout) as resp:
-            resp.read(4096)
-    except error.HTTPError as exc:
-        raise DeliveryError(f"HTTP {exc.code}", transient=exc.code in _TRANSIENT_HTTP) from None
-    except (error.URLError, TimeoutError, OSError) as exc:
-        reason = getattr(exc, "reason", exc)
-        raise DeliveryError(f"network error ({type(reason).__name__})", transient=True) from None
-
-
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS anomaly_notifications (
     anomaly_id INTEGER NOT NULL,
@@ -251,6 +242,11 @@ class MattermostNotifier:
         url = os.environ.get(self.cfg.webhook_url_env, "").strip() if self.cfg.webhook_url_env else ""
         return url if url.lower().startswith(("https://", "http://")) else ""
 
+    def webhook_url(self) -> str:
+        """The environment's webhook URL (or ""), for the default alert
+        channel. A credential: never log or return it."""
+        return self._webhook_url()
+
     def send_text(self, text: str) -> bool:
         """A one-off message (e.g. an AI budget notice) to the same webhook.
         False when not configured or delivery failed; never raises."""
@@ -315,25 +311,28 @@ class MattermostNotifier:
         threshold = URGENCY_ORDER[self.cfg.min_urgency]
         queued = suppressed = 0
         with self._lock:
+            # Below min_urgency is filtered here, not after a LIMIT: a backlog of
+            # low-urgency rows must never hide an urgent one.
             rows = self._conn.execute(
-                """
+                f"""
                 SELECT a.* FROM anomalies a
                 LEFT JOIN anomaly_notifications n
                   ON n.anomaly_id = a.id AND n.window_start = json_extract(a.evidence, '$.window_start')
                 WHERE n.anomaly_id IS NULL
                   AND a.status != 'dismissed'
                   AND json_extract(a.evidence, '$.window_start') >= ?
-                ORDER BY a.id
-                LIMIT 200
+                  AND ({URGENCY_RANK_SQL}) >= ?
+                ORDER BY ({URGENCY_RANK_SQL}) DESC, a.id
+                LIMIT ?
                 """,
-                (cutoff,),
+                (cutoff, threshold, QUEUE_BATCH),
             ).fetchall()
             for row in rows:
                 anomaly = dict(row)
                 evidence = _evidence(anomaly)
                 urgency = anomaly_urgency(anomaly, evidence)
                 if URGENCY_ORDER[urgency] < threshold:
-                    continue  # re-evaluated next run; never stored
+                    continue  # the SQL rank and anomaly_urgency disagree; never stored
                 key = (anomaly["type"], anomaly["namespace"], anomaly["pod"], anomaly["rule_key"])
                 recent = self._conn.execute(
                     "SELECT 1 FROM anomaly_notifications WHERE type = ? AND namespace = ? AND pod = ? "

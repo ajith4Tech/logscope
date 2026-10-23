@@ -11,7 +11,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Callable, Iterable
+from collections.abc import Callable, Iterable
+from typing import Any
 
 _DIGIT_RE = re.compile(r"\d")
 
@@ -74,15 +75,10 @@ def namespace_pattern(namespace: Any) -> str:
     return _NAMESPACE_NUMERIC_RE.sub("*", str(namespace or ""))
 
 
-def pod_pattern(pod: Any) -> str:
-    """web-7d9f8b6c5d-x2kqp -> web-<HASH>, db-0 -> db-<NUM>."""
-    return normalize_message(pod)
-
-
 def template_id(namespace: Any, container: Any, template: str) -> str:
     """Stable id of a template within a namespace pattern and container."""
     raw = "\x1f".join((namespace_pattern(namespace), str(container or ""), template))
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return hashlib.sha1(raw.encode("utf-8"), usedforsecurity=False).hexdigest()
 
 
 def record_template(record: dict[str, Any]) -> tuple[str, str]:

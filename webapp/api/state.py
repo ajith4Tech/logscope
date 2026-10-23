@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .filters import FilterError, clean_text
+from .filters import validate_filters as _validate_filters
 from .storage import SQLITE_BUSY_TIMEOUT_SECS
 
 STATE_DB_ENV = "LOGSCOPE_WEBAPP_STATE_DB_PATH"
@@ -109,6 +111,92 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE ai_usage ADD COLUMN subject TEXT",
         "CREATE INDEX idx_ai_usage_subject ON ai_usage(outcome, subject, ts)",
     )),
+    # Alerts on saved views (see alerts.py / channels.py). url_enc and
+    # secret_enc are Fernet tokens; the plain URL and secret are never stored.
+    # Deleting a saved view disables its rules (trigger) and records why.
+    (5, (
+        """
+        CREATE TABLE notification_channels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            type TEXT NOT NULL CHECK (type IN ('mattermost', 'slack', 'webhook')),
+            url_enc TEXT NOT NULL,
+            url_last6 TEXT NOT NULL DEFAULT '',
+            secret_enc TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE alert_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            view_id INTEGER REFERENCES saved_views(id) ON DELETE SET NULL,
+            metric TEXT NOT NULL CHECK (metric IN ('count', 'error_count', 'distinct_pods')),
+            op TEXT NOT NULL CHECK (op IN ('>', '>=', '<', '<=')),
+            threshold REAL NOT NULL,
+            window_s INTEGER NOT NULL,
+            interval_s INTEGER NOT NULL,
+            for_evals INTEGER NOT NULL DEFAULT 1,
+            group_by TEXT NOT NULL DEFAULT 'none' CHECK (group_by IN ('none', 'namespace', 'pod')),
+            max_groups INTEGER NOT NULL DEFAULT 20,
+            urgency TEXT NOT NULL DEFAULT 'high',
+            channel_ids TEXT NOT NULL DEFAULT '[]',
+            renotify_s INTEGER NOT NULL DEFAULT 21600,
+            notify_resolved INTEGER NOT NULL DEFAULT 1,
+            mute_until TEXT,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            disabled_reason TEXT,
+            labels TEXT NOT NULL DEFAULT '{}',
+            ai_summary INTEGER NOT NULL DEFAULT 0,
+            last_window_end TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """,
+        """
+        CREATE TABLE alert_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_id INTEGER,
+            group_key TEXT NOT NULL DEFAULT '',
+            from_state TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            streak INTEGER NOT NULL DEFAULT 0,
+            value REAL,
+            threshold REAL,
+            window_start TEXT,
+            window_end TEXT,
+            notified INTEGER NOT NULL DEFAULT 0,
+            muted INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            detail TEXT,
+            ts TEXT NOT NULL
+        )
+        """,
+        "CREATE INDEX idx_alert_events_rule ON alert_events(rule_id, group_key, id)",
+        "CREATE INDEX idx_alert_events_ts ON alert_events(ts)",
+        """
+        CREATE TRIGGER saved_view_deleted_disables_alerts AFTER DELETE ON saved_views
+        BEGIN
+            INSERT INTO alert_events (rule_id, group_key, from_state, state, detail, ts)
+                SELECT id, '', '', 'disabled', 'saved view ' || OLD.id || ' was deleted',
+                       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                FROM alert_rules WHERE view_id = OLD.id AND enabled = 1;
+            UPDATE alert_rules SET enabled = 0, view_id = NULL,
+                disabled_reason = 'Its saved view (' || OLD.name || ') was deleted',
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE view_id = OLD.id;
+        END
+        """,
+    )),
+    # Durable alert delivery: failed notifications back off (alerts.py
+    # RETRY_SCHEDULE_SECS) for up to a day; restarts resume from here.
+    (6, (
+        "ALTER TABLE alert_events ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE alert_events ADD COLUMN next_attempt_at TEXT",
+        "CREATE INDEX idx_alert_events_delivery ON alert_events(notified, next_attempt_at)",
+    )),
 )
 # What identifies a state database (also one written before a later
 # migration, e.g. a restored backup): tables added later are not required.
@@ -118,22 +206,8 @@ REQUIRED_TABLES = ("schema_version", "saved_views")
 VIEW_NAME_MAX = 80
 VIEW_DESCRIPTION_MAX = 500
 VIEWS_MAX = 200
-VIEW_FILTERS_MAX_BYTES = 8 * 1024
 SORT_ORDER_LIMIT = 2**31 - 1
-
-# The URL filter keys (see parseUrlState in app.js) with the same limits.
-_VIEW_TEXT_FILTERS = {"scope": 100, "ns": 253, "pod": 253, "ctr": 253, "sev": 64, "q": 500}
-_VIEW_EXCLUDE_FILTERS = {"xscope": 100, "xns": 253, "xpod": 253, "xctr": 253, "xsev": 64}
-_VIEW_EXCLUDE_MAX_VALUES = 50
-_VIEW_EXCLUDE_MAX_CHARS = 20000
-_VIEW_SEARCH_MODES = ("phrase", "raw")
-# Relative presets: reopened relative to "now", never stored as from/to.
-VIEW_RANGES = ("today", "1h", "6h", "24h", "7d", "all")
-VIEW_FILTER_KEYS = frozenset(
-    {*_VIEW_TEXT_FILTERS, *_VIEW_EXCLUDE_FILTERS, "qmode", "range", "from", "to"}
-)
-_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
-_FRACTION_RE = re.compile(r"\.(\d+)")
+# The filter set itself (keys, ranges, size limit) is defined and validated in filters.py.
 _DESCRIPTION_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # newlines and tabs allowed
 
 
@@ -154,14 +228,8 @@ def env_state_db_path() -> Path | None:
     return Path(value).expanduser() if value else None
 
 
-class ViewError(Exception):
+class ViewError(FilterError):
     """A saved-view request that cannot be applied; mapped to an HTTP status."""
-
-    status = 422
-
-    def __init__(self, message: str, field: str | None = None):
-        super().__init__(message)
-        self.field = field
 
 
 class ViewNotFound(ViewError):
@@ -250,98 +318,17 @@ class StateDB:
 
 
 def _clean_text(value: Any, field: str, max_len: int) -> str:
-    if not isinstance(value, str):
-        raise ViewError(f"'{field}' must be a string", field)
-    text = value.strip()
-    if not text:
-        raise ViewError(f"'{field}' must not be empty", field)
-    if len(text) > max_len:
-        raise ViewError(f"'{field}' is longer than {max_len} characters", field)
-    if _CONTROL_RE.search(text):
-        raise ViewError(f"'{field}' contains control characters", field)
-    return text
-
-
-def _clean_time(value: Any, field: str) -> datetime:
-    text = _clean_text(value, field, 40)
-    # fromisoformat (3.10) takes 3 or 6 fraction digits; JavaScript any number.
-    text = _FRACTION_RE.sub(lambda m: "." + (m.group(1) + "000000")[:6], text, count=1)
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00").replace("z", "+00:00"))
-    except ValueError:
-        raise ViewError(f"'{field}' must be an ISO-8601 time", field) from None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    parsed = parsed.astimezone(timezone.utc)
-    if not 2000 <= parsed.year <= 2100:
-        raise ViewError(f"'{field}' must be between the years 2000 and 2100", field)
-    return parsed
-
-
-def _iso_js(value: datetime) -> str:
-    """The form JavaScript's toISOString() produces (what the URL carries)."""
-    return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
+    return clean_text(value, field, max_len, ViewError)
 
 
 def validate_filters(raw: Any) -> dict[str, str]:
-    """The URL filter keys only, validated like the UI's URL sanitizer
-    (parseUrlState) but rejecting instead of dropping. Values are stored in
-    their URL form. A relative preset stays `range`; only an absolute range
-    is stored as from/to, and the two cannot be combined."""
-    if not isinstance(raw, dict):
-        raise ViewError("'filters' must be an object", "filters")
-    unknown = sorted(str(key) for key in raw if key not in VIEW_FILTER_KEYS)
-    if unknown:
-        raise ViewError(f"Unknown filter key '{unknown[0]}'", f"filters.{unknown[0]}")
-    out: dict[str, str] = {}
-    for key, max_len in _VIEW_TEXT_FILTERS.items():
-        if key in raw:
-            out[key] = _clean_text(raw[key], f"filters.{key}", max_len)
-    for key, max_len in _VIEW_EXCLUDE_FILTERS.items():
-        if key not in raw:
-            continue
-        field = f"filters.{key}"
-        value = raw[key]
-        if isinstance(value, list):
-            if not all(isinstance(item, str) for item in value):
-                raise ViewError(f"'{field}' values must be strings", field)
-            value = ",".join(value)
-        if not isinstance(value, str):
-            raise ViewError(f"'{field}' must be a comma-separated string", field)
-        if len(value) > _VIEW_EXCLUDE_MAX_CHARS:
-            raise ViewError(f"'{field}' is too long", field)
-        values: list[str] = []
-        for item in value.split(","):
-            cleaned = _clean_text(item, field, max_len)
-            if cleaned not in values:
-                values.append(cleaned)
-        if len(values) > _VIEW_EXCLUDE_MAX_VALUES:
-            raise ViewError(f"'{field}' lists more than {_VIEW_EXCLUDE_MAX_VALUES} values", field)
-        out[key] = ",".join(values)
-    if "qmode" in raw:
-        if raw["qmode"] not in _VIEW_SEARCH_MODES:
-            raise ViewError(f"'filters.qmode' must be one of {list(_VIEW_SEARCH_MODES)}", "filters.qmode")
-        if raw["qmode"] != "phrase":  # the default; left out like in the URL
-            out["qmode"] = raw["qmode"]
-    if "range" in raw:
-        if raw["range"] not in VIEW_RANGES:
-            raise ViewError(f"'filters.range' must be one of {list(VIEW_RANGES)}", "filters.range")
-        if "from" in raw or "to" in raw:
-            raise ViewError("Use either a relative 'range' or absolute 'from'/'to', not both", "filters.range")
-        if raw["range"] != "today":  # the default; left out like in the URL
-            out["range"] = raw["range"]
-    start = _clean_time(raw["from"], "filters.from") if "from" in raw else None
-    end = _clean_time(raw["to"], "filters.to") if "to" in raw else None
-    if start and end and end <= start:
-        raise ViewError("'filters.to' must be after 'filters.from'", "filters.to")
-    if start:
-        out["from"] = _iso_js(start)
-    if end:
-        out["to"] = _iso_js(end)
-    encoded = json.dumps(out, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-    if len(encoded) > VIEW_FILTERS_MAX_BYTES:
-        raise ViewError(f"'filters' is larger than {VIEW_FILTERS_MAX_BYTES} bytes", "filters")
-    return out
+    """filters.validate_filters, failing with a ViewError."""
+    try:
+        return _validate_filters(raw)
+    except ViewError:
+        raise
+    except FilterError as exc:
+        raise ViewError(str(exc), exc.field) from None
 
 
 def _clean_name(value: Any) -> str:

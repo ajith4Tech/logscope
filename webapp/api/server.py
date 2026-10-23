@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ipaddress
 import json
 import logging
@@ -30,6 +31,7 @@ from .actions import (
     resolve_action,
     run_described_action,
 )
+from .ai_cache import AiCache
 from .ai_settings import (
     TEST_FEATURE,
     AiFeatureDisabled,
@@ -43,8 +45,8 @@ from .ai_settings import (
     load_admin_token,
     tokens_equal,
 )
-from .ai_cache import AiCache
 from .ai_summary import (
+    complete_json,
     explain_log_line,
     explain_logs,
     ping_problem,
@@ -52,15 +54,18 @@ from .ai_summary import (
     summarize_anomalies_batch,
     summarize_anomaly,
 )
+from .alerts import AlertEngine, AlertRules, RuleError, backtest
+from .channels import ChannelError, ChannelStore
+from .config import AppConfig, load_app_config, source_prefixes
 from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, meta_of
-from .signatures import SignatureKB, load_rules
-from .summary_worker import SummaryWorker
-from .config import AppConfig, load_app_config
-from .ingest import S3Ingestor
+from .ingest import S3Ingestor, _key_time_format
 from .insights import AnomalyStore, InsightsJob
+from .nl_filters import NlFilterError, NlFilters
 from .notify import MattermostNotifier
+from .signatures import SignatureKB, load_rules
 from .state import SavedViews, StateDB, ViewError, ViewNotFound, default_state_db_path
 from .storage import FILTER_FIELDS, MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
+from .summary_worker import SummaryWorker
 
 _MAX_BODY_BYTES = 1024 * 1024  # JSON bodies are tiny; refuse anything larger
 _PRUNE_INTERVAL_SECS = 3600
@@ -259,14 +264,12 @@ class AppHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            try:
+            with contextlib.suppress(OSError):
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
                     b"Retry-After: 1\r\nConnection: close\r\nContent-Length: 30\r\n\r\n"
                     b'{"error":"Server busy; retry"}'
                 )
-            except OSError:
-                pass
             self.shutdown_request(request)
             return
         try:
@@ -554,6 +557,108 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status=exc.status)
         return True
 
+    def _handle_alerts(self, method: str, path: str) -> bool:
+        """/api/alerts/...: reads are open; channel and rule writes need the
+        admin token (on top of the Origin check every write gets); mute and
+        unmute need only the Origin check (on-call use) and are rate limited
+        per address; the backtest is read-only."""
+        parts = path.strip("/").split("/")
+        if parts[:2] != ["api", "alerts"] or len(parts) < 3 or len(parts) > 5:
+            return False
+        app = self.server.app
+        kind = parts[2]
+        item_id = None
+        if len(parts) >= 4:
+            try:
+                item_id = _bounded_int(parts[3], "id")
+            except ValueError:
+                self._send_json({"error": "Not found"}, status=404)
+                return True
+        action = parts[4] if len(parts) == 5 else None
+        no_store = {"Cache-Control": "no-store"}
+        try:
+            if kind == "channels" and item_id is None and action is None:
+                if method == "GET":
+                    self._send_json({"channels": app.alert_channels.list()}, headers=no_store)
+                elif method == "POST":
+                    if self._admin_authorized():
+                        self._send_json({"channel": app.alert_channels.create(self._read_body_json())}, status=201,
+                                        headers=no_store)
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "channels" and item_id is not None and action in (None, "test"):
+                if (method, action) not in (("PATCH", None), ("DELETE", None), ("POST", "test")):
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                elif self._admin_authorized():
+                    if action == "test":
+                        self._send_json(app.alerts.test_channel(item_id), headers=no_store)
+                    elif method == "PATCH":
+                        self._send_json({"channel": app.alert_channels.update(item_id, self._read_body_json())},
+                                        headers=no_store)
+                    else:
+                        app.alert_channels.delete(item_id)
+                        self._send_json({"ok": True, "id": item_id})
+            elif kind == "rules" and item_id is None and action is None:
+                if method == "GET":
+                    self._send_json(app.api_alert_rules())
+                elif method == "POST":
+                    if self._admin_authorized():
+                        rule = app.alert_rules.create(self._read_body_json())
+                        self._send_json({"rule": app.alert_rule_view(rule)}, status=201)
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "rules" and item_id is not None and action is None:
+                if method == "GET":
+                    self._send_json({"rule": app.alert_rule_view(app.alert_rules.get(item_id))})
+                elif method in ("PATCH", "DELETE"):
+                    if self._admin_authorized():
+                        if method == "PATCH":
+                            rule, changed = app.alert_rules.update(item_id, self._read_body_json())
+                            if changed:
+                                app.alerts.forget(item_id, "rule changed")
+                            self._send_json({"rule": app.alert_rule_view(rule)})
+                        else:
+                            app.alert_rules.delete(item_id)
+                            app.alerts.forget(item_id, "rule deleted", record=False)
+                            self._send_json({"ok": True, "id": item_id})
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "rules" and item_id is not None and action == "mute":
+                if method not in ("POST", "DELETE"):
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                    return True
+                wait = app.mute_limiter.allow(self.client_address[0])
+                if wait > 0:
+                    retry_after = max(1, int(wait + 0.999))
+                    self._send_json({"error": f"Too many mute requests; retry in {retry_after}s"}, status=429,
+                                    headers={"Retry-After": str(retry_after)})
+                    return True
+                rule = (app.alert_rules.mute(item_id, self._read_body_json()) if method == "POST"
+                        else app.alert_rules.unmute(item_id))
+                self._send_json({"rule": app.alert_rule_view(rule)})
+            elif kind == "events" and item_id is not None and action == "retry":
+                # "Retry now" on a pending or failed notification (admin).
+                if method != "POST":
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                elif self._admin_authorized():
+                    self._send_json({"event": app.alerts.retry_now(item_id)})
+            elif kind == "events" and item_id is None and method == "GET":
+                self._send_json(app.api_alert_events(parse_qs(urlparse(self.path).query)))
+            elif kind == "backtest" and item_id is None and method == "POST":
+                try:
+                    self._send_json(app.api_alert_backtest(self._read_body_json()))
+                except TimeoutError:
+                    self._send_json({"error": "The backtest took longer than 2 s; use a shorter range or a "
+                                              "narrower view"}, status=503)
+            else:
+                self._send_json({"error": "Not found"}, status=404)
+        except (RuleError, ChannelError) as exc:
+            payload = {"error": str(exc)}
+            if exc.field:
+                payload["field"] = exc.field
+            self._send_json(payload, status=exc.status)
+        return True
+
     def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -612,6 +717,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if self._handle_views("GET", parsed.path):
             return
         if self._handle_settings("GET", parsed.path):
+            return
+        if self._handle_alerts("GET", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -716,6 +823,18 @@ class LogscopeHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
             return
+        if parsed.path == "/api/ai/filters":
+            # Natural language -> proposed filters (feature nl_filters); the UI
+            # applies nothing until the operator does.
+            try:
+                self._send_json(app.nl_filters.propose(self._read_body_json()))
+            except NlFilterError as exc:
+                self._send_json(exc.payload, status=exc.status)
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=502)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
         if parsed.path == "/api/ai/feedback":
             # 👍/👎 on a cached answer: one vote per (entry, browser session),
             # 30 votes per minute per address.
@@ -733,6 +852,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if self._handle_views("POST", parsed.path):
             return
         if self._handle_settings("POST", parsed.path):
+            return
+        if self._handle_alerts("POST", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -764,10 +885,14 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             return
         if self._handle_views("PATCH", parsed.path):
             return
+        if self._handle_alerts("PATCH", parsed.path):
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _handle_delete(self) -> None:
         if self._handle_views("DELETE", urlparse(self.path).path):
+            return
+        if self._handle_alerts("DELETE", urlparse(self.path).path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -819,6 +944,7 @@ _TRUE = ("1", "true", "yes", "on")
 FEEDBACK_CLIENT_HEADER = "X-Logscope-Client"
 _CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _FEEDBACK_PER_MINUTE = 30
+_MUTES_PER_MINUTE = 30
 
 
 def _ai_options(get: Any) -> dict[str, Any]:
@@ -841,6 +967,7 @@ class WebApp:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._ingest_loop, daemon=True)
         self._fts_thread = threading.Thread(target=self._fts_migration_loop, daemon=True)
+        self._ts_thread = threading.Thread(target=self._ts_backfill_loop, daemon=True)
         self._started_at = time.monotonic()
         self._last_poll_finished: float | None = None
         self.anomaly_store = AnomalyStore(cfg.webapp.db_path)
@@ -864,7 +991,8 @@ class WebApp:
         self.admin_token, self.admin_token_source = load_admin_token(state_dir)
         self.admin_auth_failures = AuthFailureLimiter()
         self.feedback_limiter = ClientRateLimiter(max_failures=_FEEDBACK_PER_MINUTE)
-        self.ai_settings = AiSettings(self.state_db, cfg.ai, SecretBox(state_dir))
+        self.secret_box = SecretBox(state_dir)
+        self.ai_settings = AiSettings(self.state_db, cfg.ai, self.secret_box)
         self.ai_meter = UsageMeter(self.state_db, self.ai_settings, notify=self._budget_notice)
         self.ai = AiService(self.ai_settings, self.ai_meter)
         # Cheapest answer first: signatures, then the template cache, then one
@@ -881,6 +1009,26 @@ class WebApp:
             rate_limit=lambda: self.ai_rate_limiter.acquire(),
             configured=lambda: self.ai_configured(),
         )
+        self.nl_filters = NlFilters(
+            storage=self.storage, service=self.ai, cache=self.ai_cache,
+            configured=lambda: self.ai_configured(),
+            complete=lambda system, user, ai_cfg: complete_json(system, user, ai_cfg),
+            rate_limit=lambda: self.ai_rate_limiter.acquire(),
+        )
+        # Alerts on saved views (alerts.py), delivered through the channel
+        # layer shared with anomaly notifications (channels.py).
+        self.alert_channels = ChannelStore(self.state_db, self.secret_box, env_url=self.notifier.webhook_url)
+        self.alert_rules = AlertRules(self.state_db, self.alert_channels)
+        self.alerts = AlertEngine(
+            db=self.state_db, storage=self.storage, rules=self.alert_rules, channels=self.alert_channels,
+            signatures=self.signatures, prefixes=lambda: [p["prefix"] for p in source_prefixes(cfg)],
+            time_format=_key_time_format(cfg.s3_key_prefix), display_tz=cfg.alerts.display_tz,
+            public_url=cfg.alerts.public_url, batch_timeout=cfg.alerts.s3_batch_timeout_secs,
+            margin=cfg.alerts.watermark_margin_secs, tick_secs=cfg.alerts.eval_tick_secs,
+            ai_service=self.ai, ai_fn=lambda payload, ai_cfg: explain_logs(payload, ai_cfg),
+            ai_configured=lambda: self.ai_configured(),
+        )
+        self.mute_limiter = ClientRateLimiter(max_failures=_MUTES_PER_MINUTE)
         # Automatic anomaly summaries run here, never in the detection loop.
         self.summary_worker = SummaryWorker(
             self.explainer, self.anomaly_store, min_urgency=lambda: self.cfg.ai.auto_summary_min_urgency)
@@ -899,8 +1047,9 @@ class WebApp:
             for o in os.environ.get("LOGSCOPE_ALLOWED_ORIGINS", "").split(",")
             if o.strip()
         )
-        # Bounds operator-triggered AI calls (/api/explain, /api/explain-line);
-        # cached answers are free and not counted. 0 disables the limit.
+        # Bounds operator-triggered AI calls (/api/explain, /api/explain-line,
+        # /api/ai/filters); cached answers are free and not counted. 0
+        # disables the limit.
         self.ai_rate_limiter = _RateLimiter(
             _env_int("LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE", _DEFAULT_AI_RATE_LIMIT_PER_MINUTE)
         )
@@ -911,20 +1060,26 @@ class WebApp:
         self._thread.start()
         if self.storage.fts_layout == "migrating":
             self._fts_thread.start()
+        if self.storage.ts_backfill_pending:
+            self._ts_thread.start()
         if self.cfg.insights.enabled:
             self.insights.start()
         self.summary_worker.start()
         self.notifier.start()
+        self.alerts.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
         if self._fts_thread.is_alive():
             self._fts_thread.join(timeout=5)
+        if self._ts_thread.is_alive():
+            self._ts_thread.join(timeout=5)
         if self.cfg.insights.enabled:
             self.insights.stop()
         self.summary_worker.stop()
         self.notifier.stop()
+        self.alerts.stop()
 
     def _ingest_loop(self) -> None:
         while not self._stop.is_set():
@@ -959,6 +1114,29 @@ class WebApp:
             retry = _FTS_MIGRATION_RETRY_SECS
             self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
 
+    def _ts_backfill_loop(self) -> None:
+        """Give rows written by an older version their ts_epoch, in batches
+        (storage.TS_BACKFILL_BATCH) that each commit and release the lock;
+        a restart resumes. Failures retry with backoff and are reported in
+        /api/status storage.ts_backfill.last_error."""
+        logger.info("Backfilling ts_epoch for existing records (runs in the background)")
+        retry = _FTS_MIGRATION_RETRY_SECS
+        while not self._stop.is_set():
+            try:
+                if not self.storage.backfill_ts_step():
+                    self.storage.ts_backfill_error = None
+                    logger.info("ts_epoch backfill complete")
+                    return
+            except sqlite3.Error as exc:
+                self.storage.ts_backfill_error = f"{type(exc).__name__}: {exc}"[:300]
+                logger.warning("ts_epoch backfill paused (%s); retrying in %ds", exc, retry)
+                self._stop.wait(retry)
+                retry = min(retry * 2, _FTS_MIGRATION_RETRY_MAX_SECS)
+                continue
+            self.storage.ts_backfill_error = None
+            retry = _FTS_MIGRATION_RETRY_SECS
+            self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
+
     def _maybe_prune(self) -> None:
         days = self.cfg.webapp.retention_days
         if days <= 0:
@@ -967,10 +1145,10 @@ class WebApp:
         if self._last_prune_at is not None and now - self._last_prune_at < _PRUNE_INTERVAL_SECS:
             return
         self._last_prune_at = now
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        removed = self.storage.prune_records_before(cutoff)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        removed = self.storage.prune_records_before(cutoff.timestamp())
         if removed:
-            logger.info("Pruned %d cached records older than %s", removed, cutoff)
+            logger.info("Pruned %d cached records older than %s", removed, cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     def healthy(self) -> bool:
         # Liveness stays "the ingest loop is running": S3 or AI outages must not
@@ -1042,6 +1220,14 @@ class WebApp:
         status["actions_enabled"] = self.actions_enabled
         status["insights"] = self.insights.status()
         try:
+            # Alert windows end here, not at now (see alerts.compute_watermark).
+            status["watermark"] = self.alerts.watermark()
+            status["alerts"] = {"firing": self.alerts.firing_count(), "pipeline_stale": self.alerts.pipeline_firing(),
+                                "last_tick_at": self.alerts.last_tick_at, "last_error": self.alerts.last_error,
+                                "delivery": self.alerts.delivery_status()}
+        except sqlite3.Error as exc:
+            status["alerts"] = {"status_error": type(exc).__name__}
+        try:
             status["notifications"] = self.notifier.status()
         except sqlite3.Error as exc:
             status["notifications"] = {"enabled": bool(self.cfg.mattermost.enabled),
@@ -1050,8 +1236,14 @@ class WebApp:
 
     def ready(self) -> tuple[bool, bool]:
         """(ready, busy). A connection busy with a long query is still working;
-        only one that stays busy past the grace period is reported unready."""
-        if self.storage.ping():
+        only one that stays busy past the grace period is reported unready.
+        A database error (unreadable, corrupt, closed) is unready."""
+        try:
+            answered = self.storage.ping()
+        except sqlite3.Error as exc:
+            logger.warning("Readiness check: database error (%s)", type(exc).__name__)
+            return False, False
+        if answered:
             self._db_busy_since = None
             return True, False
         now = time.monotonic()
@@ -1113,6 +1305,35 @@ class WebApp:
         result = self.ai.call(TEST_FEATURE, ping_provider, before_call=self.ai_rate_limiter.acquire,
                               check_budget=False)
         return {k: result[k] for k in ("ok", "latency_ms", "model", "error") if k in result}
+
+    def alert_rule_view(self, rule: dict) -> dict:
+        return {**rule, "status": self.alerts.rule_status(rule)}
+
+    def api_alert_rules(self) -> dict:
+        rules = [self.alert_rule_view(rule) for rule in self.alert_rules.list()]
+        return {"rules": rules, "firing": sum(1 for r in rules if r["status"]["state"] == "firing"),
+                "watermark": self.alerts.watermark()}
+
+    def api_alert_events(self, params: dict[str, list[str]]) -> dict:
+        rule = _first(params, "rule")
+        cursor = _first(params, "cursor")
+        since = _first(params, "since")
+        if since and (len(since) > 40 or not re.match(r"^\d{4}-\d{2}-\d{2}", since)):
+            raise ValueError("'since' must be an ISO-8601 time")
+        state = _first(params, "state")
+        if state and state not in ("ok", "pending", "firing", "resolved", "disabled"):
+            raise ValueError("'state' must be ok, pending, firing, resolved or disabled")
+        return self.alerts.events(
+            rule_id=_bounded_int(rule, "rule") if rule else None, state=state, since=since,
+            before_id=_bounded_int(cursor, "cursor") if cursor else None,
+            limit=_coerce_limit(_first(params, "limit"), 50, 200))
+
+    def api_alert_backtest(self, body: dict) -> dict:
+        mark = self.alerts.watermark()
+        end = datetime.fromisoformat(mark["at"].replace("Z", "+00:00")) if mark["at"] else datetime.now(timezone.utc)
+        result = backtest(self.storage, self.alert_rules, body, end=end)
+        result["ends_at_watermark"] = bool(mark["at"])
+        return result
 
     def api_anomalies(self, params: dict[str, list[str]]) -> dict:
         flat = {
@@ -1229,7 +1450,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> None:
         sys.exit(2)
     # A host name given to --host is how this server is reached; trust it.
     bind_host = args.host.strip().lower()
-    extra_hosts = () if bind_host in ("", "0.0.0.0", "::") or _is_ip_literal(bind_host) else (bind_host,)
+    extra_hosts = () if bind_host in ("", "0.0.0.0", "::") or _is_ip_literal(bind_host) else (bind_host,)  # noqa: S104 - a comparison, not a bind
     try:
         app = WebApp(cfg, extra_trusted_hosts=extra_hosts)
     except (OSError, sqlite3.Error, ValueError) as exc:

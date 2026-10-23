@@ -30,20 +30,21 @@ with existing code/tests. The first troubleshooting step is used to populate it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 from urllib import error, request
 
-from .actions import assess_step_risk, step_execution_fields
+from .actions import step_execution_fields
 from .config import AiConfig
 from .patterns import digest_records
-
 
 logger = logging.getLogger(__name__)
 
@@ -207,19 +208,19 @@ _UNTRUSTED_INPUT_RULES = (
 # and pod names (needed for troubleshooting). Pattern-based redaction cannot
 # recognise every secret (e.g. a bare random string with no telling key name);
 # see the chart README for the remaining limitations.
-_SECRET_KEY_NAMES = (
+_SENSITIVE_KEY_NAMES = (
     r"[\w.-]*(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key"
     r"|private[_-]?key|client[_-]?secret|session[_-]?id|credentials?|signature)[\w.-]*"
     r"|[\w.-]*[_.-]pass\b|\bpass\b"
 )
 # A value: double- or single-quoted (also JSON-escaped \"...\" inside a
 # string, spaces allowed) or a bare word.
-_SECRET_VALUE = (
+_SENSITIVE_VALUE = (
     r"(?!\\*\[REDACTED)"
     r"(?P<value>\\*\"[^\"\r\n]*?\\*\"|\\*'[^'\r\n]*?\\*'|[^\s\"',;&}\]\\]+)"
 )
 _KEY_VALUE_RE = re.compile(
-    rf"(?i)(?P<key>\b(?:{_SECRET_KEY_NAMES}))(?P<sep>\\*[\"']?\s*[:=]\s*)" + _SECRET_VALUE
+    rf"(?i)(?P<key>\b(?:{_SENSITIVE_KEY_NAMES}))(?P<sep>\\*[\"']?\s*[:=]\s*)" + _SENSITIVE_VALUE
 )
 _QUOTE_EDGE_RE = re.compile(r"^(\\*[\"'])?[\s\S]*?(\\*[\"'])?$")
 
@@ -558,7 +559,54 @@ def explain_logs(
     return _call_provider(provider, payload, model, api_key, cfg, _EXPLAIN_SYSTEM_PROMPT)
 
 
-LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_JSON_ONLY_REMINDER = (
+    " Your previous reply was not a valid JSON object. Reply with exactly one JSON object and "
+    "nothing else: no prose, no comments, no code fences."
+)
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    """Strict: the whole reply (a ```json fence is tolerated) must be one JSON
+    object. `summary` is never empty, so the provider helpers hand every
+    reply back instead of raising; `json` is None when it did not parse."""
+    text = str(content or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    try:
+        parsed = json.loads(fenced.group(1) if fenced else text)
+    except ValueError:
+        parsed = None
+    return {"summary": "json", "json": parsed if isinstance(parsed, dict) else None}
+
+
+def complete_json(system: str, user: dict[str, Any] | str, cfg: AiConfig) -> dict[str, Any]:
+    """One JSON object from the model for a non-summary task (e.g. natural
+    language filters), through the same provider plumbing as the summaries
+    (input bounding and redaction, retries, usage capture). Always cfg.model:
+    callers pass the fast tier. A reply that is not strictly a JSON object
+    is retried once with a "JSON only" reminder; RuntimeError after that, or
+    when no provider is configured."""
+    provider = str(cfg.provider or "").strip().lower()
+    api_key = _api_key(cfg)
+    model = str(cfg.model or "").strip()
+    if provider not in SUPPORTED_PROVIDERS or not model or not api_key:
+        raise RuntimeError("AI provider is not configured")
+    payload = user if isinstance(user, dict) else {"input": str(user)}
+    totals: dict[str, int] = {}
+    try:
+        for prompt in (system, system + _JSON_ONLY_REMINDER):
+            with capture_usage() as usage:
+                result = _call_provider(provider, payload, model, api_key, cfg, prompt, parse=_parse_json_object)
+            for key, value in usage.items():
+                totals[key] = totals.get(key, 0) + int(value)
+            if result and result.get("json") is not None:
+                return result["json"]
+    finally:
+        # Both attempts count towards the caller's metering.
+        _note_usage(**totals)
+    raise RuntimeError(f"{provider} did not return valid JSON")
+
+
+LOCAL_HOSTS =frozenset({"localhost", "127.0.0.1", "::1"})
 # Sent to a local OpenAI-compatible server (e.g. Ollama) when no key is set;
 # such servers ignore it.
 LOCAL_PLACEHOLDER_KEY = "local"
@@ -755,10 +803,8 @@ def build_prompt_payload(anomaly: dict[str, Any]) -> dict[str, Any]:
 
     evidence = anomaly.get("evidence")
     if isinstance(evidence, str):
-        try:
+        with contextlib.suppress(ValueError):
             evidence = json.loads(evidence)
-        except ValueError:
-            pass
     if isinstance(evidence, dict):
         # A stored provider error is bookkeeping, not evidence.
         evidence = {k: v for k, v in evidence.items() if k != "ai_error"}
@@ -808,11 +854,6 @@ def _format_step_action(step: dict[str, Any]) -> str:
         return command
 
     return explanation
-
-
-def _infer_risk(command: str, raw_risk: str | None) -> str:
-    # Server-side; the model's label may raise the level but never lower it.
-    return assess_step_risk(command, raw_risk)
 
 
 # Shared with the anomaly store, which re-derives stored plans on every read.
@@ -1046,7 +1087,7 @@ def _clean_error_message(raw_text: str, *keys: str) -> str:
                         text = f"{msg} ({status})" if status and status not in msg else msg
                 elif isinstance(err, str):
                     text = err
-        except Exception:
+        except Exception:  # noqa: S110 - not a JSON error body: the raw text is used
             pass
 
     for k in keys:
@@ -1104,7 +1145,8 @@ def _post_json(
     ).encode("utf-8")
 
     for attempt in range(1, attempts + 1):
-        req = request.Request(
+        # Provider URLs are https (or http to localhost), checked by ai_settings.
+        req = request.Request(  # noqa: S310
             url,
             data=encoded_body,
             headers=headers,
@@ -1112,7 +1154,8 @@ def _post_json(
         )
 
         try:
-            with request.urlopen(
+            # Provider URLs are https (or http to localhost), checked by ai_settings.
+            with request.urlopen(  # noqa: S310
                 req,
                 timeout=_PROVIDER_TIMEOUT_SECONDS,
             ) as resp:
@@ -1210,7 +1253,7 @@ def _openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
 
 def _fetch_openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
     try:
-        req = request.Request(
+        req = request.Request(  # noqa: S310 - the configured provider base URL
             f"{base_url}/models",
             headers={
                 "Accept": "application/json",
@@ -1218,7 +1261,7 @@ def _fetch_openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
             },
         )
 
-        with request.urlopen(req, timeout=20) as resp:
+        with request.urlopen(req, timeout=20) as resp:  # noqa: S310 - the configured provider base URL
             raw = resp.read(_MAX_MODEL_INDEX_BYTES + 1)
         if len(raw) > _MAX_MODEL_INDEX_BYTES:
             return {}

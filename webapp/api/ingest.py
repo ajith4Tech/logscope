@@ -14,7 +14,7 @@ from botocore.exceptions import ClientError
 
 from .config import AppConfig, source_prefixes
 from .parser import make_record
-from .storage import LogStorage, utc_stamp
+from .storage import LogStorage, to_epoch, utc_stamp
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +89,6 @@ def lookback_start_after(prefix: str, last_key: str | None, time_format: str, lo
 
 @dataclass
 class IngestResult:
-    objects_scanned: int = 0
     objects_ingested: int = 0
     records_ingested: int = 0
     objects_failed: int = 0
@@ -124,8 +123,7 @@ class S3Ingestor:
             kwargs["StartAfter"] = start_after
         paginator = self.client.get_paginator("list_objects_v2")
         for page in paginator.paginate(**kwargs):
-            for obj in page.get("Contents", []):
-                yield obj
+            yield from page.get("Contents", [])
 
     def _ingest_object(self, spec: dict[str, str], key: str, etag: str, last_modified: str) -> tuple[int | None, str]:
         """Stream one gzip object into storage in bounded batches.
@@ -145,6 +143,8 @@ class S3Ingestor:
         response = self.client.get_object(Bucket=self.cfg.s3_bucket, Key=key)
         body = response["Body"]
         etag = _strip_quotes(str(response.get("ETag") or "")) or etag
+        # Lines whose timestamp does not parse are placed at the object's time.
+        object_epoch = to_epoch(last_modified)
         inserted = 0
         skipped_lines = 0
         truncated_lines = 0
@@ -169,6 +169,7 @@ class S3Ingestor:
                             source_etag=etag,
                             line_number=line_number,
                             infra_namespaces=self.cfg.infra_namespaces,
+                            fallback_epoch=object_epoch,
                         )
                     except ValueError:
                         skipped_lines += 1
@@ -253,7 +254,6 @@ class S3Ingestor:
                         key = str(obj.get("Key") or "")
                         if not key or key.endswith("/"):
                             continue
-                        result.objects_scanned += 1
                         etag = _strip_quotes(str(obj.get("ETag") or ""))
                         last_modified = _dt_to_iso(obj.get("LastModified"))
                         # The cursor may pass a failed object: the failure table
@@ -271,6 +271,9 @@ class S3Ingestor:
                             object_errors.append(error)
                     if max_key and max_key != (start_after or ""):
                         self.storage.set_prefix_cursor(prefix, max_key)
+                    # Everything in S3 at the start of this poll is now read or
+                    # in the failure table: the alert watermark's input.
+                    self.storage.set_prefix_listed(prefix, last_polled_at)
                 except Exception as exc:
                     # Listing failed: keep the cursor so the next poll re-lists.
                     logger.warning("S3 listing for prefix %s failed: %s", prefix, exc)
