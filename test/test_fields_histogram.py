@@ -138,11 +138,12 @@ def test_records_indexes_are_created_by_storage(tmp_path):
     LogStorage(db).conn.close()
     storage = LogStorage(db)  # idempotent on reopen
     names = {r[0] for r in storage.conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'")}
-    assert {"idx_records_ts_ns", "idx_records_ns_ts", "idx_records_sev_ts",
-            "idx_records_scope_ts", "idx_records_pod_ts"} <= names
+    assert {"idx_records_epoch", "idx_records_ns_epoch", "idx_records_sev_epoch",
+            "idx_records_scope_epoch", "idx_records_pod_epoch"} <= names
+    assert not names & {"idx_records_ts_ns", "idx_records_ns_ts", "idx_records_sev_ts"}  # text-time indexes dropped
     plan = " ".join(str(r[3]) for r in storage.conn.execute(
-        "EXPLAIN QUERY PLAN SELECT id FROM records WHERE namespace = ? AND timestamp >= ?", ("a", "b")))
-    assert "idx_records_ns_ts" in plan
+        "EXPLAIN QUERY PLAN SELECT id FROM records WHERE namespace = ? AND ts_epoch >= ?", ("a", 0.0)))
+    assert "idx_records_ns_epoch" in plan
 
 
 # ─── /api/fields ─────────────────────────────────────────────────────────────
@@ -323,4 +324,5 @@ def test_http_explain_receives_exclusions(server, monkeypatch):
     conn.close()
     assert res.status == 200
     assert seen["filters"] == {"xns": ["app", "billing"]}
-    assert {row["namespace"] for row in seen["log_sample"]} == {"kube-system"}
+    # Compact input: templates of the sample (namespace patterns), not raw rows.
+    assert seen["templates"] and {t["namespace"] for t in seen["templates"]} == {"kube-system"}

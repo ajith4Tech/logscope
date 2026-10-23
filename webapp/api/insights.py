@@ -7,15 +7,15 @@ import re
 import sqlite3
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .actions import step_execution_fields
 from .config import AppConfig, InsightsConfig
 from .storage import SQLITE_BUSY_TIMEOUT_SECS
-
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +45,6 @@ def rule_key_of(message: str) -> str:
     if detail_index > 0 and "=" in text[detail_index:]:
         text = text[:detail_index]
     return text
-
-
-def compute_baseline(hourly_counts: list[int]) -> float:
-    """Baseline = mean of per-hour counts across the baseline window."""
-    if not hourly_counts:
-        return 0.0
-    return sum(hourly_counts) / len(hourly_counts)
 
 
 def is_spike(current: int, baseline: float, multiplier: float, min_count: int) -> bool:
@@ -128,29 +121,15 @@ class AnomalyStore:
             cols = [info[1] for info in cur.execute("PRAGMA table_info(anomalies)").fetchall()]
             if "ai_steps" not in cols:
                 cur.execute("ALTER TABLE anomalies ADD COLUMN ai_steps TEXT")
+            if "ai_meta" not in cols:
+                # {source: signature|cache|ai, tier, generated_at, cache_key}
+                cur.execute("ALTER TABLE anomalies ADD COLUMN ai_meta TEXT")
             # Regenerate existing cached AI summaries that lack structured steps
             cur.execute(
                 "UPDATE anomalies SET ai_summarized_at = NULL "
                 "WHERE ai_steps IS NULL AND ai_summary IS NOT NULL AND status = 'new'"
             )
             self._conn.commit()
-
-    def upsert_anomaly(
-        self,
-        *,
-        type: str,
-        namespace: str,
-        pod: str,
-        rule_key: str,
-        severity: str,
-        evidence: dict[str, Any],
-        detected_day: str,
-    ) -> int:
-        anomaly_id, _ = self.record_detection(
-            type=type, namespace=namespace, pod=pod, rule_key=rule_key,
-            severity=severity, evidence=evidence, detected_day=detected_day,
-        )
-        return anomaly_id
 
     @_write
     def record_detection(
@@ -208,7 +187,8 @@ class AnomalyStore:
                 self._conn.execute(
                     """
                     UPDATE anomalies SET evidence=?, severity=?, updated_at=?,
-                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL
+                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL,
+                        ai_meta=NULL
                     WHERE id=?
                     """,
                     (evidence_json, severity, now, anomaly_id),
@@ -247,12 +227,15 @@ class AnomalyStore:
         summary: str,
         action: str,
         steps: list[dict[str, Any]] | None = None,
+        meta: dict[str, Any] | None = None,
     ) -> None:
         steps_json = json.dumps(steps, separators=(",", ":")) if steps is not None else None
+        meta_json = json.dumps(meta, separators=(",", ":")) if meta else None
         with self._lock:
             self._conn.execute(
-                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_steps=?, ai_summarized_at=? WHERE id=?",
-                (summary, action, steps_json, _utc_now_iso(), anomaly_id),
+                "UPDATE anomalies SET ai_summary=?, ai_suggested_action=?, ai_steps=?, ai_summarized_at=?, ai_meta=? "
+                "WHERE id=?",
+                (summary, action, steps_json, _utc_now_iso(), meta_json, anomaly_id),
             )
             self._conn.commit()
 
@@ -267,7 +250,7 @@ class AnomalyStore:
     def query_anomalies(self, params: dict[str, Any], *, limit: int) -> dict[str, Any]:
         clauses: list[str] = []
         args: list[Any] = []
-        for field in ("status", "type", "namespace"):
+        for field in ("id", "status", "type", "namespace"):
             value = params.get(field)
             if value:
                 clauses.append(f"{field} = ?")
@@ -281,7 +264,21 @@ class AnomalyStore:
         has_more = len(rows) > limit
         items = [dict(row) for row in rows[:limit]]
         for item in items:
-            item["evidence"] = json.loads(item["evidence"])
+            # One unreadable row (e.g. hand-edited or cut short by a full
+            # disk) is shown with the problem instead of failing the list.
+            try:
+                evidence = json.loads(item["evidence"])
+            except (TypeError, ValueError) as exc:
+                evidence = None
+                item["evidence_error"] = f"Stored evidence is not valid JSON ({type(exc).__name__})"
+            if evidence is not None and not isinstance(evidence, dict):
+                item["evidence_error"] = "Stored evidence is not a JSON object"
+                evidence = None
+            item["evidence"] = evidence if evidence is not None else {}
+            try:
+                item["ai_meta"] = json.loads(item["ai_meta"]) if item.get("ai_meta") else None
+            except ValueError:
+                item["ai_meta"] = None
             raw_steps = item.get("ai_steps")
             if raw_steps:
                 try:
@@ -302,6 +299,10 @@ class AnomalyStore:
                         step.pop(stale, None)
                     step.update(step_execution_fields(step.get("command") or "", step.get("risk")))
         return {"items": items, "has_more": has_more}
+
+    def get_anomaly(self, anomaly_id: int) -> dict[str, Any] | None:
+        items = self.query_anomalies({"id": anomaly_id}, limit=1)["items"]
+        return items[0] if items else None
 
     _VALID_STATUSES = frozenset({"new", "reviewed", "dismissed"})
 
@@ -362,11 +363,10 @@ class InsightsDetector:
     app the detector owns a separate read connection; with WAL it then never
     waits on, or blocks, the ingest writer and HTTP queries."""
 
-    def __init__(self, conn: sqlite3.Connection, cfg: InsightsConfig, lock: threading.RLock | None = None):
+    def __init__(self, conn: sqlite3.Connection, cfg: InsightsConfig):
         self._conn = conn
         self.cfg = cfg
-        # The owner's lock when conn is shared with other threads (LogStorage.lock).
-        self._lock = lock or threading.RLock()
+        self._lock = threading.RLock()
         self.history_hours: float | None = None
         self.learning = False
         with self._lock:
@@ -376,21 +376,12 @@ class InsightsDetector:
     def _iso(value: datetime) -> str:
         return value.isoformat().replace("+00:00", "Z")
 
-    @staticmethod
-    def _parse(value: str) -> datetime | None:
-        try:
-            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
-        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
     def _first_record_time(self) -> datetime | None:
-        """Earliest stored event time, or None when there are no records. An
-        unparseable value is treated as "history covers the whole window"."""
-        row = self._query("SELECT MIN(timestamp) FROM records", ())
-        if not row or not row[0][0]:
+        """Earliest stored event time, or None when there are no records."""
+        row = self._query("SELECT MIN(ts_epoch) FROM records", ())
+        if not row or row[0][0] is None:
             return None
-        return self._parse(row[0][0]) or datetime.min.replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(float(row[0][0]), timezone.utc)
 
     def _windows(self, now: datetime) -> list[_Window]:
         """The windows to evaluate at `now`, oldest first. Updates
@@ -416,13 +407,13 @@ class InsightsDetector:
         self.learning = not windows
         return windows
 
-    def _slices(self, start: str, end: str) -> list[tuple[str, str]]:
-        lo = datetime.fromisoformat(start.replace("Z", "+00:00"))
-        hi = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        out: list[tuple[str, str]] = []
+    @staticmethod
+    def _slices(lo: datetime, hi: datetime) -> list[tuple[float, float]]:
+        """[lo, hi) as epoch-second slices of at most _BASELINE_SLICE_HOURS."""
+        out: list[tuple[float, float]] = []
         while lo < hi:
             nxt = min(lo + timedelta(hours=_BASELINE_SLICE_HOURS), hi)
-            out.append((self._iso(lo), self._iso(nxt)))
+            out.append((lo.timestamp(), nxt.timestamp()))
             lo = nxt
         return out
 
@@ -431,9 +422,9 @@ class InsightsDetector:
             return self._conn.execute(sql, args).fetchall()
 
     def _counts(
-        self, start: str, end: str, keys: tuple[str, ...], where: str = "", args: tuple = ()
+        self, start: datetime, end: datetime, keys: tuple[str, ...], where: str = "", args: tuple = ()
     ) -> dict[tuple, int]:
-        """{key tuple: row count} for start <= timestamp < end, aggregated in SQL
+        """{key tuple: row count} for start <= event time < end, aggregated in SQL
         one slice at a time. `keys` are SQL expressions (fixed by the callers)."""
         select = ", ".join(f"{expr} AS k{i}" for i, expr in enumerate(keys))
         group = ", ".join(f"k{i}" for i in range(len(keys)))
@@ -441,7 +432,7 @@ class InsightsDetector:
         for lo, hi in self._slices(start, end):
             rows = self._query(
                 f"SELECT {select}, COUNT(*) FROM records "
-                f"WHERE timestamp >= ? AND timestamp < ?{where} GROUP BY {group}",
+                f"WHERE ts_epoch >= ? AND ts_epoch < ?{where} GROUP BY {group}",
                 (lo, hi, *args),
             )
             for row in rows:
@@ -458,7 +449,7 @@ class InsightsDetector:
         return out
 
     def _observed(self, windows: list[_Window], keys: tuple[str, ...], where: str = "", args: tuple = ()) -> list[dict]:
-        return [self._counts(self._iso(w.start), self._iso(w.end), keys, where, args) for w in windows]
+        return [self._counts(w.start, w.end, keys, where, args) for w in windows]
 
     def _baselines(
         self, windows: list[_Window], observed: list[dict], keys: tuple[str, ...], where: str, args: tuple
@@ -469,11 +460,11 @@ class InsightsDetector:
         previous window's observation."""
         if len(windows) == 2:
             prev, cur = windows
-            core = self._counts(self._iso(cur.baseline_start), self._iso(prev.start), keys, where, args)
-            head = self._counts(self._iso(prev.baseline_start), self._iso(cur.baseline_start), keys, where, args)
+            core = self._counts(cur.baseline_start, prev.start, keys, where, args)
+            head = self._counts(prev.baseline_start, cur.baseline_start, keys, where, args)
             return [self._add(head, core), self._add(core, observed[0])]
         return [
-            self._counts(self._iso(w.baseline_start), self._iso(w.start), keys, where, args) for w in windows
+            self._counts(w.baseline_start, w.start, keys, where, args) for w in windows
         ]
 
     def _samples(self, window: _Window, where: str, args: tuple) -> list[sqlite3.Row]:
@@ -481,8 +472,8 @@ class InsightsDetector:
         limit = max(self.cfg.sample_timestamps_max, _SAMPLE_SCAN_ROWS)
         return self._query(
             "SELECT timestamp, severity_bucket, message FROM records "
-            f"WHERE timestamp >= ? AND timestamp < ?{where} ORDER BY timestamp, id LIMIT ?",
-            (self._iso(window.start), self._iso(window.end), *args, limit),
+            f"WHERE ts_epoch >= ? AND ts_epoch < ?{where} ORDER BY ts_epoch, id LIMIT ?",
+            (window.start.timestamp(), window.end.timestamp(), *args, limit),
         )
 
     def _hours_with_data(self, start: datetime, end: datetime) -> int:
@@ -493,8 +484,8 @@ class InsightsDetector:
         found = 0
         while hour < end:
             lo, hi = max(hour, start), min(hour + timedelta(hours=1), end)
-            if self._query("SELECT 1 FROM records WHERE timestamp >= ? AND timestamp < ? LIMIT 1",
-                           (self._iso(lo), self._iso(hi))):
+            if self._query("SELECT 1 FROM records WHERE ts_epoch >= ? AND ts_epoch < ? LIMIT 1",
+                           (lo.timestamp(), hi.timestamp())):
                 found += 1
             hour += timedelta(hours=1)
         return found
@@ -562,7 +553,7 @@ class InsightsDetector:
         baselines = self._baselines(windows, observed, keys, where + extra_where, extra_args)
 
         found: dict[tuple, dict[str, Any]] = {}
-        for window, counts, baseline in zip(windows, observed, baselines):
+        for window, counts, baseline in zip(windows, observed, baselines, strict=True):
             for key, count in counts.items():
                 if key not in candidates:
                     continue
@@ -646,7 +637,7 @@ class InsightsDetector:
         ]
 
         found: dict[str, dict[str, Any]] = {}
-        for window, counts, seen in zip(windows, observed, seen_before):
+        for window, counts, seen in zip(windows, observed, seen_before, strict=True):
             for (key,), count in counts.items():
                 if key in seen or key in found:
                     continue  # known rule, or already reported for the earlier window
@@ -683,7 +674,7 @@ class InsightsDetector:
         baselines = self._baselines(windows, observed, keys, self._in_list("namespace"), (json.dumps(namespaces),))
 
         found: dict[tuple, dict[str, Any]] = {}
-        for window, current, baseline in zip(windows, observed, baselines):
+        for window, current, baseline in zip(windows, observed, baselines, strict=True):
             current_totals: dict[str, int] = {}
             for (namespace, _), count in current.items():
                 current_totals[namespace] = current_totals.get(namespace, 0) + count
@@ -717,7 +708,7 @@ class InsightsDetector:
     def future_record_count(self, now: datetime, tolerance: timedelta = timedelta(minutes=5)) -> int:
         """Records stamped ahead of `now` (clock skew or a wrong timezone). No
         window ever evaluates them, so they are reported instead."""
-        row = self._query("SELECT COUNT(*) FROM records WHERE timestamp > ?", (self._iso(now + tolerance),))
+        row = self._query("SELECT COUNT(*) FROM records WHERE ts_epoch > ?", ((now + tolerance).timestamp(),))
         return int(row[0][0]) if row else 0
 
     def detect_all(self, now: datetime) -> list[dict[str, Any]]:
@@ -737,11 +728,11 @@ class InsightsJob:
         records_conn: sqlite3.Connection,
         store: AnomalyStore,
         summarizer: Callable[[dict[str, Any]], dict[str, str] | None] | None = None,
-        records_lock: threading.RLock | None = None,
+        dispatcher: Callable[[list[dict[str, Any]]], int] | None = None,
     ):
         self.cfg = cfg
         self.store = store
-        self.detector = InsightsDetector(records_conn, cfg.insights, records_lock)
+        self.detector = InsightsDetector(records_conn, cfg.insights)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self.last_run_at: str | None = None
@@ -756,6 +747,10 @@ class InsightsJob:
         self.last_ai_error: str | None = None
         self.last_ai_error_at: str | None = None
         self._summarizer = summarizer
+        # When set, pending anomalies are handed to this non-blocking queue
+        # (summary_worker.SummaryWorker.enqueue) instead of being summarized
+        # inline, so a slow provider never delays detection.
+        self._dispatcher = dispatcher
         # anomaly id -> consecutive failures; only ids still pending are kept.
         self._ai_failures: dict[int, int] = {}
 
@@ -807,7 +802,10 @@ class InsightsJob:
         now = now or datetime.now(timezone.utc)
         counts = self.detect_once(now)
         self.future_dated_records = self.detector.future_record_count(now)
-        counts["anomalies_summarized"] = self.summarize_pending()
+        if self._dispatcher is not None:
+            counts["anomalies_queued"] = self.dispatch_pending()
+        else:
+            counts["anomalies_summarized"] = self.summarize_pending()
         self.last_duration_ms = int((time.monotonic() - started) * 1000)
         self.last_run_at = _utc_now_iso()
         self.last_counts = counts
@@ -832,6 +830,15 @@ class InsightsJob:
             )
             counts[f"anomalies_{outcome}"] += 1
         return counts
+
+    def dispatch_pending(self) -> int:
+        """Hand pending anomalies to the summary queue; returns how many it took."""
+        limit = max(50, self.cfg.ai.max_anomalies_per_tick * 10)
+        try:
+            return int(self._dispatcher(self.store.pending_ai_anomalies(limit)) or 0)  # type: ignore[misc]
+        except Exception as exc:  # the queue must never fail detection
+            logger.warning("Could not queue anomalies for AI summaries (%s)", type(exc).__name__)
+            return 0
 
     def summarize_pending(self) -> int:
         summarizer = self._summarizer or (lambda anomaly: None)

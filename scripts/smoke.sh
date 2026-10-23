@@ -11,7 +11,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 VERSION="${VERSION:-$(make -s version)}"
-IMAGE="${IMAGE:-ghcr.io/owner/logscope}"
+IMAGE="${IMAGE:-ghcr.io/ajith4tech/logscope}"
 TAG="${TAG:-$(echo "${VERSION#v}" | tr '+' '-')}"
 ARCH="${ARCH:-$(uname -m | sed -e s/x86_64/amd64/ -e s/aarch64/arm64/)}"
 BIN="${BIN:-dist/logscope-${VERSION}-linux-${ARCH}}"
@@ -130,6 +130,7 @@ selfcheck="$(docker run --rm --read-only --tmpfs /tmp -v "${config_volume}:/etc/
     -e LOGSCOPE_WEBAPP_DB_PATH=/data/logscope.sqlite -e LOGSCOPE_WEBAPP_STATE_DB_PATH=/data/state/state.sqlite \
     "${s3_env[@]}" "${REF}" selfcheck 2>&1 || true)"
 check "selfcheck passes (FTS5)" bash -c 'grep -q "^ok    fts5" <<<"$1" && grep -q "selfcheck: passed" <<<"$1"' _ "${selfcheck}"
+check "selfcheck: cryptography Fernet round-trip" grep -q "^ok    cryptography .*Fernet round-trip ok" <<<"${selfcheck}"
 check "image healthcheck command" docker exec "${cid}" logscope healthcheck
 uid="$(docker top "${cid}" -eo pid,uid,comm | awk 'NR > 1 && $3 == "logscope" {print $2; exit}' || true)"
 check "runs as UID 10001 (process uid ${uid:-?}, image user $(docker inspect -f '{{.Config.User}}' "${REF}"))" \
@@ -151,6 +152,7 @@ else
     check "binary version" bash -c "'${BIN}' version | grep -q '^logscope ${VERSION}'"
     out="$(AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y "${BIN}" selfcheck --config "${work}/bin-config.yaml" 2>&1 || true)"
     check "binary selfcheck passes (FTS5)" bash -c 'grep -q "^ok    fts5" <<<"$1" && grep -q "selfcheck: passed" <<<"$1"' _ "${out}"
+    check "binary selfcheck: cryptography Fernet round-trip" grep -q "^ok    cryptography .*Fernet round-trip ok" <<<"${out}"
     bin_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
     AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y AWS_ENDPOINT_URL_S3=http://127.0.0.1:9 AWS_MAX_ATTEMPTS=1 \
         "${BIN}" serve --host 127.0.0.1 --port "${bin_port}" --config "${work}/bin-config.yaml" \
@@ -166,7 +168,13 @@ else
     kill -TERM "${bin_pid}"; wait "${bin_pid}" 2>/dev/null || true; bin_pid=""
     info "binary size: $(du -h "${BIN}" | cut -f1)"
 fi
-info "image size: $(docker image inspect -f '{{.Size}}' "${REF}" | awk '{printf "%.1f MB", $1/1e6}')"
+size="$(docker image inspect -f '{{.Size}}' "${REF}")"
+info "image size: $(awk -v s="${size}" 'BEGIN {printf "%.1f MB", s/1e6}')"
+# BASELINE_REF (e.g. the previous release's image) reports the size change.
+if [[ -n "${BASELINE_REF:-}" ]] && base_size="$(docker image inspect -f '{{.Size}}' "${BASELINE_REF}" 2>/dev/null)"; then
+    info "image size vs ${BASELINE_REF}: $(awk -v a="${size}" -v b="${base_size}" \
+        'BEGIN {printf "%+.1f MB (%.1f MB -> %.1f MB, %+.1f%%)", (a-b)/1e6, b/1e6, a/1e6, 100*(a-b)/b}')"
+fi
 
 echo
 if ((failures)); then echo "smoke: ${failures} check(s) FAILED"; exit 1; fi

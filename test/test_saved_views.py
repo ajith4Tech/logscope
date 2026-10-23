@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT))
 
 from test_production import CONFIG, JSON, _request, _serve  # noqa: E402
 
-from webapp.api import dbtool, state as state_mod  # noqa: E402
+from webapp.api import dbtool  # noqa: E402
+from webapp.api import state as state_mod
 from webapp.api.config import load_app_config  # noqa: E402
 from webapp.api.server import WebApp  # noqa: E402
 from webapp.api.state import (  # noqa: E402
@@ -330,7 +331,7 @@ def test_dbtool_state_backup_verify_restore(tmp_path, monkeypatch, capsys):
     assert _mode(backup) == 0o600
     assert dbtool.main(["verify", "--state", str(backup)]) == 0
     out = capsys.readouterr().out
-    assert "'saved_views': 1" in out and "'schema_version': 1" in out
+    assert "'saved_views': 1" in out and f"'schema_version': {MIGRATIONS[-1][0]}" in out
     # The two kinds of database are not interchangeable.
     assert dbtool.main(["verify", str(backup)]) == 1
     assert "not a Logscope database" in capsys.readouterr().err

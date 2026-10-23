@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from .state import STATE_DB_ENV, default_state_db_path
-
+from .storage import CACHE_DB_ENV, default_cache_db_path
 
 DEFAULT_BACKEND = {
     "poll_interval_secs": 30,
-    "db_path": "/tmp/logscope-webapp.sqlite",
+    # The log cache (rebuildable from S3). None = $XDG_CACHE_HOME/logscope/
+    # cache.sqlite (~/.cache/logscope/...); never /tmp. $LOGSCOPE_WEBAPP_DB_PATH wins.
+    "db_path": None,
     # Durable state (saved views) in its own file; never in /tmp. None =
     # $XDG_DATA_HOME/logscope/state.sqlite (~/.local/share/logscope/...).
     "state_db_path": None,
@@ -49,6 +51,18 @@ DEFAULT_AI = {
     "max_anomalies_per_tick": 5,
     "reasoning_effort": "medium",
     "base_url": "",
+    "deep_model": "",
+    "prices": {},
+    "features": {},
+    "budgets": {},
+    # AI answers are cached per log template for this long (0 = no cache).
+    "cache_ttl_hours": 168,
+    # With anomaly_auto_summary on, only anomalies at or above this urgency
+    # (see notify.anomaly_urgency) are summarized automatically.
+    "auto_summary_min_urgency": "urgent",
+    # Extra signature rules (same format as webapp/api/signatures.yaml),
+    # tried after the built-in ones.
+    "signatures": [],
 }
 
 # Conventional key variable per provider when webapp.ai.api_key_env is not set.
@@ -74,6 +88,17 @@ DEFAULT_MATTERMOST = {
     # Occurrences whose window started longer ago than this are never sent
     # (no backlog flood when notifications are first enabled).
     "max_age_hours": 6,
+}
+
+DEFAULT_ALERTS = {
+    # Seconds subtracted from the ingest watermark (see alerts.watermark):
+    # objects can land in S3 a little after the poll that should have seen them.
+    "watermark_margin_secs": 120,
+    # Vector's S3 batch timeout (batch.timeout_secs; scripts/render.py and the
+    # chart use 600): an event is in S3 at most this long after it happened.
+    "s3_batch_timeout_secs": 600,
+    # How often the evaluator looks for due rules.
+    "eval_tick_secs": 30,
 }
 
 # Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
@@ -121,6 +146,19 @@ class AiConfig:
     max_anomalies_per_tick: int
     reasoning_effort: str
     base_url: str = ""
+    # Model for anomaly summaries (deeper analysis); "" = model.
+    deep_model: str = ""
+    # Per-model prices in USD per million tokens: {model: {input, output, cached}}.
+    prices: dict = field(default_factory=dict, compare=False)
+    # Defaults for the Settings UI's feature flags and budgets (it overrides them).
+    features: dict = field(default_factory=dict, compare=False)
+    budgets: dict = field(default_factory=dict, compare=False)
+    cache_ttl_hours: float = 168.0
+    auto_summary_min_urgency: str = "urgent"
+    signatures: tuple = field(default_factory=tuple, compare=False)
+    # The resolved key (see ai_settings.AiSettings.effective); never from
+    # config.yaml. Excluded from repr so it cannot reach a log line.
+    api_key: str = field(default="", repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -134,8 +172,19 @@ class MattermostConfig:
 
 
 @dataclass(frozen=True)
+class AlertsConfig:
+    # IANA zone for times in notifications (webapp.display_tz).
+    display_tz: str = "UTC"
+    # Public URL of the UI for deep links (webapp.public_url, else
+    # webapp.mattermost.link_base_url). Empty = no links.
+    public_url: str = ""
+    watermark_margin_secs: int = 120
+    s3_batch_timeout_secs: int = 600
+    eval_tick_secs: float = 30
+
+
+@dataclass(frozen=True)
 class AppConfig:
-    root: Path
     s3_bucket: str
     s3_region: str
     s3_key_prefix: str
@@ -149,6 +198,7 @@ class AppConfig:
     insights: InsightsConfig
     ai: AiConfig
     mattermost: MattermostConfig
+    alerts: AlertsConfig = field(default_factory=AlertsConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -200,8 +250,8 @@ def load_app_config(config_path: Path) -> AppConfig:
     mattermost.update(webapp.get("mattermost") or {})
     # Container deployments mount persistent storage at a different path than
     # the local-dev default; same LOGSCOPE_* override style as scripts/render.py.
-    if os.environ.get("LOGSCOPE_WEBAPP_DB_PATH"):
-        backend["db_path"] = os.environ["LOGSCOPE_WEBAPP_DB_PATH"]
+    if os.environ.get(CACHE_DB_ENV, "").strip():
+        backend["db_path"] = os.environ[CACHE_DB_ENV].strip()
     if os.environ.get(STATE_DB_ENV):
         backend["state_db_path"] = os.environ[STATE_DB_ENV]
     retention_days = backend.get("retention_days")
@@ -242,6 +292,30 @@ def load_app_config(config_path: Path) -> AppConfig:
     if int(backend["page_size_default"]) > int(backend["page_size_max"]):
         raise ValueError("webapp.backend.page_size_default must not exceed page_size_max")
 
+    from .ai_settings import SettingsError, clean_budgets, clean_flags, clean_prices
+
+    try:
+        ai["prices"] = clean_prices(ai.get("prices") or {}, "webapp.ai.prices")
+        ai["features"] = clean_flags(ai.get("features") or {}, "webapp.ai.features")
+        ai["budgets"] = clean_budgets(ai.get("budgets") or {}, "webapp.ai.budgets")
+    except SettingsError as exc:
+        raise ValueError(str(exc)) from None
+    if not isinstance(ai.get("signatures") or [], list):
+        raise ValueError("webapp.ai.signatures must be a list of rules")
+    from .signatures import SignatureError, load_rules
+
+    try:
+        load_rules(ai.get("signatures") or [])
+    except SignatureError as exc:
+        raise ValueError(f"webapp.ai.signatures: {exc}") from None
+    auto_urgency = str(ai.get("auto_summary_min_urgency") or "urgent").strip().lower()
+    if auto_urgency not in URGENCY_ORDER:
+        raise ValueError(f"webapp.ai.auto_summary_min_urgency must be one of {sorted(URGENCY_ORDER)}")
+    if float(ai.get("cache_ttl_hours") or 0) < 0:
+        raise ValueError("webapp.ai.cache_ttl_hours must be >= 0")
+    if "api_key" in ai_raw:
+        raise ValueError("webapp.ai.api_key is not read from config files; set the variable named in api_key_env")
+
     link_base_url = str(mattermost.get("link_base_url") or "").strip().rstrip("/")
     if link_base_url and not link_base_url.lower().startswith(("https://", "http://")):
         raise ValueError("webapp.mattermost.link_base_url must start with https:// or http://")
@@ -249,8 +323,24 @@ def load_app_config(config_path: Path) -> AppConfig:
         if float(mattermost[key]) <= 0:
             raise ValueError(f"webapp.mattermost.{key} must be > 0, got {mattermost[key]!r}")
 
+    alerts = dict(DEFAULT_ALERTS)
+    alerts.update(webapp.get("alerts") or {})
+    for key, minimum in (("watermark_margin_secs", 0), ("s3_batch_timeout_secs", 1), ("eval_tick_secs", 1)):
+        if float(alerts[key]) < minimum:
+            raise ValueError(f"webapp.alerts.{key} must be >= {minimum}, got {alerts[key]!r}")
+    display_tz = str(webapp.get("display_tz") or "UTC").strip()
+    try:
+        from zoneinfo import ZoneInfo
+
+        if display_tz.upper() != "UTC":
+            ZoneInfo(display_tz)
+    except Exception:
+        raise ValueError(f"webapp.display_tz must be an IANA time zone name, got {display_tz!r}") from None
+    public_url = str(webapp.get("public_url") or "").strip().rstrip("/") or link_base_url
+    if public_url and not public_url.lower().startswith(("https://", "http://")):
+        raise ValueError("webapp.public_url must start with https:// or http://")
+
     return AppConfig(
-        root=config_path.resolve().parent,
         s3_bucket=str(s3_cfg["bucket"]),
         s3_region=str(s3_cfg["region"]),
         s3_key_prefix=str(s3_cfg["key_prefix"]),
@@ -262,7 +352,7 @@ def load_app_config(config_path: Path) -> AppConfig:
         falco_namespace=str(falco["namespace"]) if falco.get("enabled") and falco.get("namespace") else None,
         webapp=BackendConfig(
             poll_interval_secs=int(backend["poll_interval_secs"]),
-            db_path=Path(str(backend["db_path"])).expanduser(),
+            db_path=Path(str(backend["db_path"] or default_cache_db_path())).expanduser(),
             page_size_default=int(backend["page_size_default"]),
             page_size_max=int(backend["page_size_max"]),
             s3_lookback_secs=int(backend["s3_lookback_secs"]),
@@ -291,6 +381,13 @@ def load_app_config(config_path: Path) -> AppConfig:
             max_anomalies_per_tick=int(ai["max_anomalies_per_tick"]),
             reasoning_effort=str(ai.get("reasoning_effort") or ""),
             base_url=str(ai.get("base_url") or ""),
+            deep_model=str(ai.get("deep_model") or ""),
+            prices=dict(ai.get("prices") or {}),
+            features=dict(ai.get("features") or {}),
+            budgets=dict(ai.get("budgets") or {}),
+            cache_ttl_hours=float(ai.get("cache_ttl_hours") if ai.get("cache_ttl_hours") is not None else 168),
+            auto_summary_min_urgency=auto_urgency,
+            signatures=tuple(ai.get("signatures") or ()),
         ),
         mattermost=MattermostConfig(
             enabled=bool(mattermost["enabled"]),
@@ -299,6 +396,13 @@ def load_app_config(config_path: Path) -> AppConfig:
             link_base_url=link_base_url,
             renotify_after_hours=float(mattermost["renotify_after_hours"]),
             max_age_hours=float(mattermost["max_age_hours"]),
+        ),
+        alerts=AlertsConfig(
+            display_tz=display_tz,
+            public_url=public_url,
+            watermark_margin_secs=int(alerts["watermark_margin_secs"]),
+            s3_batch_timeout_secs=int(alerts["s3_batch_timeout_secs"]),
+            eval_tick_secs=float(alerts["eval_tick_secs"]),
         ),
     )
 

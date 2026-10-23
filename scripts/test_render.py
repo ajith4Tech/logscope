@@ -42,7 +42,8 @@ def test_example_config():
     vrl = R.build_vrl(cfg)
     assert 'out = ts + " - " + ns + " - " + pod + "/" + contnr + " - " + flat' in vrl
     assert "match(ns, r'^kube-system$')" in vrl
-    assert r"r'^E\d{4}\s'" in vrl
+    assert r"r'^(?:E|F)\d{4}\s'" in vrl          # klog fatal (F) is an error too
+    assert r"r'^W\d{4}\s'" in vrl
     assert r"r'^E\\d{4}\\s'" not in vrl
     assert "segmentation fault" in vrl
     assert 'bkt = "metrics"' in vrl
@@ -51,7 +52,7 @@ def test_example_config():
     assert cfg["format"]["line"] == cfg["format"]["metrics"]
     assert R.falco_enabled(cfg)
     vrl_on = R.build_vrl(cfg)
-    assert f'if ns == "{cfg["falco"]["namespace"]}"' in vrl_on
+    assert f'if ns == "{cfg["falco"]["namespace"]}" && includes(["falco"], contnr)' in vrl_on
     assert 'scope = "security"' in vrl_on
     assert 'fpl == "informational"' in vrl_on
     assert 'fpl == "emergency"' in vrl_on
@@ -111,7 +112,10 @@ def test_falco_pipeline_dual_write_not_exclusive():
     assert doc["sinks"]["log_files"]["path"] == cfg["sinks"]["file"]["path"]
     assert doc["sinks"]["falco_security_log"]["path"] == R.falco_security_file_path(cfg)
     doc_s3 = R.vector_config_dict(cfg, include_file=False, include_s3=True)
-    assert doc_s3["sinks"]["s3_logs"]["inputs"] == ["classify_and_scope"]
+    # Falco events reach S3 once: the main sink leaves them out.
+    assert doc_s3["sinks"]["s3_logs"]["inputs"] == ["regular_events"]
+    assert doc_s3["transforms"]["regular_events"] == {"type": "filter", "inputs": ["classify_and_scope"],
+                                                     "condition": ".falco != true"}
     assert doc_s3["transforms"]["falco_security"]["inputs"] == ["classify_and_scope"]
     assert doc_s3["sinks"]["falco_security_s3"]["inputs"] == ["falco_security"]
     assert doc_s3["sinks"]["s3_logs"]["key_prefix"] == cfg["sinks"]["s3"]["key_prefix"]
@@ -124,7 +128,46 @@ def test_falco_pipeline_dual_write_not_exclusive():
     assert "falco_security" not in doc_off["transforms"]
     assert "falco_security_log" not in doc_off["sinks"]
     assert "falco_security_s3" not in doc_off["sinks"]
+    assert "regular_events" not in doc_off["transforms"]
+    assert doc_off["sinks"]["s3_logs"]["inputs"] == ["classify_and_scope"]
     assert 'falco_hit' not in doc_off["transforms"]["classify_and_scope"]["source"]
+
+
+def test_klog_prefix_list_and_single_letter():
+    cfg = R.load_config(TEST_CONFIG)
+    cfg["severity"]["buckets"][0]["klog"] = "E"          # a single letter still works
+    assert "match(text, r'^E\\d{4}\\s')" in R.build_vrl(cfg)
+    cfg["severity"]["buckets"][0]["klog"] = ["E", "F"]
+    assert "match(text, r'^(?:E|F)\\d{4}\\s') { bkt = \"error\" }" in R.build_vrl(cfg)
+
+
+def test_falco_containers_config_and_validation():
+    from copy import deepcopy
+
+    cfg = deepcopy(R.load_config(TEST_CONFIG))
+    cfg["falco"]["containers"] = ["falco", "falco-driver"]
+    assert 'includes(["falco", "falco-driver"], contnr)' in R.build_vrl(cfg)
+    del cfg["falco"]["containers"]                        # default: the official chart's container name
+    assert 'includes(["falco"], contnr)' in R.build_vrl(cfg)
+    for bad in ([], "falco", [""], [3]):
+        cfg["falco"]["containers"] = bad
+        try:
+            R.validate_cfg(cfg)
+        except SystemExit as e:
+            assert "falco.containers" in str(e)
+        else:
+            raise AssertionError(f"accepted falco.containers={bad!r}")
+
+
+def test_vector_image_tag_is_pinned_to_the_chart():
+    import yaml
+
+    rendered = render_kits(TEST_CONFIG)
+    chart = yaml.safe_load((ROOT / "deploy" / "helm" / "logscope" / "values.yaml").read_text())
+    for name in ("values-local.yaml", "values-agent.yaml"):
+        image = yaml.safe_load(rendered[name])["image"]
+        assert image["tag"] == R.VECTOR_IMAGE_TAG == "0.57.0-debian" == chart["vector"]["image"]["tag"]
+        assert image["repository"] == R.VECTOR_IMAGE_REPO == chart["vector"]["image"]["repository"]
 
 
 if __name__ == "__main__":
@@ -134,4 +177,7 @@ if __name__ == "__main__":
     test_falco_priority_map_validation()
     test_falco_rendered_into_both_kits()
     test_falco_pipeline_dual_write_not_exclusive()
+    test_klog_prefix_list_and_single_letter()
+    test_falco_containers_config_and_validation()
+    test_vector_image_tag_is_pinned_to_the_chart()
     print("ok")

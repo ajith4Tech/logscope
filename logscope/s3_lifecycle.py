@@ -90,7 +90,7 @@ def lifecycle_prefix(key_prefix: str) -> str:
 
 def resolve_retention_days(s3: dict, *, warn=sys.stderr.write) -> int:
     """Positive int from config; default 30 with a warning if unset."""
-    raw = s3.get("retention_days", None)
+    raw = s3.get("retention_days")
     if raw is None:
         warn(
             f"warning: sinks.s3.retention_days unset; using default {DEFAULT_RETENTION_DAYS}\n"

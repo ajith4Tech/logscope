@@ -13,7 +13,7 @@ are no deployment scripts.
 │        ▼                                         │
 │ Vector DaemonSet ── classify (VRL) ──────────────┼──► AWS S3 bucket
 │  ▲  severity buckets, infra vs namespace,        │    <keyPrefix>/<bucket>/YYYY/MM/DD/…gz
-│  │  Falco JSON → scope "security"                │    (+ security/<bucket>/… for Falco)
+│  │  Falco JSON → scope "security"                │    (Falco: security/<bucket>/… only)
 │  │                                               │         │
 │ Falco DaemonSet ── JSON alerts on stdout         │         │ poll every 30s (read-only)
 │  (kernel events → rules)                         │         ▼
@@ -29,7 +29,7 @@ are no deployment scripts.
 | Component | Responsibility | Where it runs | Managed by this chart |
 |---|---|---|---|
 | **Falco** | Detects runtime security events and prints them as JSON to stdout | k3s (privileged DaemonSet) | Optional: `falco.enabled` (official chart 9.1.0, vendored). Default: use the existing install |
-| **Vector** | Tails all pod logs, classifies severity and scope, writes gzip objects to S3. Falco events are recognised by namespace and written twice: to their severity prefix and to `security/` | k3s (DaemonSet) | Optional: `vector.enabled`. Default: use the existing install (`scripts/render.py` + `vector/vector`) |
+| **Vector** | Tails all pod logs, classifies severity and scope, writes gzip objects to S3. Falco events are recognised by namespace and container (`logscope.falco.containers`) and written once, under `security/<severity>/` | k3s (DaemonSet) | Optional: `vector.enabled`. Default: use the existing install (`scripts/render.py` + `vector/vector`) |
 | **S3** | Durable log store. Its lifecycle rule is the retention policy | External (AWS) | No. Bucket, IAM and lifecycle rule are prerequisites |
 | **Logscope web app** | Polls S3, caches in SQLite, serves the UI/API, detects anomalies, requests AI summaries | k3s (Deployment + PVC) | Always |
 | **AI provider** | Summarises anomalies and explains logs on request. It receives log samples | External API | No. Configured via `ai.*` |
@@ -146,6 +146,8 @@ message in any of these cases:
 | Web app S3 (read) | `s3.credentials.webapp.accessKeyId/secretAccessKey` | `s3.credentials.webapp.existingSecret` (keys `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`) |
 | Vector S3 (write) | `s3.credentials.vector.*` | `s3.credentials.vector.existingSecret` (same keys) |
 | AI API key | `ai.apiKey` | `ai.existingSecret` + `ai.existingSecretKey` |
+| Settings admin token | — (generated once into `/state/admin.token`) | `settings.adminToken.existingSecret` + `existingSecretKey` |
+| Settings master key | — (generated once into `/state/secret.key`) | `settings.secretKey.existingSecret` + `existingSecretKey` (+ optional `previousKeysKey`) |
 
 - Credentials reach pods only through `secretKeyRef` environment variables.
   They never go into ConfigMaps, command lines, NOTES output or app logs; the
@@ -170,6 +172,147 @@ message in any of these cases:
   after rotating one run
   `kubectl -n logging rollout restart deploy/logscope-webapp` (or
   `ds/logscope-vector`).
+
+### AI settings from the UI (Settings tab)
+
+The Settings tab changes the AI provider, model, deep model (used for anomaly
+summaries), base URL and API key, the feature flags, daily budgets and the
+price table at runtime, without a restart. It shows today's and the last 7
+days' AI usage per feature (calls, tokens, estimated cost, cache-hit %,
+blocked calls).
+
+- **Admin token.** The tab and `/api/settings/ai*` need
+  `Authorization: Bearer <token>` on top of the Origin check. The token is
+  `LOGSCOPE_ADMIN_TOKEN` (from `settings.adminToken.existingSecret`) or,
+  without it, a random token generated once into `/state/admin.token`
+  (mode 0600). Only the file's path is logged. The image is distroless (no
+  shell or `cat`), so reading the generated file needs access to the volume;
+  for a token you can hand out, create a Secret and point the chart at it:
+  ```bash
+  kubectl -n logging create secret generic logscope-admin \
+    --from-literal=LOGSCOPE_ADMIN_TOKEN="$(openssl rand -base64 32)"
+  # values: settings.adminToken.existingSecret: logscope-admin
+  ```
+  A wrong token gets `401`; after 10 failures in a minute an address gets
+  `429` (even with the right token) until the minute has passed. The UI keeps
+  the token in `sessionStorage` only.
+- **Precedence.** An environment variable (set directly or from a Secret)
+  wins and is read-only in the tab; otherwise the value saved in the tab;
+  otherwise `config.yaml` (these chart values). For the key: the chart's
+  `ai.apiKey`/`ai.existingSecret` (`LOGSCOPE_AI_API_KEY`) > the key stored
+  from the tab > none. `LOGSCOPE_AI_PROVIDER`, `LOGSCOPE_AI_MODEL`,
+  `LOGSCOPE_AI_DEEP_MODEL` and `LOGSCOPE_AI_BASE_URL` (via
+  `webapp.extraEnv`) pin the other fields.
+- **Stored key.** Encrypted (Fernet) with the master key and kept in the
+  state database with its last 4 characters; no endpoint returns it or its
+  ciphertext, and it is never logged.
+- **Base URL allowlist.** The official OpenRouter, Gemini, OpenAI and
+  Anthropic API hosts, `localhost`/`127.0.0.1`/`[::1]`, and the hosts in
+  `ai.allowedHosts` (`LOGSCOPE_AI_ALLOWED_HOSTS`). https is required except
+  for local hosts; anything else gets `422`.
+- **Feature flags.** `explain_line`, `explain_filtered`,
+  `anomaly_auto_summary` (default **off**: anomalies are summarized only on
+  request), `anomaly_manual_summary`, `nl_filters` (the Ask box: proposes
+  filters from a plain-language request via `POST /api/ai/filters`, fast
+  model, never applied without a click; no log content is sent). A disabled
+  feature answers `403 {"error": "ai_feature_disabled"}` and its buttons are
+  hidden.
+- **Budgets** (UTC days): `daily_tokens`, `daily_cost_usd`, and per-feature
+  `daily_calls`. Checked before each call; over budget the call is skipped
+  and the answer is `{"degraded": true, "reason": "budget"}`. At 80%
+  `/api/status` `ai_warnings` says so, and with Mattermost enabled one notice
+  per budget per day is sent.
+- **Metering.** Every AI request is a row in the state database's
+  `ai_usage` table (outcome `ok`, `error`, `cache_hit` or `budget_blocked`).
+  Token counts come from the provider's usage fields, else chars/4. Cost uses
+  `ai.prices` (or the tab's price table; USD per million input, output and
+  cached input tokens); a model without a price is counted with an unknown
+  cost.
+
+#### Rotating the master key
+
+Without `settings.secretKey.existingSecret` the master key is
+`/state/secret.key`, created on first start. To rotate (or to move to a
+Secret):
+
+1. Create the new key: `python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'`
+   (any random string of 32+ characters also works).
+2. Put it in the Secret as `LOGSCOPE_SECRET_KEY` and the old key as
+   `LOGSCOPE_SECRET_KEY_PREVIOUS` (comma-separated for several), and set
+   `settings.secretKey.existingSecret`. Moving off the generated file, the old
+   key is the content of `/state/secret.key`.
+3. Restart (`kubectl -n logging rollout restart deploy/logscope-webapp`). On
+   start the stored API key is re-encrypted with the new key ("Re-encrypted
+   the stored AI key" in the log).
+4. Remove `LOGSCOPE_SECRET_KEY_PREVIOUS` from the Secret and restart again.
+
+If the master key changes without the previous one (e.g. the Secret was
+replaced or `secret.key` lost), the app keeps running: the stored key reads
+as not set (`key_set: false`), the tab and `/api/status` show a warning, and
+the key has to be entered again. A key from `ai.apiKey`/`ai.existingSecret`
+is not affected. Rotating the admin token is a Secret update (or deleting
+`/state/admin.token`) followed by a restart.
+
+### Alerts on saved views (Alerts tab)
+
+A rule counts what a saved view matches (`count`, `error_count` or
+`distinct_pods`) over a window of 5 min to 24 h, every 1 to 60 min, and
+compares it with a threshold (`>`, `>=`, `<`, `<=`), optionally per namespace
+or pod (at most 20 groups; the rest is reported as overflow). At most 100
+rules. Creating, changing or deleting rules and channels needs the Settings
+admin token; muting (1 h, 4 h, 24 h or custom) does not, so on-call can
+silence a rule from the UI (rate limited per address). The rule form shows a
+backtest ("would have fired N times in 7 days") computed from the histogram
+buckets.
+
+- **Watermark.** Every window ends at the ingest watermark, never at "now":
+  per S3 prefix, the start of its latest complete listing minus Vector's
+  batch timeout (600 s), held back to the key time of any object that is
+  still failing; the oldest prefix wins, minus `alerts.watermarkMarginSecs`.
+  `/api/status` → `watermark` shows it. When it is more than 3 × the batch
+  timeout (30 min) behind, the pipeline is stale: `<`/`<=` rules report
+  *unknown* instead of firing on missing data, and one `pipeline_stale` alert
+  goes to the default (environment Mattermost) channel.
+- **States.** ok → pending (until the required consecutive breaches) →
+  firing → resolved → ok. Notifications on firing, again every
+  `renotify` interval while firing (default 6 h), and on resolved if enabled.
+  A muted rule still records its events. Every transition is kept in the
+  state database for 30 days, and the evaluator rebuilds its state from it at
+  start, so a restart neither forgets nor re-sends a firing alert.
+- **Channels.** Mattermost or Slack incoming webhooks, or a generic JSON
+  webhook (optionally signed: `X-Logscope-Signature: sha256=<HMAC-SHA256 of the
+  body>`). URLs and signing secrets are encrypted with the settings master key
+  and are write-only (the UI shows the last six characters). 10 s timeout, 5
+  attempts with backoff, no redirects; failures are stored with the event.
+  Channel URLs must be https and must not resolve to link-local, cloud
+  metadata, loopback or private addresses; list internal hosts (e.g. an
+  in-cluster Mattermost) in `alerts.allowedHosts` to allow http and private
+  addresses for them (link-local and metadata stay refused). The Mattermost
+  webhook from `mattermost.*` is offered as a read-only default channel; its
+  URL never leaves the environment variable.
+- **Content.** Rule, value vs threshold, the window in `alerts.displayTz`,
+  the three most frequent message templates with counts (redacted, no raw log
+  lines), the matching known-pattern title, and a link to the Logs tab with
+  the view's filters and that window when `alerts.publicUrl` (or
+  `mattermost.linkBaseUrl`) is set. A rule can opt in to an AI summary (fast
+  model, metered and budgeted as `alert_summary`; skipped, not blocking, when
+  over budget).
+- **One replica.** The evaluator and its in-memory state live in the web app
+  pod; two replicas would evaluate and notify twice. The chart allows only
+  `replicaCount` 0 or 1 and uses the `Recreate` strategy, so this holds.
+
+### NetworkPolicy and egress
+
+The chart's NetworkPolicy restricts **ingress** only. Outbound traffic is
+whatever the namespace allows. If your cluster applies a default-deny egress
+policy, the web app pod needs egress to:
+
+- S3 (`s3.<region>.amazonaws.com`, TCP 443) for ingestion;
+- the AI provider API (TCP 443) when AI is enabled;
+- every alert channel's host (TCP 443, or the port in an allowed http URL),
+  and the Mattermost server for anomaly notifications;
+- DNS (kube-dns, UDP/TCP 53), since channel hosts are resolved and checked
+  before each delivery.
 
 ## Image
 
@@ -435,7 +578,10 @@ failures are also logged with a traceback.
 | `last_error: Could not connect to the endpoint URL` | DNS or outbound 443 blocked |
 | UI empty, no error | Nothing in S3 yet (Vector batches flush after up to 10 min), or `s3.keyPrefix`/`logscope.*` differ from what the existing Vector writes |
 | No security events | Falco namespace labeled `vector.dev/exclude`, `logscope.falco.namespace` wrong, or Falco not emitting JSON on stdout |
-| AI "not configured" | `ai.model` or key missing; check `/api/status` `ai_configured` |
+| AI "not configured" | `ai.model` or key missing (chart values or the Settings tab); check `/api/status` `ai_configured` and `ai_warnings` |
+| Settings tab: "stored API key is not usable" | The master key changed; enter the key again, or rotate with `LOGSCOPE_SECRET_KEY_PREVIOUS` (see "Rotating the master key") |
+| `403 ai_feature_disabled` | The feature is switched off in the Settings tab |
+| `{"degraded": true, "reason": "budget"}` | A daily AI budget is used up; it resets at 00:00 UTC, or raise it in the Settings tab |
 | AI HTTP 4xx in logs | Wrong model ID or key for that provider; the key is redacted in messages |
 | `https://<host>` returns Traefik `404 page not found` | DNS points at Traefik, but the host doesn't match `ingress.host`, or the Ingress isn't admitted: `kubectl -n logging describe ingress logscope-webapp` |
 | `https://<host>` times out | DNS, public IP/NAT, or firewall (443) isn't in place. Test inside the network with `curl --resolve` |
@@ -456,7 +602,8 @@ failures are also logged with a traceback.
 - **Rate limiting covers AI calls only.** Other API endpoints aren't
   throttled, and the AI limit is in memory and per pod (see
   [Request protections](#request-protections-in-the-web-app)).
-- **Single web app replica** (SQLite); no high availability.
+- **Single web app replica** (SQLite); no high availability. Alerts rely on
+  it too: a second replica would evaluate and notify every rule twice.
 - **S3 only, AWS endpoints.** There is no custom S3 endpoint (MinIO/Ceph), no
   IRSA wiring in the chart, and no file-sink mode in the chart.
 - **Vector runs as root with host log mounts**; Falco is privileged (upstream

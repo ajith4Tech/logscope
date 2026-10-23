@@ -92,6 +92,39 @@ spec:
                   name: {{ include "logscope.aiSecret" . }}
                   key: {{ include "logscope.aiSecretKey" . }}
             {{- end }}
+            {{- with .Values.settings.adminToken.existingSecret }}
+            # Bearer token for the Settings tab (else generated into /state/admin.token).
+            - name: LOGSCOPE_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.settings.adminToken.existingSecretKey }}
+            {{- end }}
+            {{- with .Values.settings.secretKey.existingSecret }}
+            # Master key for an API key stored from the Settings tab (else /state/secret.key).
+            - name: LOGSCOPE_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ $.Values.settings.secretKey.existingSecretKey }}
+            {{- with $.Values.settings.secretKey.previousKeysKey }}
+            - name: LOGSCOPE_SECRET_KEY_PREVIOUS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Values.settings.secretKey.existingSecret }}
+                  key: {{ . }}
+                  optional: true
+            {{- end }}
+            {{- end }}
+            {{- with .Values.alerts.allowedHosts }}
+            # Alert channel hosts allowed over http / on private addresses.
+            - name: LOGSCOPE_ALERT_ALLOWED_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.ai.allowedHosts }}
+            - name: LOGSCOPE_AI_ALLOWED_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- if .Values.mattermost.enabled }}
             # Webhook URL for anomaly notifications; config.yaml names this variable.
             - name: LOGSCOPE_MATTERMOST_WEBHOOK_URL

@@ -26,6 +26,9 @@ ROOT = project_dir()
 CHART_VERSION = "0.57.0"
 VECTOR_IMAGE_REPO = "docker.io/timberio/vector"
 VECTOR_IMAGE_BASE = "debian"
+# Pinned image tag: the same Vector release as the chart above (and as
+# vector.image.tag in deploy/helm/logscope/values.yaml), never "latest".
+VECTOR_IMAGE_TAG = f"{CHART_VERSION}-{VECTOR_IMAGE_BASE}"
 METRICS_ADDR = "0.0.0.0:8686"
 IGNORE_OLDER_SECS = 3600
 MAX_LINE_BYTES = 10485760
@@ -76,7 +79,12 @@ ENV_MAP = {
     "LOGSCOPE_BACKUP_LOG": ("backup.log", "str"),
     "LOGSCOPE_FALCO_ENABLED": ("falco.enabled", "bool"),
     "LOGSCOPE_FALCO_NAMESPACE": ("falco.namespace", "str"),
+    "LOGSCOPE_FALCO_CONTAINERS": ("falco.containers", "list"),
 }
+
+# Container names that identify Falco's own pods in falco.namespace (the
+# official chart's container is "falco"); sidecars such as falcoctl are not Falco.
+DEFAULT_FALCO_CONTAINERS = ("falco",)
 
 # Official Falco priority names (JSON `priority` field), lowercased as config keys.
 FALCO_PRIORITIES = (
@@ -202,6 +210,23 @@ def falco_enabled(cfg: dict) -> bool:
     return bool(isinstance(f, dict) and f.get("enabled"))
 
 
+def falco_containers(cfg: dict) -> list[str]:
+    raw = cfg["falco"].get("containers")
+    if raw is None:
+        return list(DEFAULT_FALCO_CONTAINERS)
+    if not isinstance(raw, list) or not raw or not all(isinstance(c, str) and c.strip() for c in raw):
+        raise SystemExit("falco.containers must be a non-empty list of container names")
+    return [c.strip() for c in raw]
+
+
+def klog_prefixes(bucket: dict) -> list[str]:
+    """A bucket's klog severity letters: one ("E") or a list (["E", "F"])."""
+    raw = bucket.get("klog")
+    if not raw:
+        return []
+    return [str(p) for p in raw] if isinstance(raw, list) else [str(raw)]
+
+
 def falco_priority_map(cfg: dict) -> dict[str, str]:
     raw = cfg["falco"].get("priority_map") or {}
     if not isinstance(raw, dict):
@@ -219,7 +244,8 @@ def falco_security_file_path(cfg: dict) -> str:
 
 
 def falco_security_s3_prefix(cfg: dict) -> str:
-    """Falco copy under logs/{{ scope }}/{{ log_type }}/ → security/<bucket>/."""
+    """Falco events under logs/{{ scope }}/{{ log_type }}/ → security/<bucket>/
+    (the only S3 copy: the main sink leaves them out)."""
     p = cfg["sinks"]["s3"]["key_prefix"]
     marker = "{{ log_type }}"
     if marker in p:
@@ -318,11 +344,12 @@ def build_vrl(cfg: dict) -> str:
         lines.append(f"  {kw} {joiner} {{ bkt = {vrl_string(name)} }}")
     lines.append("}")
 
-    klog_buckets = [(b["name"], b["klog"]) for b in buckets if b.get("klog")]
+    klog_buckets = [(b["name"], klog_prefixes(b)) for b in buckets if klog_prefixes(b)]
     if klog_buckets:
         lines += ["", "# ---- klog prefixes ----", 'if bkt == "" {']
-        for i, (name, pfx) in enumerate(klog_buckets):
-            rx = vrl_escape_regex(rf"^{re.escape(str(pfx))}\d{{4}}\s")
+        for i, (name, pfxs) in enumerate(klog_buckets):
+            alt = re.escape(pfxs[0]) if len(pfxs) == 1 else "(?:" + "|".join(re.escape(p) for p in pfxs) + ")"
+            rx = vrl_escape_regex(rf"^{alt}\d{{4}}\s")
             kw = "if" if i == 0 else "else if"
             lines.append(f"  {kw} match(text, r'{rx}') {{ bkt = {vrl_string(name)} }}")
         lines.append("}")
@@ -432,13 +459,16 @@ def build_vrl(cfg: dict) -> str:
 
 
 def _falco_vrl(cfg: dict) -> list[str]:
-    """Override scope/severity/message for pods in falco.namespace (from config)."""
+    """Override scope/severity/message for Falco's own containers: a container
+    named in falco.containers in a pod of falco.namespace. Other pods and
+    sidecars in that namespace are classified like any other workload."""
     ns = vrl_string(cfg["falco"]["namespace"])
+    containers = ", ".join(vrl_string(c) for c in falco_containers(cfg))
     pmap = falco_priority_map(cfg)
     lines = [
-        "# ---- falco (detect via config namespace; parallel sink uses .falco) ----",
+        "# ---- falco (detect via config namespace + container; sinks split on .falco) ----",
         "falco_hit = false",
-        f"if ns == {ns} {{",
+        f"if ns == {ns} && includes([{containers}], contnr) {{",
         "  falco_hit = true",
         '  scope = "security"',
         '  fout, foerr = get(obj, ["output"])',
@@ -516,6 +546,7 @@ def _validate_falco(cfg: dict) -> None:
     ns = f.get("namespace")
     if not isinstance(ns, str) or not ns.strip():
         raise SystemExit("falco.namespace is required when falco.enabled is true")
+    falco_containers(cfg)
     pmap = falco_priority_map(cfg)
     missing = [p for p in FALCO_PRIORITIES if p not in pmap]
     if missing:
@@ -584,13 +615,20 @@ def vector_config_dict(
         "source": vrl,
     }
     sinks: dict[str, Any] = {}
-    # Dual-write Falco: main sink still gets every event; filter fans out a second copy.
-    # Vector `route` is first-match exclusive — do not use it here.
+    # Falco events: the file kit writes them twice (security/<bkt>.log through
+    # the main sink plus security.log); S3 gets them once, under security/ only
+    # (the web app reads them there), so the main S3 sink leaves them out.
     if falco_enabled(cfg) and (include_file or include_s3):
         transforms["falco_security"] = {
             "type": "filter",
             "inputs": ["classify_and_scope"],
             "condition": ".falco == true",
+        }
+    if falco_enabled(cfg) and include_s3:
+        transforms["regular_events"] = {
+            "type": "filter",
+            "inputs": ["classify_and_scope"],
+            "condition": ".falco != true",
         }
     if include_file:
         sinks["log_files"] = {
@@ -610,7 +648,8 @@ def vector_config_dict(
         # Embed bucket/region (Vector 0.57+ disables ${ENV} interpolation by default).
         # AWS_* keys still come from the Secret via env / IRSA — not from config.
         sinks["s3_logs"] = _aws_s3_sink(
-            cfg, inputs=["classify_and_scope"], key_prefix=cfg["sinks"]["s3"]["key_prefix"]
+            cfg, inputs=["regular_events" if falco_enabled(cfg) else "classify_and_scope"],
+            key_prefix=cfg["sinks"]["s3"]["key_prefix"],
         )
         if falco_enabled(cfg):
             sinks["falco_security_s3"] = _aws_s3_sink(
@@ -716,9 +755,9 @@ def helm_values(cfg: dict, *, mode: str) -> str:
     if mode == "agent" and s3.get("enabled"):
         env_lines = [
             "env:",
-            f"  - name: AWS_REGION",
+            "  - name: AWS_REGION",
             f"    value: {yaml_str(s3['region'])}",
-            f"  - name: S3_BUCKET",
+            "  - name: S3_BUCKET",
             f"    value: {yaml_str(s3['bucket'])}",
         ]
         if not irsa:
@@ -774,6 +813,7 @@ role: "Agent"
 
 image:
   repository: {VECTOR_IMAGE_REPO}
+  tag: "{VECTOR_IMAGE_TAG}"
   base: "{VECTOR_IMAGE_BASE}"
   pullPolicy: IfNotPresent
 

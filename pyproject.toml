@@ -2,7 +2,7 @@
 # Production builds use the PyInstaller binary / container image instead
 # (Makefile, Dockerfile); their dependency pins are in requirements.lock.
 [build-system]
-requires = ["setuptools>=69"]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license string
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,9 @@ name = "logscope"
 dynamic = ["version"]
 description = "Kubernetes log viewer with anomaly insights (Vector -> S3 -> SQLite) and its operator tools"
 requires-python = ">=3.10"
-dependencies = ["PyYAML>=6.0", "boto3>=1.28"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = ["PyYAML>=6.0", "boto3>=1.28", "cryptography>=42"]
 
 [project.optional-dependencies]
 anthropic = ["anthropic"]
@@ -23,6 +25,40 @@ packages = ["logscope", "webapp", "webapp.api"]
 
 [tool.setuptools.package-data]
 webapp = ["ui/index.html", "ui/app.js", "ui/styles.css"]
+"webapp.api" = ["signatures.yaml"]
 
 [tool.setuptools.dynamic]
 version = { attr = "logscope.version.__version__" }
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = ["archive", "backups", "dist", "logs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "S"]
+ignore = [
+    # SQL is built from fixed column/clause names chosen in code (allowlisted
+    # fields, never request text); every value is a bound parameter.
+    "S608",
+    # Long SQL strings, URLs and test fixtures; the 120 limit applies to code
+    # through review, not mechanically.
+    "E501",
+    # Ternaries and early-continue loops are kept where they read better.
+    "SIM108",
+    # One `with` per lock/resource keeps the lock scopes visible.
+    "SIM117",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests: asserts, fixed throwaway secrets/tokens, temp paths, bind-all and
+# metadata addresses as data, subprocess calls of local tools (helm, node, the
+# CLI), and pytest fixtures imported from other test modules (F811: a test's
+# parameter of the same name is how pytest injects them).
+"test/**" = ["S101", "S104", "S105", "S106", "S108", "S311", "S603", "S607", "E402", "F811"]
+"scripts/test_*.py" = ["S101", "S105", "S603", "S607", "E402"]
+# Entry-point shims put the repository on sys.path before importing.
+"scripts/*.py" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["logscope", "webapp"]

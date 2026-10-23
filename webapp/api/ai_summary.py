@@ -5,8 +5,10 @@ AI is only called for:
 - a server-side re-derived sample of currently filtered logs, or
 - one server-side re-derived log record.
 
-The provider is config-driven (webapp.ai.provider).
-The API key is read only from the configured environment variable.
+The provider, model and key come from the effective settings (see
+ai_settings: environment > Settings UI > config.yaml). The key is the
+configured environment variable's value, else the one stored (encrypted)
+from the Settings UI; it is never logged.
 
 AI responses are structured as:
 {
@@ -28,18 +30,21 @@ with existing code/tests. The first troubleshooting step is used to populate it.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 from urllib import error, request
 
-from .actions import assess_step_risk, step_execution_fields
+from .actions import step_execution_fields
 from .config import AiConfig
-
+from .patterns import digest_records
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +109,74 @@ _MAX_STEP_TEXT_CHARS = 2000
 _warned_once: set[str] = set()
 _warned_once_lock = threading.Lock()
 
+# Token usage of the provider call running on this thread (see capture_usage).
+_usage_local = threading.local()
+
+
+@contextmanager
+def capture_usage() -> Iterator[dict[str, Any]]:
+    """Collects what the provider reported for calls made inside the block:
+    tokens_in (all input, cached included), tokens_out, cached_tokens, and
+    input_chars (prompt size, for estimating when usage is missing)."""
+    usage: dict[str, Any] = {}
+    previous = getattr(_usage_local, "current", None)
+    _usage_local.current = usage
+    try:
+        yield usage
+    finally:
+        _usage_local.current = previous
+
+
+def _note_usage(**values: Any) -> None:
+    usage = getattr(_usage_local, "current", None)
+    if usage is None:
+        return
+    for key, value in values.items():
+        if value is None:
+            continue
+        try:
+            usage[key] = max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+
+
+def _note_openai_usage(data: dict[str, Any]) -> None:
+    """OpenAI / OpenRouter Chat Completions `usage`."""
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return
+    details = usage.get("prompt_tokens_details") if isinstance(usage.get("prompt_tokens_details"), dict) else {}
+    _note_usage(
+        tokens_in=usage.get("prompt_tokens"),
+        tokens_out=usage.get("completion_tokens"),
+        cached_tokens=details.get("cached_tokens"),
+    )
+
+
+def _note_gemini_usage(data: dict[str, Any]) -> None:
+    usage = data.get("usageMetadata")
+    if not isinstance(usage, dict):
+        return
+    out = usage.get("candidatesTokenCount")
+    thoughts = usage.get("thoughtsTokenCount")
+    if out is not None or thoughts is not None:
+        out = int(out or 0) + int(thoughts or 0)
+    _note_usage(tokens_in=usage.get("promptTokenCount"), tokens_out=out,
+                cached_tokens=usage.get("cachedContentTokenCount"))
+
+
+def _note_anthropic_usage(response: Any) -> None:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return
+    base = getattr(usage, "input_tokens", None)
+    if base is None:
+        return
+    read = int(getattr(usage, "cache_read_input_tokens", None) or 0)
+    written = int(getattr(usage, "cache_creation_input_tokens", None) or 0)
+    _note_usage(tokens_in=int(base) + read + written, tokens_out=getattr(usage, "output_tokens", None),
+                cached_tokens=read)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Untrusted input: every value sent to a provider comes from logs, log-derived
@@ -135,19 +208,19 @@ _UNTRUSTED_INPUT_RULES = (
 # and pod names (needed for troubleshooting). Pattern-based redaction cannot
 # recognise every secret (e.g. a bare random string with no telling key name);
 # see the chart README for the remaining limitations.
-_SECRET_KEY_NAMES = (
+_SENSITIVE_KEY_NAMES = (
     r"[\w.-]*(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|apikey|access[_-]?key"
     r"|private[_-]?key|client[_-]?secret|session[_-]?id|credentials?|signature)[\w.-]*"
     r"|[\w.-]*[_.-]pass\b|\bpass\b"
 )
 # A value: double- or single-quoted (also JSON-escaped \"...\" inside a
 # string, spaces allowed) or a bare word.
-_SECRET_VALUE = (
+_SENSITIVE_VALUE = (
     r"(?!\\*\[REDACTED)"
     r"(?P<value>\\*\"[^\"\r\n]*?\\*\"|\\*'[^'\r\n]*?\\*'|[^\s\"',;&}\]\\]+)"
 )
 _KEY_VALUE_RE = re.compile(
-    rf"(?i)(?P<key>\b(?:{_SECRET_KEY_NAMES}))(?P<sep>\\*[\"']?\s*[:=]\s*)" + _SECRET_VALUE
+    rf"(?i)(?P<key>\b(?:{_SENSITIVE_KEY_NAMES}))(?P<sep>\\*[\"']?\s*[:=]\s*)" + _SENSITIVE_VALUE
 )
 _QUOTE_EDGE_RE = re.compile(r"^(\\*[\"'])?[\s\S]*?(\\*[\"'])?$")
 
@@ -325,7 +398,9 @@ _SYSTEM_PROMPT = (
 _EXPLAIN_SYSTEM_PROMPT = (
     "You are a Kubernetes observability assistant for Logscope. "
     "Summarize the currently filtered Kubernetes logs for an operator using ONLY the provided "
-    "log_sample, filters, sample_size, and total_matching_exceeds_sample metadata. "
+    "filters and templates. Each template is a log message pattern with <PLACEHOLDERS> for variable "
+    "parts, its count in the sample, first/last seen times and a few redacted exemplars; "
+    "sample_rows and sample_limit_reached describe the sample. "
     "Do not invent root causes, services, dependencies, infrastructure state, intent, "
     "or patterns that are not evidenced in the sample. "
     "Identify the dominant or most important observed behavior, including severity, affected "
@@ -379,7 +454,7 @@ def explain_log_line(
     if provider not in SUPPORTED_PROVIDERS:
         return None
 
-    api_key = os.environ.get(cfg.api_key_env, "")
+    api_key = _api_key(cfg)
     model = str(cfg.model or "").strip()
 
     if not model:
@@ -394,7 +469,7 @@ def explain_log_line(
         _warn_once(
             f"{provider}_missing_key",
             f"AI summarization is configured for {provider} "
-            f"but {cfg.api_key_env} is not set; skipping.",
+            f"but no API key is set ({cfg.api_key_env} or the Settings UI); skipping.",
         )
         return None
 
@@ -415,13 +490,15 @@ def summarize_anomaly(
     anomaly: dict[str, Any],
     cfg: AiConfig,
 ) -> dict[str, Any] | None:
-    """Summarize an already-detected anomaly and generate troubleshooting steps."""
+    """Summarize an already-detected anomaly and generate troubleshooting steps.
+    Uses cfg.model; the Deep analysis tier passes a config whose model is the
+    deep model."""
 
     provider = str(cfg.provider or "").strip().lower()
     if provider not in SUPPORTED_PROVIDERS:
         return None
 
-    api_key = os.environ.get(cfg.api_key_env, "")
+    api_key = _api_key(cfg)
     model = str(cfg.model or "").strip()
 
     if not model:
@@ -436,7 +513,7 @@ def summarize_anomaly(
         _warn_once(
             f"{provider}_missing_key",
             f"AI summarization is configured for {provider} "
-            f"but {cfg.api_key_env} is not set; skipping anomaly summaries.",
+            f"but no API key is set ({cfg.api_key_env} or the Settings UI); skipping anomaly summaries.",
         )
         return None
 
@@ -460,7 +537,7 @@ def explain_logs(
     if provider not in SUPPORTED_PROVIDERS:
         return None
 
-    api_key = os.environ.get(cfg.api_key_env, "")
+    api_key = _api_key(cfg)
     model = str(cfg.model or "").strip()
 
     if not model:
@@ -475,11 +552,84 @@ def explain_logs(
         _warn_once(
             f"{provider}_missing_key",
             f"AI summarization is configured for {provider} "
-            f"but {cfg.api_key_env} is not set; skipping.",
+            f"but no API key is set ({cfg.api_key_env} or the Settings UI); skipping.",
         )
         return None
 
     return _call_provider(provider, payload, model, api_key, cfg, _EXPLAIN_SYSTEM_PROMPT)
+
+
+_JSON_ONLY_REMINDER = (
+    " Your previous reply was not a valid JSON object. Reply with exactly one JSON object and "
+    "nothing else: no prose, no comments, no code fences."
+)
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    """Strict: the whole reply (a ```json fence is tolerated) must be one JSON
+    object. `summary` is never empty, so the provider helpers hand every
+    reply back instead of raising; `json` is None when it did not parse."""
+    text = str(content or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
+    try:
+        parsed = json.loads(fenced.group(1) if fenced else text)
+    except ValueError:
+        parsed = None
+    return {"summary": "json", "json": parsed if isinstance(parsed, dict) else None}
+
+
+def complete_json(system: str, user: dict[str, Any] | str, cfg: AiConfig) -> dict[str, Any]:
+    """One JSON object from the model for a non-summary task (e.g. natural
+    language filters), through the same provider plumbing as the summaries
+    (input bounding and redaction, retries, usage capture). Always cfg.model:
+    callers pass the fast tier. A reply that is not strictly a JSON object
+    is retried once with a "JSON only" reminder; RuntimeError after that, or
+    when no provider is configured."""
+    provider = str(cfg.provider or "").strip().lower()
+    api_key = _api_key(cfg)
+    model = str(cfg.model or "").strip()
+    if provider not in SUPPORTED_PROVIDERS or not model or not api_key:
+        raise RuntimeError("AI provider is not configured")
+    payload = user if isinstance(user, dict) else {"input": str(user)}
+    totals: dict[str, int] = {}
+    try:
+        for prompt in (system, system + _JSON_ONLY_REMINDER):
+            with capture_usage() as usage:
+                result = _call_provider(provider, payload, model, api_key, cfg, prompt, parse=_parse_json_object)
+            for key, value in usage.items():
+                totals[key] = totals.get(key, 0) + int(value)
+            if result and result.get("json") is not None:
+                return result["json"]
+    finally:
+        # Both attempts count towards the caller's metering.
+        _note_usage(**totals)
+    raise RuntimeError(f"{provider} did not return valid JSON")
+
+
+LOCAL_HOSTS =frozenset({"localhost", "127.0.0.1", "::1"})
+# Sent to a local OpenAI-compatible server (e.g. Ollama) when no key is set;
+# such servers ignore it.
+LOCAL_PLACEHOLDER_KEY = "local"
+
+
+def is_local_base_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+
+    try:
+        host = (urlsplit(str(url or "").strip()).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in LOCAL_HOSTS
+
+
+def _api_key(cfg: AiConfig) -> str:
+    """The resolved key (ai_settings puts the environment's value or the
+    stored one here), else the configured environment variable; a local
+    endpoint (Ollama and similar) needs none."""
+    key = str(getattr(cfg, "api_key", "") or "") or os.environ.get(cfg.api_key_env, "")
+    if not key and is_local_base_url(getattr(cfg, "base_url", "")):
+        return LOCAL_PLACEHOLDER_KEY
+    return key
 
 
 def _base_url(provider: str, cfg: AiConfig) -> str:
@@ -493,6 +643,7 @@ def _call_provider(
     api_key: str,
     cfg: AiConfig,
     system_prompt: str,
+    parse: Any = None,
 ) -> dict[str, Any] | None:
     """Every provider failure surfaces as RuntimeError (HTTP 502 at the API).
     The provider helpers raise RuntimeError for errors they recognise; any
@@ -500,9 +651,12 @@ def _call_provider(
     body, unexpected shape), which is an upstream fault, not a bad request."""
     # The single path to every provider: bound, redact and frame the input here.
     safe_payload = prepare_untrusted_payload(payload)
+    _note_usage(input_chars=len(system_prompt) + len(_UNTRUSTED_INPUT_RULES)
+                + len(json.dumps(safe_payload, separators=(",", ":"), ensure_ascii=False)))
     try:
         return _dispatch_provider(
-            provider, safe_payload, model, api_key, cfg, system_prompt + _UNTRUSTED_INPUT_RULES
+            provider, safe_payload, model, api_key, cfg, system_prompt + _UNTRUSTED_INPUT_RULES,
+            parse=parse or _parse_summary_response,
         )
     except RuntimeError as exc:
         # Messages built by the provider helpers are already cleaned; redact
@@ -526,22 +680,26 @@ def _dispatch_provider(
     api_key: str,
     cfg: AiConfig,
     system_prompt: str,
+    parse: Any = None,
 ) -> dict[str, Any] | None:
     base_url = _base_url(provider, cfg)
+    parse = parse or _parse_summary_response
     if provider == "openrouter":
         return _summarize_openrouter(
             payload, model, api_key, cfg.reasoning_effort,
-            system_prompt=system_prompt, base_url=base_url,
+            system_prompt=system_prompt, base_url=base_url, parse=parse,
         )
     if provider == "gemini":
-        return _summarize_gemini(payload, model, api_key, system_prompt=system_prompt, base_url=base_url)
+        return _summarize_gemini(payload, model, api_key, system_prompt=system_prompt, base_url=base_url,
+                                 parse=parse)
     if provider == "openai":
-        return _summarize_openai(payload, model, api_key, system_prompt=system_prompt, base_url=base_url)
+        return _summarize_openai(payload, model, api_key, system_prompt=system_prompt, base_url=base_url,
+                                 parse=parse)
     if provider == "anthropic":
         return _summarize_anthropic(
             payload, model, api_key, cfg.reasoning_effort,
             system_prompt=system_prompt,
-            base_url=str(cfg.base_url or "").strip(),
+            base_url=str(cfg.base_url or "").strip(), parse=parse,
         )
     return None
 
@@ -559,18 +717,106 @@ def _warn_once(key: str, message: str) -> None:
     logger.warning(message)
 
 
+_BATCH_SYSTEM_PROMPT = _SYSTEM_PROMPT.split("Return valid JSON only")[0] + (
+    "The input lists several anomalies under 'anomalies', each with an 'id'; summarize each one "
+    "separately (do not merge them), following the rules above for each. "
+    "Return valid JSON only with this structure: "
+    "{\"summaries\":[{\"id\":<id>,\"summary\":\"...\",\"steps\":["
+    "{\"title\":\"...\",\"command\":\"...\",\"explanation\":\"...\",\"risk\":\"read-only|medium|high\"}"
+    "]}]}"
+)
+
+
+def _parse_batch_response(content: str) -> dict[str, Any]:
+    """{"summary": "batch" or "", ..., "batch": {id: parsed summary}}."""
+    text = _strip_json_fence(content)
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        first, last = text.find("{"), text.rfind("}")
+        if first != -1 and last > first:
+            try:
+                parsed = json.loads(text[first:last + 1])
+            except json.JSONDecodeError:
+                parsed = None
+    items = parsed.get("summaries") if isinstance(parsed, dict) else None
+    batch: dict[int, dict[str, Any]] = {}
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            anomaly_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        result = _parse_summary_response(json.dumps({k: v for k, v in item.items() if k != "id"}))
+        if result["summary"]:
+            batch[anomaly_id] = result
+    return {"summary": "batch" if batch else "", "steps": [], "suggested_action": "", "batch": batch}
+
+
+def summarize_anomalies_batch(anomalies: list[dict[str, Any]], cfg: AiConfig) -> dict[int, dict[str, Any]] | None:
+    """Several anomalies in one provider call: {anomaly id: summary}. Ids
+    missing from the answer are left out (the caller retries them later)."""
+    provider = str(cfg.provider or "").strip().lower()
+    api_key = _api_key(cfg)
+    model = str(cfg.model or "").strip()
+    if provider not in SUPPORTED_PROVIDERS or not model or not api_key:
+        return None
+    payload = {"anomalies": [{"id": int(a["id"]), **build_prompt_payload(a)} for a in anomalies]}
+    result = _call_provider(provider, payload, model, api_key, cfg, _BATCH_SYSTEM_PROMPT, parse=_parse_batch_response)
+    return (result or {}).get("batch") or {}
+
+
+def _template_payload(group: dict[str, Any]) -> dict[str, Any]:
+    """One template as sent to a provider (no internal ids)."""
+    out = {"template": group["template"], "count": group["count"]}
+    for key in ("first_seen", "last_seen"):
+        if group.get(key):
+            out[key] = group[key]
+    for key in ("severity", "namespace", "container"):
+        if group.get(key):
+            out[key] = group[key]
+    if group.get("pods"):
+        out["pods"] = group["pods"]
+    if group.get("exemplars"):
+        out["exemplars"] = group["exemplars"]
+    return out
+
+
+def compact_log_payload(records: list[dict[str, Any]], filters: dict[str, Any], *, sample_limit_reached: bool,
+                        top: int = 15) -> dict[str, Any]:
+    """The filtered-explain input: the sample's top templates with counts,
+    first/last seen and 3 redacted exemplars each, instead of raw rows."""
+    digest = digest_records(records, top=top, exemplars=3, redact=redact_text)
+    return {
+        "filters": filters,
+        "sample_rows": digest["rows"],
+        "sample_limit_reached": sample_limit_reached,
+        "distinct_templates": digest["distinct_templates"],
+        "templates": [_template_payload(t) for t in digest["templates"]],
+    }
+
+
 def build_prompt_payload(anomaly: dict[str, Any]) -> dict[str, Any]:
     """Build evidence-only input for anomaly summarization."""
 
     evidence = anomaly.get("evidence")
     if isinstance(evidence, str):
-        try:
+        with contextlib.suppress(ValueError):
             evidence = json.loads(evidence)
-        except ValueError:
-            pass
     if isinstance(evidence, dict):
         # A stored provider error is bookkeeping, not evidence.
         evidence = {k: v for k, v in evidence.items() if k != "ai_error"}
+        messages = evidence.get("sample_messages")
+        if isinstance(messages, list) and messages:
+            # Templates with counts and a few exemplars instead of raw lines.
+            stamps = evidence.get("sample_timestamps") if isinstance(evidence.get("sample_timestamps"), list) else []
+            rows = [{"message": str(m), "timestamp": stamps[i] if i < len(stamps) else "",
+                     "namespace": anomaly.get("namespace"), "container": ""} for i, m in enumerate(messages)]
+            digest = digest_records(rows, top=15, exemplars=3, redact=redact_text)
+            evidence = {k: v for k, v in evidence.items() if k not in ("sample_messages", "sample_timestamps")}
+            evidence["sample_templates"] = [_template_payload(t) for t in digest["templates"]]
     return {
         "type": anomaly.get("type"),
         "namespace": anomaly.get("namespace"),
@@ -608,11 +854,6 @@ def _format_step_action(step: dict[str, Any]) -> str:
         return command
 
     return explanation
-
-
-def _infer_risk(command: str, raw_risk: str | None) -> str:
-    # Server-side; the model's label may raise the level but never lower it.
-    return assess_step_risk(command, raw_risk)
 
 
 # Shared with the anomaly store, which re-derives stored plans on every read.
@@ -846,7 +1087,7 @@ def _clean_error_message(raw_text: str, *keys: str) -> str:
                         text = f"{msg} ({status})" if status and status not in msg else msg
                 elif isinstance(err, str):
                     text = err
-        except Exception:
+        except Exception:  # noqa: S110 - not a JSON error body: the raw text is used
             pass
 
     for k in keys:
@@ -889,6 +1130,7 @@ def _post_json(
     body: dict[str, Any],
     headers: dict[str, str],
     api_key_to_redact: str = "",
+    attempts: int = _MAX_AI_ATTEMPTS,
 ) -> dict[str, Any]:
     """POST JSON with bounded retries for transient failures (429, 5xx, network, timeouts).
 
@@ -902,8 +1144,9 @@ def _post_json(
         ensure_ascii=False,
     ).encode("utf-8")
 
-    for attempt in range(1, _MAX_AI_ATTEMPTS + 1):
-        req = request.Request(
+    for attempt in range(1, attempts + 1):
+        # Provider URLs are https (or http to localhost), checked by ai_settings.
+        req = request.Request(  # noqa: S310
             url,
             data=encoded_body,
             headers=headers,
@@ -911,7 +1154,8 @@ def _post_json(
         )
 
         try:
-            with request.urlopen(
+            # Provider URLs are https (or http to localhost), checked by ai_settings.
+            with request.urlopen(  # noqa: S310
                 req,
                 timeout=_PROVIDER_TIMEOUT_SECONDS,
             ) as resp:
@@ -934,7 +1178,7 @@ def _post_json(
 
             if (
                 code in _TRANSIENT_HTTP_STATUS_CODES
-                and attempt < _MAX_AI_ATTEMPTS
+                and attempt < attempts
             ):
                 delay = _retry_delay(exc, attempt)
 
@@ -962,7 +1206,7 @@ def _post_json(
             reason = getattr(exc, "reason", str(exc))
             clean_reason = _clean_error_message(str(reason), api_key_to_redact)
 
-            if attempt < _MAX_AI_ATTEMPTS:
+            if attempt < attempts:
                 delay = min(
                     _RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
                     _MAX_RETRY_SECONDS,
@@ -985,7 +1229,7 @@ def _post_json(
                 f"{provider} summarization network error: {clean_reason}"
             ) from None
 
-    raise RuntimeError(f"{provider} summarization failed after {_MAX_AI_ATTEMPTS} attempts")
+    raise RuntimeError(f"{provider} summarization failed after {attempts} attempts")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1009,7 +1253,7 @@ def _openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
 
 def _fetch_openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
     try:
-        req = request.Request(
+        req = request.Request(  # noqa: S310 - the configured provider base URL
             f"{base_url}/models",
             headers={
                 "Accept": "application/json",
@@ -1017,7 +1261,7 @@ def _fetch_openrouter_models_index(base_url: str) -> dict[str, dict[str, Any]]:
             },
         )
 
-        with request.urlopen(req, timeout=20) as resp:
+        with request.urlopen(req, timeout=20) as resp:  # noqa: S310 - the configured provider base URL
             raw = resp.read(_MAX_MODEL_INDEX_BYTES + 1)
         if len(raw) > _MAX_MODEL_INDEX_BYTES:
             return {}
@@ -1057,6 +1301,7 @@ def _summarize_openrouter(
     reasoning_effort: str,
     system_prompt: str = _SYSTEM_PROMPT,
     base_url: str = _DEFAULT_BASE_URLS["openrouter"],
+    parse: Any = None,
 ) -> dict[str, Any]:
     params = _supported_parameters(model, base_url)
 
@@ -1103,6 +1348,7 @@ def _summarize_openrouter(
         api_key_to_redact=api_key,
     )
 
+    _note_openai_usage(data)
     choices = data.get("choices") or []
 
     if not choices:
@@ -1114,7 +1360,7 @@ def _summarize_openrouter(
 
     content = message.get("content") or ""
 
-    result = _parse_summary_response(str(content))
+    result = (parse or _parse_summary_response)(str(content))
 
     if not result["summary"]:
         raise RuntimeError(
@@ -1134,6 +1380,7 @@ def _summarize_gemini(
     api_key: str,
     system_prompt: str = _SYSTEM_PROMPT,
     base_url: str = _DEFAULT_BASE_URLS["gemini"],
+    parse: Any = None,
 ) -> dict[str, Any]:
     url = f"{base_url}/v1beta/models/{model}:generateContent"
 
@@ -1178,6 +1425,7 @@ def _summarize_gemini(
         api_key_to_redact=api_key,
     )
 
+    _note_gemini_usage(data)
     candidates = data.get("candidates") or []
 
     if not candidates:
@@ -1196,7 +1444,7 @@ def _summarize_gemini(
 
     text = parts[0].get("text") or ""
 
-    result = _parse_summary_response(str(text))
+    result = (parse or _parse_summary_response)(str(text))
 
     if not result["summary"]:
         raise RuntimeError(
@@ -1216,6 +1464,7 @@ def _summarize_openai(
     api_key: str,
     system_prompt: str = _SYSTEM_PROMPT,
     base_url: str = _DEFAULT_BASE_URLS["openai"],
+    parse: Any = None,
 ) -> dict[str, Any]:
     # No temperature / reasoning_effort: OpenAI reasoning models reject a
     # non-default temperature and non-reasoning models reject reasoning_effort.
@@ -1245,6 +1494,7 @@ def _summarize_openai(
         api_key_to_redact=api_key,
     )
 
+    _note_openai_usage(data)
     choices = data.get("choices") or []
     if not choices:
         raise RuntimeError("OpenAI summarization returned no choices")
@@ -1260,7 +1510,7 @@ def _summarize_openai(
             "that answers within this budget"
         )
 
-    result = _parse_summary_response(content)
+    result = (parse or _parse_summary_response)(content)
     if not result["summary"]:
         raise RuntimeError("OpenAI summarization returned an empty summary")
     return result
@@ -1277,6 +1527,7 @@ def _summarize_anthropic(
     reasoning_effort: str,
     system_prompt: str = _SYSTEM_PROMPT,
     base_url: str = "",
+    parse: Any = None,
 ) -> dict[str, Any]:
     try:
         import anthropic
@@ -1293,7 +1544,9 @@ def _summarize_anthropic(
     params: dict[str, Any] = {
         "model": model,
         "max_tokens": 16000,
-        "system": system_prompt,
+        # The static system prompt is a cacheable prefix: repeated requests
+        # read it from the prompt cache (usage.cache_read_input_tokens).
+        "system": [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
         "messages": [
             {
                 "role": "user",
@@ -1325,11 +1578,96 @@ def _summarize_anthropic(
         detail = _clean_error_message(str(exc), api_key)
         raise RuntimeError(f"Anthropic summarization network error: {detail}") from None
 
+    _note_anthropic_usage(response)
     if response.stop_reason == "refusal":
         raise RuntimeError("Anthropic declined to summarize this content (refusal)")
 
     text = "".join(block.text for block in response.content if block.type == "text")
-    result = _parse_summary_response(text)
+    result = (parse or _parse_summary_response)(text)
     if not result["summary"]:
         raise RuntimeError("Anthropic summarization returned an empty summary")
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connection test (Settings → Test): one minimal request, no log content
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PING_PROMPT = "Reply with the single word OK."
+_PING_MAX_TOKENS = 16
+
+
+def ping_problem(cfg: AiConfig) -> str | None:
+    """Why no test call can be made with these settings, or None."""
+    if str(cfg.provider or "").strip().lower() not in SUPPORTED_PROVIDERS:
+        return "No supported AI provider is selected"
+    if not str(cfg.model or "").strip():
+        return "No model is set"
+    if not _api_key(cfg):
+        return "No API key is set"
+    return None
+
+
+def ping_provider(cfg: AiConfig) -> dict[str, Any]:
+    """One tiny request with the effective settings, no retries. Returns
+    {ok, latency_ms, model, error?}; the error is cleaned of the key, auth
+    headers and anything redact_text recognises."""
+    provider = str(cfg.provider or "").strip().lower()
+    model = str(cfg.model or "").strip()
+    api_key = _api_key(cfg)
+    out: dict[str, Any] = {"ok": False, "latency_ms": 0, "model": model}
+    problem = ping_problem(cfg)
+    if problem:
+        out["error"] = problem
+        return out
+    _note_usage(input_chars=len(_PING_PROMPT))
+    started = time.monotonic()
+    try:
+        _dispatch_ping(provider, model, api_key, cfg)
+        out["ok"] = True
+    except Exception as exc:  # noqa: BLE001 - every failure is reported, sanitized
+        if isinstance(exc, RuntimeError):
+            message = str(exc)
+        else:
+            message = f"{provider} request failed ({type(exc).__name__})"
+        out["error"] = _clean_error_message(message, api_key)[:300]
+    out["latency_ms"] = int((time.monotonic() - started) * 1000)
+    return out
+
+
+def _dispatch_ping(provider: str, model: str, api_key: str, cfg: AiConfig) -> None:
+    base_url = _base_url(provider, cfg)
+    headers = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "logscope-webapp/1.0"}
+    messages = [{"role": "user", "content": _PING_PROMPT}]
+    if provider in ("openrouter", "openai"):
+        body: dict[str, Any] = {"model": model, "messages": messages}
+        body["max_completion_tokens" if provider == "openai" else "max_tokens"] = _PING_MAX_TOKENS
+        data = _post_json(provider="OpenAI" if provider == "openai" else "OpenRouter",
+                          url=f"{base_url}/chat/completions", body=body,
+                          headers={**headers, "Authorization": f"Bearer {api_key}"},
+                          api_key_to_redact=api_key, attempts=1)
+        if not data.get("choices"):
+            raise RuntimeError(f"{provider} returned no choices")
+        _note_openai_usage(data)
+        return
+    if provider == "gemini":
+        data = _post_json(provider="Gemini", url=f"{base_url}/v1beta/models/{model}:generateContent",
+                          body={"contents": [{"parts": [{"text": _PING_PROMPT}]}],
+                                "generationConfig": {"maxOutputTokens": _PING_MAX_TOKENS}},
+                          headers={**headers, "x-goog-api-key": api_key}, api_key_to_redact=api_key, attempts=1)
+        _note_gemini_usage(data)
+        return
+    try:
+        import anthropic
+    except ImportError:
+        raise RuntimeError("The anthropic provider requires the 'anthropic' package") from None
+    client = anthropic.Anthropic(api_key=api_key, base_url=str(cfg.base_url or "").strip() or None,
+                                 timeout=_PROVIDER_TIMEOUT_SECONDS, max_retries=0)
+    try:
+        response = client.messages.create(model=model, max_tokens=_PING_MAX_TOKENS, messages=messages)
+    except anthropic.APIStatusError as exc:
+        detail = _clean_error_message(str(getattr(exc, "message", "") or ""), api_key)
+        raise RuntimeError(f"Anthropic request failed with HTTP {exc.status_code}: {detail}") from None
+    except anthropic.APIConnectionError as exc:
+        raise RuntimeError(f"Anthropic network error: {_clean_error_message(str(exc), api_key)}") from None
+    _note_anthropic_usage(response)

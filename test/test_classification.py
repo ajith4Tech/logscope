@@ -211,7 +211,7 @@ def test_rendered_values_include_multiline_reduce():
             capture_output=True,
         )
         rendered = {name: (Path(td) / name).read_text() for name in ("values-local.yaml", "values-agent.yaml")}
-    for name, text in rendered.items():
+    for text in rendered.values():
         assert "multiline:" in text
         assert "type: reduce" in text
         assert "kubernetes.pod_name" in text
@@ -223,10 +223,7 @@ def test_rendered_values_include_multiline_reduce():
 
 
 def _is_infra(cfg: dict[str, Any], ns: str) -> bool:
-    for p in cfg["routing"]["infra_namespaces"] or []:
-        if re.match(R.glob_to_regex(str(p)), ns):
-            return True
-    return False
+    return any(re.match(R.glob_to_regex(str(p)), ns) for p in cfg["routing"]["infra_namespaces"] or [])
 
 
 def _bucket_from_level(cfg: dict[str, Any], lv: str) -> str:
@@ -240,7 +237,7 @@ def _bucket_from_level(cfg: dict[str, Any], lv: str) -> str:
     return ""
 
 
-def classify_event(cfg: dict[str, Any], message: str, namespace: str) -> dict[str, Any]:
+def classify_event(cfg: dict[str, Any], message: str, namespace: str, container: str = "falco") -> dict[str, Any]:
     """Python stand-in for classify_and_scope + Falco overlay (tests)."""
     import json
 
@@ -272,7 +269,7 @@ def classify_event(cfg: dict[str, Any], message: str, namespace: str) -> dict[st
         scope = cfg["routing"]["namespace_scope_prefix"] + namespace
 
     falco_hit = False
-    if R.falco_enabled(cfg) and namespace == cfg["falco"]["namespace"]:
+    if R.falco_enabled(cfg) and namespace == cfg["falco"]["namespace"] and container in R.falco_containers(cfg):
         falco_hit = True
         scope = "security"
         if obj.get("output"):
@@ -366,6 +363,28 @@ def test_falco_disabled_falls_through():
     assert got["scope"] == cfg["routing"]["namespace_scope_prefix"] + ns
     assert "security.log" not in got["dests"]
     assert got["dests"] == [f"{got['scope']}/{got['log_type']}.log"]
+
+
+def test_only_falco_containers_in_the_falco_namespace_are_falco():
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
+    ns = cfg["falco"]["namespace"]
+    line = _lines("falco_alerts.txt")[0]
+    assert classify_event(cfg, line, ns, container="falco")["falco"] is True
+    # The falcoctl sidecar (or any other pod) in that namespace is an ordinary workload.
+    other = classify_event(cfg, '{"level":"info","msg":"artifact pulled"}', ns, container="falcoctl-artifact-follow")
+    assert other["falco"] is False and other["scope"] == f"namespaces/{ns}" and other["dests"] == [f"namespaces/{ns}/info.log"]
+    vrl = R.build_vrl(cfg)
+    assert f'if ns == "{ns}" && includes(["falco"], contnr) {{' in vrl
+    assert f'if ns == "{ns}" {{' not in vrl
+
+
+def test_klog_fatal_lines_are_errors():
+    cfg = R.load_config(ROOT / "test" / "fixtures" / "config.test.yaml")
+    error = next(b for b in cfg["severity"]["buckets"] if b["name"] == "error")
+    assert R.klog_prefixes(error) == ["E", "F"]
+    rx = re.compile(r"^(?:E|F)\d{4}\s")
+    assert rx.match("F0915 10:00:00.000000       1 main.go:42] unrecoverable")
+    assert "match(text, r'^(?:E|F)\\d{4}\\s') { bkt = \"error\" }" in R.build_vrl(cfg)
 
 
 def test_falco_json_starts_when():

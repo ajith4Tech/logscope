@@ -4,21 +4,20 @@ from __future__ import annotations
 
 import io
 import json
-import logging
 import sys
 from pathlib import Path
+from unittest.mock import patch
 from urllib import error, request
-from unittest.mock import MagicMock, patch
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import execute_action  # noqa: E402
+
 from webapp.api.actions import (
-    SUPPORTED_ACTIONS,
     build_kubectl_argv,
-    execute_action,
     parse_command_to_action,
     validate_namespace,
     validate_resource_name,
@@ -28,10 +27,7 @@ from webapp.api.ai_summary import (
     _normalise_steps,
     _parse_summary_response,
     _post_json,
-    _retry_delay,
-    _strip_json_fence,
 )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. AI Response Parsing & Structured Output
@@ -492,7 +488,6 @@ def test_shell_syntax_is_never_runnable_and_always_high_risk(command):
 # 6. Adversarial parsing, confirmation binding and bounded execution
 # ─────────────────────────────────────────────────────────────────────────────
 
-import os  # noqa: E402
 import threading  # noqa: E402
 
 from webapp.api.actions import (  # noqa: E402

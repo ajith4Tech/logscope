@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,17 +11,18 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from webapp.api.config import load_app_config  # noqa: E402
+from helpers import upsert_anomaly  # noqa: E402
+
 from webapp.api.ai_summary import summarize_anomaly  # noqa: E402
+from webapp.api.config import load_app_config  # noqa: E402
 from webapp.api.insights import (  # noqa: E402
     AnomalyStore,
     InsightsDetector,
     InsightsJob,
-    compute_baseline,
     is_spike,
     rule_key_of,
 )
-from webapp.api.storage import LogStorage  # noqa: E402
+from webapp.api.storage import LogStorage, to_epoch  # noqa: E402
 
 NOW = datetime(2026, 9, 7, 12, 30, 0, tzinfo=timezone.utc)
 HOUR_START = NOW.replace(minute=0, second=0, microsecond=0)
@@ -44,12 +44,12 @@ def insert_record(conn, *, timestamp, namespace="app", pod="web-0", message="boo
     INSERT OR IGNORE won't silently drop records that share a timestamp."""
     conn.execute(
         """
-        INSERT OR IGNORE INTO records (timestamp, severity_bucket, scope, namespace, pod, container,
+        INSERT OR IGNORE INTO records (timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container,
                              message, raw_line, source_key, source_etag, line_number, is_falco)
-        VALUES (?, ?, ?, ?, ?, 'c', ?, ?, ?, 'e', 1, ?)
+        VALUES (?, ?, ?, ?, ?, ?, 'c', ?, ?, ?, 'e', 1, ?)
         """,
         (
-            timestamp, severity_bucket, scope, namespace, pod, message,
+            timestamp, to_epoch(timestamp), severity_bucket, scope, namespace, pod, message,
             f"{timestamp} - {namespace} - {pod}/c - {message}",
             f"k/{timestamp}",
             "1" if scope == "security" else "0",
@@ -86,8 +86,9 @@ def make_job(store, summarizer=None, **overrides):
         sample_timestamps_max=10,
     )
     defaults.update(overrides)
-    from webapp.api.config import AiConfig, InsightsConfig
     from dataclasses import replace
+
+    from webapp.api.config import AiConfig, InsightsConfig
 
     base = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     cfg = replace(
@@ -128,12 +129,6 @@ def test_rule_key_of_matches_ui_rulekeyof():
 
 
 # --- Baseline / threshold math (deterministic) ------------------------------
-
-def test_compute_baseline():
-    assert compute_baseline([]) == 0.0
-    assert compute_baseline([4, 6]) == 5.0
-    assert compute_baseline([3]) == 3.0
-
 
 def test_is_spike_thresholds():
     assert not is_spike(5, 50.0, 3.0, 10)          # below multiplier
@@ -325,7 +320,7 @@ def test_persistent_ai_failure_is_recorded_after_bounded_retries(store):
     job = make_job(store, summarizer=None)
     upsert = dict(type="message_frequency", namespace="app", pod="", rule_key="boom",
                   severity="error", detected_day="2026-09-07")
-    anomaly_id = store.upsert_anomaly(evidence={"current_count": 1}, **upsert)
+    anomaly_id = upsert_anomaly(store, evidence={"current_count": 1}, **upsert)
 
     def always_failing(anomaly):
         raise RuntimeError("provider rejected the request")
@@ -337,7 +332,7 @@ def test_persistent_ai_failure_is_recorded_after_bounded_retries(store):
         assert (row["ai_summarized_at"] is None) == (attempt < _MAX_AI_ATTEMPTS_PER_ANOMALY)
 
     assert store.pending_ai_anomalies(10) == []
-    store.upsert_anomaly(evidence={"current_count": 2}, **upsert)  # next detection tick
+    upsert_anomaly(store, evidence={"current_count": 2}, **upsert)  # next detection tick
     item = store.query_anomalies({}, limit=10)["items"][0]
     assert item["evidence"]["current_count"] == 2
     assert item["evidence"]["ai_error"] == "provider rejected the request"
@@ -347,7 +342,7 @@ def test_ai_failure_keeps_anomaly_retryable(store):
     conn = store._conn
     insert_record(conn, timestamp=_iso(HOUR_START), namespace="app", pod="web-0", severity_bucket="error", message="boom")
     job = make_job(store, summarizer=None)
-    anomaly_id = store.upsert_anomaly(
+    anomaly_id = upsert_anomaly(store,
         type="message_frequency",
         namespace="app",
         pod="",
@@ -511,7 +506,7 @@ def test_gemini_summarize_anomaly_uses_correct_headers(monkeypatch):
 
 def test_anomaly_store_set_status(store):
     """set_status() updates status to reviewed/dismissed; rejects invalid values."""
-    anomaly_id = store.upsert_anomaly(
+    anomaly_id = upsert_anomaly(store,
         type="error_rate_spike",
         namespace="default",
         pod="",
@@ -549,6 +544,7 @@ def test_anomaly_store_set_status(store):
 def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
     """api_explain returns cached:True and skips AI on the second call with same filters."""
     from dataclasses import replace
+
     from webapp.api.config import AiConfig
     from webapp.api.server import WebApp
     from webapp.api.storage import LogStorage
@@ -557,7 +553,7 @@ def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
 
     db_path = tmp_path / "webapp.sqlite"
     # Create schema via LogStorage first
-    storage = LogStorage(db_path)
+    LogStorage(db_path)
 
     base = load_app_config(ROOT / "test" / "fixtures" / "config.test.yaml")
     cfg = replace(
@@ -588,9 +584,9 @@ def test_explain_cache_returns_cached_on_second_call(monkeypatch, tmp_path):
 
     # Insert one log record so the explain has something to sample
     app.storage.conn.execute(
-        "INSERT OR IGNORE INTO records (timestamp, severity_bucket, scope, namespace, pod, container,"
+        "INSERT OR IGNORE INTO records (timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container,"
         " message, raw_line, source_key, source_etag, line_number, is_falco)"
-        " VALUES ('2026-09-07T12:00:00Z', 'error', 'namespaces/default', 'default', 'web-0', 'c',"
+        " VALUES ('2026-09-07T12:00:00Z', 1788782400.0, 'error', 'namespaces/default', 'default', 'web-0', 'c',"
         " 'Connection timeout', 'raw', 'k/test', 'e', 1, 0)"
     )
     app.storage.conn.commit()
@@ -620,12 +616,12 @@ def _bulk(conn, rows):
     Each row gets a unique source key (unlike insert_record, which keys on time)."""
     conn.executemany(
         """
-        INSERT INTO records (timestamp, severity_bucket, scope, namespace, pod, container,
+        INSERT INTO records (timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container,
                              message, raw_line, source_key, source_etag, line_number, is_falco)
-        VALUES (?, ?, ?, ?, 'web-0', 'c', ?, ?, ?, 'e', 1, ?)
+        VALUES (?, ?, ?, ?, ?, 'web-0', 'c', ?, ?, ?, 'e', 1, ?)
         """,
         [
-            (ts, sev, (rest[0] if rest else f"namespaces/{ns}"), ns, msg, f"{ts} - {ns} - web-0/c - {msg}",
+            (ts, to_epoch(ts), sev, (rest[0] if rest else f"namespaces/{ns}"), ns, msg, f"{ts} - {ns} - web-0/c - {msg}",
              f"bulk/{next(_seq)}", 1 if rest and rest[0] == "security" else 0)
             for ts, ns, sev, msg, *rest in rows
         ],
@@ -734,7 +730,7 @@ def test_recurrence_clears_stale_ai_summary_and_counts_are_accurate(store):
 
 
 def test_stored_plan_risk_is_recomputed_and_never_lower_than_the_command(store):
-    anomaly_id = store.upsert_anomaly(type="message_frequency", namespace="app", pod="", rule_key="x",
+    anomaly_id = upsert_anomaly(store, type="message_frequency", namespace="app", pod="", rule_key="x",
                                       severity="error", evidence={"current_count": 1}, detected_day="2026-09-07")
     store.save_ai_summary(anomaly_id, "s", "a", [
         {"title": "a", "command": "kubectl delete namespace prod", "risk": "read-only"},

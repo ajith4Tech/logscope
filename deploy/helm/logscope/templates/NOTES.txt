@@ -7,7 +7,8 @@ Web app ({{ include "logscope.image" . }}):
 
 Vector:  {{ if .Values.vector.enabled }}chart-managed DaemonSet {{ include "logscope.vector.fullname" . }}{{ else }}not managed by this chart (existing install expected){{ end }}
 Falco:   {{ if .Values.falco.enabled }}chart-managed in namespace {{ .Values.falco.namespaceOverride | default .Release.Namespace }}{{ else }}not managed by this chart (existing install, if any){{ end }}
-AI:      {{ if include "logscope.aiEnabled" . }}{{ .Values.ai.provider }} / {{ .Values.ai.model }}{{ else }}disabled{{ end }}
+AI:      {{ if include "logscope.aiEnabled" . }}{{ .Values.ai.provider }} / {{ .Values.ai.model }}{{ else }}not set in values (can be set in the Settings tab){{ end }}
+Settings tab admin token: {{ if .Values.settings.adminToken.existingSecret }}Secret {{ .Values.settings.adminToken.existingSecret }}{{ else }}generated into /state/admin.token on the volume{{ end }}
 
 The web app has NO built-in authentication. Keep it internal or behind an
 authenticated, TLS-protected Ingress.

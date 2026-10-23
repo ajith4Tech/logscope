@@ -13,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import upsert_anomaly  # noqa: E402
 from test_production import JSON, _make_webapp, _request, _serve  # noqa: E402
 
 from webapp.api.insights import AnomalyStore  # noqa: E402
@@ -109,7 +110,7 @@ def test_stored_plans_are_rederived_with_the_current_parser():
 
         LogStorage(db)
         store = AnomalyStore(db)
-        anomaly_id = store.upsert_anomaly(type="error_rate_spike", namespace="app", pod="", rule_key="",
+        anomaly_id = upsert_anomaly(store, type="error_rate_spike", namespace="app", pod="", rule_key="",
                                           severity="error", evidence={"window_start": "2026-09-07T10:00:00Z"},
                                           detected_day="2026-09-07")
         # Saved by an older parser: "deployment foo" became a restart of a
@@ -138,7 +139,6 @@ import io  # noqa: E402
 import sqlite3  # noqa: E402
 
 import pytest  # noqa: E402
-
 from test_production import CONFIG, FakeS3, _gz, _S3WithFailures  # noqa: E402
 
 from webapp.api import ingest as ingest_mod  # noqa: E402
@@ -438,7 +438,7 @@ def test_insights_status_shows_provider_failures_without_failing_detection(tmp_p
     db = tmp_path / "db.sqlite"
     LogStorage(db)
     store = AnomalyStore(db)
-    store.upsert_anomaly(type="error_rate_spike", namespace="app", pod="", rule_key="", severity="error",
+    upsert_anomaly(store, type="error_rate_spike", namespace="app", pod="", rule_key="", severity="error",
                          evidence={"window_start": "2026-09-07T10:00:00Z"}, detected_day="2026-09-07")
 
     def failing(_):
@@ -460,7 +460,7 @@ import socket  # noqa: E402
 import time  # noqa: E402
 
 from webapp.api import server as server_mod  # noqa: E402
-from webapp.api.server import AppHTTPServer, LogscopeHandler, _cache_put  # noqa: E402
+from webapp.api.server import AppHTTPServer, LogscopeHandler  # noqa: E402
 
 
 def test_status_survives_a_failing_database(tmp_path, monkeypatch):
@@ -512,14 +512,16 @@ def test_oversized_and_out_of_range_inputs_are_client_errors(tmp_path):
         server.server_close()
 
 
-def test_explain_caches_are_bounded(monkeypatch):
-    monkeypatch.setattr(server_mod, "_EXPLAIN_CACHE_MAX_ENTRIES", 5)
-    cache: dict = {}
-    now = time.monotonic()
-    cache["expired"] = ({}, now - 1)
+def test_explain_cache_front_is_bounded(monkeypatch, tmp_path):
+    # The AI answer cache is persistent (state DB); its in-memory front is an LRU.
+    from webapp.api import ai_cache
+    from webapp.api.state import StateDB
+
+    monkeypatch.setattr(ai_cache, "FRONT_MAX_ENTRIES", 5)
+    cache = ai_cache.AiCache(StateDB(tmp_path / "s.sqlite"))
     for i in range(20):
-        _cache_put(cache, i, ({}, now + 60))
-    assert len(cache) == 5 and "expired" not in cache and list(cache) == [15, 16, 17, 18, 19]
+        cache._front_put(str(i), {"i": i})
+    assert list(cache._front) == ["15", "16", "17", "18", "19"]
 
 
 def test_requests_beyond_the_concurrency_cap_get_a_quick_503(tmp_path):

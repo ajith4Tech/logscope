@@ -25,7 +25,8 @@ def main(argv: list[str]) -> int:
     url = _URL.format(version=version, arch=arch)
     digest = hashlib.sha256()
     partial = dest + ".partial"
-    with urllib.request.urlopen(url, timeout=120) as resp, open(partial, "wb") as out:
+    # Fixed https URL (_URL); the download is checked against the pinned sha256.
+    with urllib.request.urlopen(url, timeout=120) as resp, open(partial, "wb") as out:  # noqa: S310
         while chunk := resp.read(1 << 20):
             digest.update(chunk)
             out.write(chunk)
@@ -34,7 +35,7 @@ def main(argv: list[str]) -> int:
         os.unlink(partial)
         print(f"kubectl {version} {arch}: sha256 {actual} does not match the pinned {expected}", file=sys.stderr)
         return 1
-    os.chmod(partial, 0o755)
+    os.chmod(partial, 0o755)  # noqa: S103 - an executable for every user of the image
     os.replace(partial, dest)
     print(f"kubectl {version} {arch}: sha256 verified")
     return 0

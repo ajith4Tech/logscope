@@ -51,7 +51,11 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY requirements.lock requirements-build.lock ./
-RUN pip install --require-hashes --no-deps -r requirements.lock -r requirements-build.lock \
+# cryptography (stored AI key encryption) and cffi install as manylinux wheels
+# that bundle OpenSSL and libffi, so neither the builder nor distroless/cc
+# needs extra system packages; --only-binary keeps it that way (no Rust build).
+RUN pip install --require-hashes --no-deps --only-binary cryptography,cffi \
+        -r requirements.lock -r requirements-build.lock \
     && pip check
 COPY config.example.yaml ./
 COPY packaging/ packaging/
@@ -120,10 +124,10 @@ FROM ${RUNTIME_IMAGE} AS runtime
 ARG VERSION=0.0.0+unknown
 ARG REVISION=
 ARG CREATED=
-ARG SOURCE=
+ARG SOURCE=https://github.com/ajith4Tech/logscope
 LABEL org.opencontainers.image.title="logscope" \
       org.opencontainers.image.description="Logscope web app: Kubernetes log viewer with anomaly insights" \
-      org.opencontainers.image.licenses="NOASSERTION" \
+      org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${REVISION}" \
       org.opencontainers.image.source="${SOURCE}" \
@@ -136,7 +140,9 @@ COPY --from=kubectl /out/ /
 # SSL_CERT_FILE: the bundled OpenSSL uses the distroless CA bundle.
 # XDG_DATA_HOME: UID 10001 has no home directory here, so the default state
 # database (saved views) lands in /data/logscope/ unless config or
-# LOGSCOPE_WEBAPP_STATE_DB_PATH (set by the Helm chart) says otherwise.
+# LOGSCOPE_WEBAPP_STATE_DB_PATH (set by the Helm chart) says otherwise. The
+# generated admin.token and secret.key (Settings UI) live next to that file
+# unless LOGSCOPE_ADMIN_TOKEN / LOGSCOPE_SECRET_KEY are set.
 ENV TMPDIR=/tmp \
     SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     XDG_DATA_HOME=/data

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
+import contextlib
 import ipaddress
 import json
 import logging
 import os
+import re
 import signal
 import sqlite3
 import sys
@@ -30,17 +31,42 @@ from .actions import (
     resolve_action,
     run_described_action,
 )
-from .ai_summary import SUPPORTED_PROVIDERS, explain_log_line, explain_logs, summarize_anomaly
-from .config import AppConfig, load_app_config
-from .ingest import S3Ingestor
+from .ai_cache import AiCache
+from .ai_settings import (
+    TEST_FEATURE,
+    AiFeatureDisabled,
+    AiService,
+    AiSettings,
+    AuthFailureLimiter,
+    ClientRateLimiter,
+    SecretBox,
+    SettingsError,
+    UsageMeter,
+    load_admin_token,
+    tokens_equal,
+)
+from .ai_summary import (
+    complete_json,
+    explain_log_line,
+    explain_logs,
+    ping_problem,
+    ping_provider,
+    summarize_anomalies_batch,
+    summarize_anomaly,
+)
+from .alerts import AlertEngine, AlertRules, RuleError, backtest
+from .channels import ChannelError, ChannelStore
+from .config import AppConfig, load_app_config, source_prefixes
+from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, meta_of
+from .ingest import S3Ingestor, _key_time_format
 from .insights import AnomalyStore, InsightsJob
+from .nl_filters import NlFilterError, NlFilters
 from .notify import MattermostNotifier
+from .signatures import SignatureKB, load_rules
 from .state import SavedViews, StateDB, ViewError, ViewNotFound, default_state_db_path
 from .storage import FILTER_FIELDS, MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
+from .summary_worker import SummaryWorker
 
-_EXPLAIN_CACHE_TTL = 300  # seconds — reuse cached answer for same filter set
-_EXPLAIN_SAMPLE_SIZE = 50  # max log lines sent to the AI
-_EXPLAIN_LINE_CACHE_TTL = 600  # per-line explanations rarely change; cache longer
 _MAX_BODY_BYTES = 1024 * 1024  # JSON bodies are tiny; refuse anything larger
 _PRUNE_INTERVAL_SECS = 3600
 _DB_BUSY_GRACE_SECS = 60  # readiness tolerates the shared DB connection being busy this long
@@ -66,8 +92,6 @@ _MAX_QUERY_PARAM_CHARS = 1000
 # query syntax. Values per exclusion parameter (xns, xpod, ...).
 _SEARCH_MODES = frozenset({"phrase", "raw"})
 _MAX_EXCLUDED_VALUES = 50
-# Cached AI answers kept per cache (oldest dropped first).
-_EXPLAIN_CACHE_MAX_ENTRIES = 256
 # HTTP requests handled at once; more get an immediate 503 instead of a
 # thread each (ThreadingHTTPServer has no limit of its own).
 _DEFAULT_MAX_CONCURRENT_REQUESTS = 64
@@ -240,14 +264,12 @@ class AppHTTPServer(ThreadingHTTPServer):
 
     def process_request(self, request, client_address):
         if not self._slots.acquire(blocking=False):
-            try:
+            with contextlib.suppress(OSError):
                 request.sendall(
                     b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\n"
                     b"Retry-After: 1\r\nConnection: close\r\nContent-Length: 30\r\n\r\n"
                     b'{"error":"Server busy; retry"}'
                 )
-            except OSError:
-                pass
             self.shutdown_request(request)
             return
         try:
@@ -396,6 +418,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Request body too large"}, status=413)
         except _UnsupportedMediaType:
             self._send_json({"error": "Content-Type must be application/json"}, status=415)
+        except AiFeatureDisabled as exc:
+            self._send_json({"error": "ai_feature_disabled", "feature": exc.feature}, status=403)
         except _RateLimited as exc:
             retry_after = max(1, int(exc.retry_after + 0.999))
             self._send_json(
@@ -424,6 +448,66 @@ class LogscopeHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):  # noqa: N802
         self._guarded(self._handle_delete, state_changing=True)
+
+    def do_PUT(self):  # noqa: N802
+        self._guarded(self._handle_put, state_changing=True)
+
+    def _admin_authorized(self) -> bool:
+        """Bearer admin token (constant-time compare). A correct token always
+        succeeds; wrong tokens are counted per client address, and past 10 in
+        a minute a wrong token gets 429 instead of 401."""
+        app = self.server.app
+        ip = self.client_address[0]
+        scheme, _, token = (self.headers.get("Authorization") or "").strip().partition(" ")
+        token = token.strip()
+        if scheme.lower() == "bearer" and tokens_equal(token, app.admin_token) and token:
+            return True
+        wait = app.admin_auth_failures.retry_after(ip)
+        if wait > 0:
+            retry_after = max(1, int(wait + 0.999))
+            self._send_json({"error": f"Too many failed admin token attempts; retry in {retry_after}s"},
+                            status=429, headers={"Retry-After": str(retry_after), "Cache-Control": "no-store"})
+            return False
+        app.admin_auth_failures.fail(ip)
+        self._send_json({"error": "A valid admin token is required"}, status=401,
+                        headers={"WWW-Authenticate": 'Bearer realm="logscope-settings"', "Cache-Control": "no-store"})
+        return False
+
+    def _handle_settings(self, method: str, path: str) -> bool:
+        """/api/settings/ai[/test|/usage]: admin token on top of the Origin
+        check (applied here to GET as well). Returns False for other paths."""
+        if path != "/api/settings" and not path.startswith("/api/settings/"):
+            return False
+        app = self.server.app
+        if method == "GET" and not self._origin_allowed():
+            self._send_json({"error": "Cross-origin request rejected"}, status=403)
+            return True
+        if not self._admin_authorized():
+            return True
+        no_store = {"Cache-Control": "no-store"}
+        route = (method, path.rstrip("/"))
+        try:
+            if route == ("GET", "/api/settings/ai"):
+                self._send_json(app.api_settings(), headers=no_store)
+            elif route == ("PUT", "/api/settings/ai"):
+                body = self._read_body_json() if int(self.headers.get("Content-Length", 0) or 0) else None
+                app.ai_settings.update(body)
+                self._send_json(app.api_settings(), headers=no_store)
+            elif route == ("POST", "/api/settings/ai/test"):
+                self._send_json(app.api_settings_test(), headers=no_store)
+            elif route == ("GET", "/api/settings/ai/usage"):
+                days = _bounded_int(_first(parse_qs(urlparse(self.path).query), "days", "7"), "days")
+                self._send_json(app.ai_meter.summary(days), headers=no_store)
+            elif route[1] in ("/api/settings/ai", "/api/settings/ai/test", "/api/settings/ai/usage"):
+                self._send_json({"error": "Method not allowed"}, status=405)
+            else:
+                self._send_json({"error": "Not found"}, status=404)
+        except SettingsError as exc:
+            payload = {"error": str(exc)}
+            if exc.field:
+                payload["field"] = exc.field
+            self._send_json(payload, status=exc.status, headers=no_store)
+        return True
 
     def _view_route(self, path: str) -> tuple[bool, int | None, str | None]:
         """/api/views[/<id>[/<action>]] -> (matched, id, action). An id that is
@@ -467,6 +551,108 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json({"error": "Method not allowed"}, status=405)
         except ViewError as exc:
+            payload = {"error": str(exc)}
+            if exc.field:
+                payload["field"] = exc.field
+            self._send_json(payload, status=exc.status)
+        return True
+
+    def _handle_alerts(self, method: str, path: str) -> bool:
+        """/api/alerts/...: reads are open; channel and rule writes need the
+        admin token (on top of the Origin check every write gets); mute and
+        unmute need only the Origin check (on-call use) and are rate limited
+        per address; the backtest is read-only."""
+        parts = path.strip("/").split("/")
+        if parts[:2] != ["api", "alerts"] or len(parts) < 3 or len(parts) > 5:
+            return False
+        app = self.server.app
+        kind = parts[2]
+        item_id = None
+        if len(parts) >= 4:
+            try:
+                item_id = _bounded_int(parts[3], "id")
+            except ValueError:
+                self._send_json({"error": "Not found"}, status=404)
+                return True
+        action = parts[4] if len(parts) == 5 else None
+        no_store = {"Cache-Control": "no-store"}
+        try:
+            if kind == "channels" and item_id is None and action is None:
+                if method == "GET":
+                    self._send_json({"channels": app.alert_channels.list()}, headers=no_store)
+                elif method == "POST":
+                    if self._admin_authorized():
+                        self._send_json({"channel": app.alert_channels.create(self._read_body_json())}, status=201,
+                                        headers=no_store)
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "channels" and item_id is not None and action in (None, "test"):
+                if (method, action) not in (("PATCH", None), ("DELETE", None), ("POST", "test")):
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                elif self._admin_authorized():
+                    if action == "test":
+                        self._send_json(app.alerts.test_channel(item_id), headers=no_store)
+                    elif method == "PATCH":
+                        self._send_json({"channel": app.alert_channels.update(item_id, self._read_body_json())},
+                                        headers=no_store)
+                    else:
+                        app.alert_channels.delete(item_id)
+                        self._send_json({"ok": True, "id": item_id})
+            elif kind == "rules" and item_id is None and action is None:
+                if method == "GET":
+                    self._send_json(app.api_alert_rules())
+                elif method == "POST":
+                    if self._admin_authorized():
+                        rule = app.alert_rules.create(self._read_body_json())
+                        self._send_json({"rule": app.alert_rule_view(rule)}, status=201)
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "rules" and item_id is not None and action is None:
+                if method == "GET":
+                    self._send_json({"rule": app.alert_rule_view(app.alert_rules.get(item_id))})
+                elif method in ("PATCH", "DELETE"):
+                    if self._admin_authorized():
+                        if method == "PATCH":
+                            rule, changed = app.alert_rules.update(item_id, self._read_body_json())
+                            if changed:
+                                app.alerts.forget(item_id, "rule changed")
+                            self._send_json({"rule": app.alert_rule_view(rule)})
+                        else:
+                            app.alert_rules.delete(item_id)
+                            app.alerts.forget(item_id, "rule deleted", record=False)
+                            self._send_json({"ok": True, "id": item_id})
+                else:
+                    self._send_json({"error": "Method not allowed"}, status=405)
+            elif kind == "rules" and item_id is not None and action == "mute":
+                if method not in ("POST", "DELETE"):
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                    return True
+                wait = app.mute_limiter.allow(self.client_address[0])
+                if wait > 0:
+                    retry_after = max(1, int(wait + 0.999))
+                    self._send_json({"error": f"Too many mute requests; retry in {retry_after}s"}, status=429,
+                                    headers={"Retry-After": str(retry_after)})
+                    return True
+                rule = (app.alert_rules.mute(item_id, self._read_body_json()) if method == "POST"
+                        else app.alert_rules.unmute(item_id))
+                self._send_json({"rule": app.alert_rule_view(rule)})
+            elif kind == "events" and item_id is not None and action == "retry":
+                # "Retry now" on a pending or failed notification (admin).
+                if method != "POST":
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                elif self._admin_authorized():
+                    self._send_json({"event": app.alerts.retry_now(item_id)})
+            elif kind == "events" and item_id is None and method == "GET":
+                self._send_json(app.api_alert_events(parse_qs(urlparse(self.path).query)))
+            elif kind == "backtest" and item_id is None and method == "POST":
+                try:
+                    self._send_json(app.api_alert_backtest(self._read_body_json()))
+                except TimeoutError:
+                    self._send_json({"error": "The backtest took longer than 2 s; use a shorter range or a "
+                                              "narrower view"}, status=503)
+            else:
+                self._send_json({"error": "Not found"}, status=404)
+        except (RuleError, ChannelError) as exc:
             payload = {"error": str(exc)}
             if exc.field:
                 payload["field"] = exc.field
@@ -530,7 +716,16 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             return
         if self._handle_views("GET", parsed.path):
             return
+        if self._handle_settings("GET", parsed.path):
+            return
+        if self._handle_alerts("GET", parsed.path):
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+    def _handle_put(self) -> None:
+        if self._handle_settings("PUT", urlparse(self.path).path):
+            return
+        self.send_error(HTTPStatus.NOT_IMPLEMENTED)
 
     def _handle_post(self) -> None:
         parsed = urlparse(self.path)
@@ -606,7 +801,59 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"error": str(exc)}, status=400)
             return
+        parts = parsed.path.strip("/").split("/")
+        if len(parts) == 4 and parts[:2] == ["api", "anomalies"] and parts[3] == "summarize":
+            # Manual AI summary of one anomaly (feature anomaly_manual_summary).
+            try:
+                anomaly_id = _bounded_int(parts[2], "anomaly id")
+            except ValueError:
+                self._send_json({"error": "Invalid anomaly id"}, status=400)
+                return
+            try:
+                body = self._read_body_json()
+                result = app.api_summarize_anomaly(anomaly_id, _ai_options(body.get))
+            except LookupError:
+                self._send_json({"error": "Anomaly not found"}, status=404)
+                return
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=502)
+                return
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(result)
+            return
+        if parsed.path == "/api/ai/filters":
+            # Natural language -> proposed filters (feature nl_filters); the UI
+            # applies nothing until the operator does.
+            try:
+                self._send_json(app.nl_filters.propose(self._read_body_json()))
+            except NlFilterError as exc:
+                self._send_json(exc.payload, status=exc.status)
+            except RuntimeError as exc:
+                self._send_json({"error": str(exc)}, status=502)
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+        if parsed.path == "/api/ai/feedback":
+            # 👍/👎 on a cached answer: one vote per (entry, browser session),
+            # 30 votes per minute per address.
+            wait = app.feedback_limiter.allow(self.client_address[0])
+            if wait > 0:
+                retry_after = max(1, int(wait + 0.999))
+                self._send_json({"error": f"Too many feedback votes; retry in {retry_after}s"}, status=429,
+                                headers={"Retry-After": str(retry_after)})
+                return
+            try:
+                self._send_json(app.api_ai_feedback(self._read_body_json(), self.headers.get(FEEDBACK_CLIENT_HEADER)))
+            except LookupError:
+                self._send_json({"error": "No cached answer with this key (it may have expired)"}, status=404)
+            return
         if self._handle_views("POST", parsed.path):
+            return
+        if self._handle_settings("POST", parsed.path):
+            return
+        if self._handle_alerts("POST", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -638,10 +885,14 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             return
         if self._handle_views("PATCH", parsed.path):
             return
+        if self._handle_alerts("PATCH", parsed.path):
+            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def _handle_delete(self) -> None:
         if self._handle_views("DELETE", urlparse(self.path).path):
+            return
+        if self._handle_alerts("DELETE", urlparse(self.path).path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -687,14 +938,23 @@ def _bounded_int(raw, name: str) -> int:
     return value
 
 
-def _cache_put(cache: dict, key, value) -> None:
-    """Insert into a bounded cache: expired entries go first, then the oldest."""
-    now = time.monotonic()
-    for stale in [k for k, (_, expiry) in cache.items() if expiry <= now]:
-        del cache[stale]
-    while len(cache) >= _EXPLAIN_CACHE_MAX_ENTRIES:
-        del cache[next(iter(cache))]
-    cache[key] = value
+_TRUE = ("1", "true", "yes", "on")
+# Random per-browser-session id the UI keeps in sessionStorage: one vote per
+# (cache entry, client id); a repeat vote replaces the earlier one.
+FEEDBACK_CLIENT_HEADER = "X-Logscope-Client"
+_CLIENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_FEEDBACK_PER_MINUTE = 30
+_MUTES_PER_MINUTE = 30
+
+
+def _ai_options(get: Any) -> dict[str, Any]:
+    """tier / regenerate / skip_signature from a JSON body or query string
+    (get(name) returns the raw value or None)."""
+    tier = get("tier") or "fast"
+    if tier not in ("fast", "deep"):
+        raise ValueError("'tier' must be 'fast' or 'deep'")
+    flag = lambda name: get(name) is True or str(get(name) or "").strip().lower() in _TRUE  # noqa: E731
+    return {"tier": tier, "regenerate": flag("regenerate"), "skip_signature": flag("skip_signature")}
 
 
 class WebApp:
@@ -707,6 +967,7 @@ class WebApp:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._ingest_loop, daemon=True)
         self._fts_thread = threading.Thread(target=self._fts_migration_loop, daemon=True)
+        self._ts_thread = threading.Thread(target=self._ts_backfill_loop, daemon=True)
         self._started_at = time.monotonic()
         self._last_poll_finished: float | None = None
         self.anomaly_store = AnomalyStore(cfg.webapp.db_path)
@@ -716,7 +977,7 @@ class WebApp:
             cfg,
             open_connection(cfg.webapp.db_path),
             self.anomaly_store,
-            summarizer=lambda anomaly: summarize_anomaly(anomaly, cfg.ai),
+            dispatcher=self._dispatch_summaries,
         )
         # Optional Mattermost notifications; own thread and connection, so a
         # slow webhook never delays ingestion or detection.
@@ -724,10 +985,53 @@ class WebApp:
         # Saved views live in the durable state database, not the cache.
         self.state_db = StateDB(cfg.webapp.state_db_path or default_state_db_path())
         self.views = SavedViews(self.state_db)
-        # Server-side explain caches: filter-set explain and per-line explain
-        self._explain_cache: dict[str, tuple[dict, float]] = {}
-        self._explain_line_cache: dict[int, tuple[dict, float]] = {}
-        self._explain_lock = threading.Lock()
+        # AI settings from the UI (see ai_settings): admin token and master
+        # key files sit next to the state database unless set by environment.
+        state_dir = self.state_db.path.parent
+        self.admin_token, self.admin_token_source = load_admin_token(state_dir)
+        self.admin_auth_failures = AuthFailureLimiter()
+        self.feedback_limiter = ClientRateLimiter(max_failures=_FEEDBACK_PER_MINUTE)
+        self.secret_box = SecretBox(state_dir)
+        self.ai_settings = AiSettings(self.state_db, cfg.ai, self.secret_box)
+        self.ai_meter = UsageMeter(self.state_db, self.ai_settings, notify=self._budget_notice)
+        self.ai = AiService(self.ai_settings, self.ai_meter)
+        # Cheapest answer first: signatures, then the template cache, then one
+        # metered call (see explain.py).
+        self.ai_cache = AiCache(self.state_db, ttl_hours=cfg.ai.cache_ttl_hours)
+        self.signatures = SignatureKB(load_rules(cfg.ai.signatures))
+        self.explainer = Explainer(
+            settings=self.ai_settings, service=self.ai, cache=self.ai_cache, kb=self.signatures,
+            # Late-bound module names (tests replace them).
+            line_fn=lambda record, ai_cfg: explain_log_line(record, ai_cfg),
+            logs_fn=lambda payload, ai_cfg: explain_logs(payload, ai_cfg),
+            anomaly_fn=lambda anomaly, ai_cfg: summarize_anomaly(anomaly, ai_cfg),
+            batch_fn=lambda anomalies, ai_cfg: summarize_anomalies_batch(anomalies, ai_cfg),
+            rate_limit=lambda: self.ai_rate_limiter.acquire(),
+            configured=lambda: self.ai_configured(),
+        )
+        self.nl_filters = NlFilters(
+            storage=self.storage, service=self.ai, cache=self.ai_cache,
+            configured=lambda: self.ai_configured(),
+            complete=lambda system, user, ai_cfg: complete_json(system, user, ai_cfg),
+            rate_limit=lambda: self.ai_rate_limiter.acquire(),
+        )
+        # Alerts on saved views (alerts.py), delivered through the channel
+        # layer shared with anomaly notifications (channels.py).
+        self.alert_channels = ChannelStore(self.state_db, self.secret_box, env_url=self.notifier.webhook_url)
+        self.alert_rules = AlertRules(self.state_db, self.alert_channels)
+        self.alerts = AlertEngine(
+            db=self.state_db, storage=self.storage, rules=self.alert_rules, channels=self.alert_channels,
+            signatures=self.signatures, prefixes=lambda: [p["prefix"] for p in source_prefixes(cfg)],
+            time_format=_key_time_format(cfg.s3_key_prefix), display_tz=cfg.alerts.display_tz,
+            public_url=cfg.alerts.public_url, batch_timeout=cfg.alerts.s3_batch_timeout_secs,
+            margin=cfg.alerts.watermark_margin_secs, tick_secs=cfg.alerts.eval_tick_secs,
+            ai_service=self.ai, ai_fn=lambda payload, ai_cfg: explain_logs(payload, ai_cfg),
+            ai_configured=lambda: self.ai_configured(),
+        )
+        self.mute_limiter = ClientRateLimiter(max_failures=_MUTES_PER_MINUTE)
+        # Automatic anomaly summaries run here, never in the detection loop.
+        self.summary_worker = SummaryWorker(
+            self.explainer, self.anomaly_store, min_urgency=lambda: self.cfg.ai.auto_summary_min_urgency)
         # kubectl actions run with this process's credentials and the HTTP API
         # has no auth of its own, so they are opt-in: LOGSCOPE_ACTIONS_ENABLED=true.
         self.actions_enabled = _env_flag("LOGSCOPE_ACTIONS_ENABLED", False)
@@ -743,8 +1047,9 @@ class WebApp:
             for o in os.environ.get("LOGSCOPE_ALLOWED_ORIGINS", "").split(",")
             if o.strip()
         )
-        # Bounds operator-triggered AI calls (/api/explain, /api/explain-line);
-        # cached answers are free and not counted. 0 disables the limit.
+        # Bounds operator-triggered AI calls (/api/explain, /api/explain-line,
+        # /api/ai/filters); cached answers are free and not counted. 0
+        # disables the limit.
         self.ai_rate_limiter = _RateLimiter(
             _env_int("LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE", _DEFAULT_AI_RATE_LIMIT_PER_MINUTE)
         )
@@ -755,18 +1060,26 @@ class WebApp:
         self._thread.start()
         if self.storage.fts_layout == "migrating":
             self._fts_thread.start()
+        if self.storage.ts_backfill_pending:
+            self._ts_thread.start()
         if self.cfg.insights.enabled:
             self.insights.start()
+        self.summary_worker.start()
         self.notifier.start()
+        self.alerts.start()
 
     def stop(self) -> None:
         self._stop.set()
         self._thread.join(timeout=5)
         if self._fts_thread.is_alive():
             self._fts_thread.join(timeout=5)
+        if self._ts_thread.is_alive():
+            self._ts_thread.join(timeout=5)
         if self.cfg.insights.enabled:
             self.insights.stop()
+        self.summary_worker.stop()
         self.notifier.stop()
+        self.alerts.stop()
 
     def _ingest_loop(self) -> None:
         while not self._stop.is_set():
@@ -801,6 +1114,29 @@ class WebApp:
             retry = _FTS_MIGRATION_RETRY_SECS
             self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
 
+    def _ts_backfill_loop(self) -> None:
+        """Give rows written by an older version their ts_epoch, in batches
+        (storage.TS_BACKFILL_BATCH) that each commit and release the lock;
+        a restart resumes. Failures retry with backoff and are reported in
+        /api/status storage.ts_backfill.last_error."""
+        logger.info("Backfilling ts_epoch for existing records (runs in the background)")
+        retry = _FTS_MIGRATION_RETRY_SECS
+        while not self._stop.is_set():
+            try:
+                if not self.storage.backfill_ts_step():
+                    self.storage.ts_backfill_error = None
+                    logger.info("ts_epoch backfill complete")
+                    return
+            except sqlite3.Error as exc:
+                self.storage.ts_backfill_error = f"{type(exc).__name__}: {exc}"[:300]
+                logger.warning("ts_epoch backfill paused (%s); retrying in %ds", exc, retry)
+                self._stop.wait(retry)
+                retry = min(retry * 2, _FTS_MIGRATION_RETRY_MAX_SECS)
+                continue
+            self.storage.ts_backfill_error = None
+            retry = _FTS_MIGRATION_RETRY_SECS
+            self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
+
     def _maybe_prune(self) -> None:
         days = self.cfg.webapp.retention_days
         if days <= 0:
@@ -809,10 +1145,10 @@ class WebApp:
         if self._last_prune_at is not None and now - self._last_prune_at < _PRUNE_INTERVAL_SECS:
             return
         self._last_prune_at = now
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        removed = self.storage.prune_records_before(cutoff)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        removed = self.storage.prune_records_before(cutoff.timestamp())
         if removed:
-            logger.info("Pruned %d cached records older than %s", removed, cutoff)
+            logger.info("Pruned %d cached records older than %s", removed, cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
     def healthy(self) -> bool:
         # Liveness stays "the ingest loop is running": S3 or AI outages must not
@@ -869,8 +1205,28 @@ class WebApp:
             }
         status["version"] = __version__
         status["ai_configured"] = self.ai_configured()
+        status["ai_summary_queue"] = self.summary_worker.status()
+        try:
+            status["ai_features"] = dict(self.ai_settings.snapshot().flags)
+            budget = self.ai_meter.budget_status()
+            status["ai_budget"] = budget
+            status["ai_warnings"] = self.ai_settings.warnings() + [
+                f"AI budget {item['budget']} is at {item['ratio'] * 100:.0f}% today (UTC)"
+                + (" — calls are being skipped" if item["used"] >= item["limit"] else "")
+                for item in budget if item["ratio"] >= 0.8
+            ]
+        except sqlite3.Error as exc:
+            status["ai_warnings"] = [f"AI settings unavailable ({type(exc).__name__})"]
         status["actions_enabled"] = self.actions_enabled
         status["insights"] = self.insights.status()
+        try:
+            # Alert windows end here, not at now (see alerts.compute_watermark).
+            status["watermark"] = self.alerts.watermark()
+            status["alerts"] = {"firing": self.alerts.firing_count(), "pipeline_stale": self.alerts.pipeline_firing(),
+                                "last_tick_at": self.alerts.last_tick_at, "last_error": self.alerts.last_error,
+                                "delivery": self.alerts.delivery_status()}
+        except sqlite3.Error as exc:
+            status["alerts"] = {"status_error": type(exc).__name__}
         try:
             status["notifications"] = self.notifier.status()
         except sqlite3.Error as exc:
@@ -880,8 +1236,14 @@ class WebApp:
 
     def ready(self) -> tuple[bool, bool]:
         """(ready, busy). A connection busy with a long query is still working;
-        only one that stays busy past the grace period is reported unready."""
-        if self.storage.ping():
+        only one that stays busy past the grace period is reported unready.
+        A database error (unreadable, corrupt, closed) is unready."""
+        try:
+            answered = self.storage.ping()
+        except sqlite3.Error as exc:
+            logger.warning("Readiness check: database error (%s)", type(exc).__name__)
+            return False, False
+        if answered:
             self._db_busy_since = None
             return True, False
         now = time.monotonic()
@@ -890,13 +1252,88 @@ class WebApp:
         return now - self._db_busy_since < _DB_BUSY_GRACE_SECS, True
 
     def ai_configured(self) -> bool:
-        """True when an AI provider+model+key combination is usable."""
-        provider = str(self.cfg.ai.provider or "").strip().lower()
-        if provider not in SUPPORTED_PROVIDERS:
-            return False
-        model = str(self.cfg.ai.model or "").strip()
-        api_key = os.environ.get(self.cfg.ai.api_key_env, "")
-        return bool(model and api_key)
+        """True when the effective provider+model+key combination is usable."""
+        return self.ai_settings.configured()
+
+    def _budget_notice(self, text: str) -> None:
+        if self.notifier.configured:
+            self.notifier.send_text(text)
+
+    def _dispatch_summaries(self, anomalies: list[dict]) -> int:
+        """Insights' hand-off: queues anomalies for automatic summaries
+        (anomaly_auto_summary on, urgency at or above the configured minimum)."""
+        return self.summary_worker.enqueue(anomalies)
+
+    def api_summarize_anomaly(self, anomaly_id: int, options: dict | None = None) -> dict:
+        options = options or {}
+        self.ai.require("anomaly_manual_summary")
+        anomaly = self.anomaly_store.get_anomaly(anomaly_id)
+        if anomaly is None:
+            raise LookupError(anomaly_id)
+        result = self.explainer.summarize_anomaly(anomaly, feature="anomaly_manual_summary", **options)
+        if not result.get("degraded"):
+            self.anomaly_store.save_ai_summary(
+                anomaly_id, result["summary"], result.get("suggested_action", ""), result.get("steps"),
+                meta=meta_of(result))
+        return {**result, "id": anomaly_id}
+
+    def api_ai_feedback(self, body: dict, client_id: str | None) -> dict:
+        key = body.get("key")
+        if not isinstance(key, str) or not key or len(key) > 300:
+            raise ValueError("'key' is required")
+        if not client_id or not _CLIENT_ID_RE.match(client_id):
+            raise ValueError(f"The {FEEDBACK_CLIENT_HEADER} header must hold the browser session's client id")
+        try:
+            counts = self.ai_cache.feedback(key, str(body.get("vote") or ""), client_id)
+        except KeyError:
+            raise LookupError(key) from None
+        return {"ok": True, "key": key, **counts}
+
+    def api_settings(self) -> dict:
+        view = self.ai_settings.public_view()
+        view["admin_token_source"] = self.admin_token_source
+        view["budget_status"] = self.ai_meter.budget_status()
+        return view
+
+    def api_settings_test(self) -> dict:
+        """One minimal provider call with the saved settings (metered as
+        settings_test, rate limited, outside the budgets)."""
+        cfg = self.ai_settings.effective()
+        problem = ping_problem(cfg)
+        if problem:  # nothing to send: not a metered call
+            return {"ok": False, "latency_ms": 0, "model": cfg.model, "error": problem}
+        result = self.ai.call(TEST_FEATURE, ping_provider, before_call=self.ai_rate_limiter.acquire,
+                              check_budget=False)
+        return {k: result[k] for k in ("ok", "latency_ms", "model", "error") if k in result}
+
+    def alert_rule_view(self, rule: dict) -> dict:
+        return {**rule, "status": self.alerts.rule_status(rule)}
+
+    def api_alert_rules(self) -> dict:
+        rules = [self.alert_rule_view(rule) for rule in self.alert_rules.list()]
+        return {"rules": rules, "firing": sum(1 for r in rules if r["status"]["state"] == "firing"),
+                "watermark": self.alerts.watermark()}
+
+    def api_alert_events(self, params: dict[str, list[str]]) -> dict:
+        rule = _first(params, "rule")
+        cursor = _first(params, "cursor")
+        since = _first(params, "since")
+        if since and (len(since) > 40 or not re.match(r"^\d{4}-\d{2}-\d{2}", since)):
+            raise ValueError("'since' must be an ISO-8601 time")
+        state = _first(params, "state")
+        if state and state not in ("ok", "pending", "firing", "resolved", "disabled"):
+            raise ValueError("'state' must be ok, pending, firing, resolved or disabled")
+        return self.alerts.events(
+            rule_id=_bounded_int(rule, "rule") if rule else None, state=state, since=since,
+            before_id=_bounded_int(cursor, "cursor") if cursor else None,
+            limit=_coerce_limit(_first(params, "limit"), 50, 200))
+
+    def api_alert_backtest(self, body: dict) -> dict:
+        mark = self.alerts.watermark()
+        end = datetime.fromisoformat(mark["at"].replace("Z", "+00:00")) if mark["at"] else datetime.now(timezone.utc)
+        result = backtest(self.storage, self.alert_rules, body, end=end)
+        result["ends_at_watermark"] = bool(mark["at"])
+        return result
 
     def api_anomalies(self, params: dict[str, list[str]]) -> dict:
         flat = {
@@ -905,95 +1342,47 @@ class WebApp:
             if _first(params, key)
         }
         limit = _coerce_limit(_first(params, "limit"), self.cfg.webapp.page_size_default, self.cfg.webapp.page_size_max)
-        return self.anomaly_store.query_anomalies(flat, limit=limit)
+        result = self.anomaly_store.query_anomalies(flat, limit=limit)
+        for item in result["items"]:
+            # Free: what changed, counts vs baseline, top templates, signature.
+            item["template_summary"] = anomaly_template_summary(self.signatures, item)
+        return result
 
     def api_dashboard(self, params: dict[str, list[str]]) -> dict:
         flat = _query_params(params)
         return self.storage.query_dashboard(flat)
 
     def api_explain(self, params: dict[str, list[str]]) -> dict:
-        """Re-derive a bounded log sample from filters, summarize via AI.
-        Server-side cache: same filter set returns cached result for _EXPLAIN_CACHE_TTL seconds.
-        """
-        if not self.ai_configured():
-            raise ValueError("AI provider is not configured")
+        """Explain the currently filtered logs: signatures when they cover the
+        sample, else the template cache, else one AI call with the sample's
+        top templates (not raw rows)."""
+        self.ai.require("explain_filtered")
+        options = _ai_options(lambda name: _first(params, name))
         flat = _query_params(params)
-        cache_key = hashlib.sha1(
-            json.dumps(flat, sort_keys=True).encode()
-        ).hexdigest()
-        now = time.monotonic()
-        with self._explain_lock:
-            cached = self._explain_cache.get(cache_key)
-            if cached:
-                result, expiry = cached
-                if now < expiry and bool(result.get("steps")):
-                    return {**result, "cached": True}
-        data = self.storage.query_logs(flat, limit=_EXPLAIN_SAMPLE_SIZE, cursor=None, direction="desc")
+        data = self.storage.query_logs(flat, limit=FILTERED_SAMPLE_ROWS, cursor=None, direction="desc")
         items = data.get("items") or []
-        total_matching_exceeds_sample = bool(data.get("has_more"))
         if not items:
-            return {"summary": "No logs found matching the current filters.", "steps": [], "suggested_action": "", "sample_count": 0, "total_matching_exceeds_sample": False, "cached": False}
-        sample = [
-            {
-                "timestamp": item.get("timestamp"),
-                "severity": item.get("severity_bucket"),
-                "namespace": item.get("namespace"),
-                "pod": item.get("pod"),
-                "container": item.get("container"),
-                "message": item.get("message"),
-            }
-            for item in items
-        ]
-        payload = {
-            "filters": flat,
-            "total_matching_exceeds_sample": total_matching_exceeds_sample,
-            "sample_size": len(sample),
-            "log_sample": sample,
-        }
-        self.ai_rate_limiter.acquire()
-        result = explain_logs(payload, self.cfg.ai)
-        if result is None:
-            raise RuntimeError("AI summarization returned no result")
-        response = {
-            **result,
-            "sample_count": len(sample),
-            "total_matching_exceeds_sample": total_matching_exceeds_sample,
-            "cached": False,
-        }
-        with self._explain_lock:
-            _cache_put(self._explain_cache, cache_key, (response, now + _EXPLAIN_CACHE_TTL))
-        return response
+            if not self.ai_configured():
+                raise ValueError("AI provider is not configured")
+            return {"summary": "No logs found matching the current filters.", "steps": [], "suggested_action": "",
+                    "sample_count": 0, "total_matching_exceeds_sample": False, "cached": False, "source": "none"}
+        return self.explainer.explain_filtered(flat, items, sample_limit_reached=bool(data.get("has_more")), **options)
 
     def api_explain_line(self, body: dict) -> dict:
         """Explain a single already-fetched log row, re-derived by id from
         storage (never trusting client-supplied message text)."""
-        if not self.ai_configured():
-            raise ValueError("AI provider is not configured")
+        self.ai.require("explain_line")
+        options = _ai_options(body.get)
         record_id = body.get("id")
         if record_id is None:
             raise ValueError("Missing 'id' field")
         record_id = _bounded_int(record_id, "id")
-
-        now = time.monotonic()
-        with self._explain_lock:
-            cached = self._explain_line_cache.get(record_id)
-            if cached:
-                result, expiry = cached
-                if now < expiry and bool(result.get("steps")):
-                    return {**result, "cached": True}
-
         record = self.storage.get_record_by_id(record_id)
         if record is None:
+            if not self.ai_configured():
+                raise ValueError("AI provider is not configured")
             raise ValueError("Log record not found")
-
-        self.ai_rate_limiter.acquire()
-        result = explain_log_line(record, self.cfg.ai)
-        if result is None:
-            raise RuntimeError("AI summarization returned no result")
-        response = {**result, "cached": False}
-        with self._explain_lock:
-            _cache_put(self._explain_line_cache, record_id, (response, now + _EXPLAIN_LINE_CACHE_TTL))
-        return response
+        return self.explainer.explain_line(record, **options)
 
     def api_logs(self, params: dict[str, list[str]]) -> dict:
         flat = _query_params(params)
@@ -1061,7 +1450,7 @@ def main(argv: list[str] | None = None, prog: str | None = None) -> None:
         sys.exit(2)
     # A host name given to --host is how this server is reached; trust it.
     bind_host = args.host.strip().lower()
-    extra_hosts = () if bind_host in ("", "0.0.0.0", "::") or _is_ip_literal(bind_host) else (bind_host,)
+    extra_hosts = () if bind_host in ("", "0.0.0.0", "::") or _is_ip_literal(bind_host) else (bind_host,)  # noqa: S104 - a comparison, not a bind
     try:
         app = WebApp(cfg, extra_trusted_hosts=extra_hosts)
     except (OSError, sqlite3.Error, ValueError) as exc:

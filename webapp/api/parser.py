@@ -4,6 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from .storage import to_epoch
 
 LINE_RE = re.compile(
     r"^(?P<timestamp>[^ ]+) - (?P<namespace>[^ ]+) - (?P<pod>[^/]+)/(?P<container>[^ ]+) - (?P<message>.*)$"
@@ -58,14 +59,28 @@ def make_record(
     source_etag: str,
     line_number: int,
     infra_namespaces: tuple[str, ...],
+    fallback_epoch: float | None = None,
 ) -> dict[str, Any] | None:
+    """One record from one line. ts_epoch is the line's timestamp in UTC
+    epoch seconds (no zone = UTC); when it does not parse, fallback_epoch
+    (the S3 object's time) is used and ts_fallback is set.
+
+    Falco events are read from the security/ prefix only: a line tagged
+    " scope=security" in a regular prefix (written there by versions that
+    sent every Falco event to both sinks) is skipped."""
     parsed = parse_flat_line(raw_line)
     if source_scope != "security" and parsed.is_security_suffix:
         return None
+    ts_epoch = to_epoch(parsed.timestamp)
+    ts_fallback = ts_epoch is None
+    if ts_fallback:
+        ts_epoch = fallback_epoch
 
     scope = "security" if source_scope == "security" else route_scope(parsed.namespace, infra_namespaces)
     return {
         "timestamp": parsed.timestamp,
+        "ts_epoch": ts_epoch,
+        "ts_fallback": ts_fallback,
         "severity_bucket": source_bucket,
         "scope": scope,
         "namespace": parsed.namespace,

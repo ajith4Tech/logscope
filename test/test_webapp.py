@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import json
 import gzip
 import io
+import json
 import sys
 import tempfile
 from dataclasses import replace
@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 from webapp.api.config import load_app_config  # noqa: E402
 from webapp.api.ingest import S3Ingestor  # noqa: E402
-from webapp.api.parser import make_record, parse_flat_line  # noqa: E402
+from webapp.api.parser import make_record  # noqa: E402
 from webapp.api.server import WebApp  # noqa: E402
 from webapp.api.storage import LogStorage, decode_cursor  # noqa: E402
 

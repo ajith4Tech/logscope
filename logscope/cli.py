@@ -154,6 +154,12 @@ def _check_writable(report: _Report, name: str, db_path: Path) -> None:
         report.ok(name, f"{db_path} ({'exists' if db_path.exists() else 'will be created'}; {directory} writable)")
 
 
+def is_frozen_bundle() -> bool:
+    from .resources import is_frozen
+
+    return is_frozen()
+
+
 def _check_modules(report: _Report, need_anthropic: bool) -> None:
     """boto3 with botocore's S3 service model (data files), and the anthropic
     SDK. A missing SDK fails the check in a bundle (the build is incomplete)
@@ -174,6 +180,19 @@ def _check_modules(report: _Report, need_anthropic: bool) -> None:
             "anthropic", f"SDK not importable: {type(exc).__name__}: {exc}")
     else:
         report.ok("anthropic", f"SDK {anthropic.__version__}")
+    try:
+        import cryptography
+        from cryptography.fernet import Fernet
+
+        probe = Fernet(Fernet.generate_key())
+        if probe.decrypt(probe.encrypt(b"selfcheck")) != b"selfcheck":
+            raise ValueError("round-trip mismatch")
+    except Exception as exc:  # noqa: BLE001
+        # Needed only for an API key stored from the Settings UI.
+        (report.fail if is_frozen_bundle() else report.warn)(
+            "cryptography", f"unavailable: {type(exc).__name__}; a key stored from the Settings UI cannot be used")
+    else:
+        report.ok("cryptography", f"{cryptography.__version__}, Fernet round-trip ok")
 
 
 def _report_ai(report: _Report, cfg) -> None:
@@ -190,7 +209,8 @@ def _report_ai(report: _Report, cfg) -> None:
     if not os.environ.get(ai.api_key_env):
         missing.append(f"${ai.api_key_env}")
     if missing:
-        report.warn("ai", f"provider {provider} set but {', '.join(missing)} missing: AI features stay off")
+        report.warn("ai", f"provider {provider} set but {', '.join(missing)} missing: AI features stay off "
+                          "unless set in the Settings UI")
     else:
         report.ok("ai", f"provider {provider}, model {ai.model}, key from ${ai.api_key_env}")
 

@@ -17,7 +17,7 @@
      an existingSecret is not visible to Helm; restart the workload instead. */}}
 {{- define "logscope.webapp.credentialsChecksum" -}}
 {{- $c := .Values.s3.credentials.webapp -}}
-{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey .Values.mattermost.enabled .Values.mattermost.existingSecret .Values.mattermost.existingSecretKey .Values.mattermost.webhookUrl | toJson | sha256sum -}}
+{{- list $c.existingSecret $c.accessKeyId $c.secretAccessKey .Values.ai.provider .Values.ai.existingSecret .Values.ai.existingSecretKey .Values.ai.apiKey .Values.mattermost.enabled .Values.mattermost.existingSecret .Values.mattermost.existingSecretKey .Values.mattermost.webhookUrl .Values.settings.adminToken .Values.settings.secretKey | toJson | sha256sum -}}
 {{- end -}}
 
 {{- define "logscope.vector.credentialsChecksum" -}}
@@ -114,7 +114,7 @@ Ingress host when enabled, and webapp.trustedHosts.
 
 {{/* Variables the chart sets itself; webapp.extraEnv must not override them. */}}
 {{- define "logscope.reservedEnv" -}}
-LOGSCOPE_WEBAPP_DB_PATH LOGSCOPE_WEBAPP_STATE_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVEL LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE LOGSCOPE_ALLOWED_ORIGINS LOGSCOPE_TRUSTED_HOSTS LOGSCOPE_AI_API_KEY LOGSCOPE_MATTERMOST_WEBHOOK_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
+LOGSCOPE_WEBAPP_DB_PATH LOGSCOPE_WEBAPP_STATE_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACTIONS_ENABLED LOGSCOPE_LOG_LEVEL LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE LOGSCOPE_ALLOWED_ORIGINS LOGSCOPE_TRUSTED_HOSTS LOGSCOPE_AI_API_KEY LOGSCOPE_MATTERMOST_WEBHOOK_URL LOGSCOPE_ALERT_ALLOWED_HOSTS AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY
 {{- end -}}
 
 {{- define "logscope.validate" -}}
@@ -168,6 +168,9 @@ LOGSCOPE_WEBAPP_DB_PATH LOGSCOPE_WEBAPP_STATE_DB_PATH SQLITE_TMPDIR LOGSCOPE_ACT
 {{- if not $buckets }}{{ fail "logscope.severity.buckets must define at least one bucket" }}{{ end -}}
 {{- if .Values.logscope.falco.enabled -}}
 {{- $_ := required "logscope.falco.namespace is required when logscope.falco.enabled" .Values.logscope.falco.namespace -}}
+{{- if and (hasKey .Values.logscope.falco "containers") (not (and (kindIs "slice" .Values.logscope.falco.containers) .Values.logscope.falco.containers)) -}}
+{{- fail "logscope.falco.containers must be a non-empty list of container names" -}}
+{{- end -}}
 {{- range (list "emergency" "alert" "critical" "error" "warning" "notice" "informational" "debug") -}}
 {{- $dest := get $.Values.logscope.falco.priority_map . -}}
 {{- if not $dest }}{{ fail (printf "logscope.falco.priority_map is missing Falco priority %q (all 8 are required)" .) }}{{ end -}}

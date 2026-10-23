@@ -21,7 +21,6 @@ const FILTER_EXCLUDES = [
 ];
 
 const state = {
-  filters: { scope: '', namespace: '', pod: '', container: '', severity_bucket: '', q: '', start: '', end: '' },
   facets: {},
   // Values left out per filter field (Alt/Shift-click in the field sidebar).
   exclude: { scope: [], namespace: [], pod: [], container: [], severity_bucket: [] },
@@ -63,6 +62,9 @@ const state = {
   expandedGroups: new Set(),
   groupByRule: false,
   aiConfigured: false,
+  // Feature flags from /api/status (ai_features); a feature turned off in
+  // Settings hides its buttons.
+  aiFeatures: {},
   // Server capability from /api/status; the server enforces it (403) regardless.
   actionsEnabled: false,
   explainCooldownUntil: 0,
@@ -138,13 +140,15 @@ function dashboardContextText() {
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
-const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'pipeline'];
+const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'alerts', 'pipeline', 'settings'];
 const TAB_IDS = {
   dashboard: ['tabDashboard', 'panelDashboard'],
   logs: ['tabLogs', 'panelLogs'],
   insights: ['tabInsights', 'panelInsights'],
   actionable: ['tabActionable', 'panelActionable'],
+  alerts: ['tabAlerts', 'panelAlerts'],
   pipeline: ['tabPipeline', 'panelPipeline'],
+  settings: ['tabSettings', 'panelSettings'],
 };
 
 // history: 'push' for a user navigation, 'replace' to update the current
@@ -174,6 +178,8 @@ function switchTab(name, { history = 'push' } = {}) {
     updateActionableSourceOptions();
     renderActionableWorkspace();
   }
+  if (name === 'settings') openSettings();
+  if (name === 'alerts') loadAlerts();
   if (name === 'pipeline') {
     startPipelinePolling();
   } else {
@@ -268,6 +274,12 @@ function excludeParams() {
   return out;
 }
 
+// "raw" (FTS syntax) only while there is a search; phrase is the default
+// and is left out of the API and the URL.
+function currentQmode() {
+  return el('qmodeRaw').checked && el('q').value.trim() ? 'raw' : '';
+}
+
 function queryFromFilters(extra = {}) {
   const range = currentRange();
   const current = {
@@ -277,6 +289,7 @@ function queryFromFilters(extra = {}) {
     container: el('container').value,
     severity_bucket: el('severity_bucket').value,
     q: el('q').value.trim(),
+    qmode: currentQmode(),
     start: range.start,
     // Exclusive end: the API's "before" (entries strictly earlier).
     before: range.before,
@@ -481,8 +494,8 @@ async function drillDownFromDashboard(action, value, severity = '') {
     el('scope').value = 'security';
   } else if (action === 'search') {
     el('q').value = value;
+    el('qmodeRaw').checked = false;
   }
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   // One history entry for the whole drilldown (tab + filters + range).
@@ -656,7 +669,7 @@ function rowMarkup(item) {
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
   messageButton.title = 'Click row to expand full details';
-  if (state.aiConfigured) {
+  if (aiFeatureOn('explain_line')) {
     const explainBlock = lineExplainMarkup(String(item.id), item);
     node.appendChild(explainBlock);
   }
@@ -675,6 +688,121 @@ function addDetailBlock(wrap, label, text) {
   block.appendChild(labelNode);
   block.appendChild(pre);
   wrap.appendChild(block);
+}
+
+// ─── Explanation source, age, feedback ──────────────────────────────────────
+
+function formatAge(seconds) {
+  const s = Number(seconds);
+  if (!Number.isFinite(s) || s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
+
+function ageFrom(meta) {
+  if (Number.isFinite(Number(meta.age_secs)) && meta.source === 'cache') return Number(meta.age_secs);
+  const t = Date.parse(meta.generated_at || '');
+  return Number.isFinite(t) ? Math.max(0, (Date.now() - t) / 1000) : null;
+}
+
+function sourceLabel(meta) {
+  if (meta.source === 'signature') return 'Signature';
+  if (meta.source === 'cache') return meta.tier === 'deep' ? 'Cache · deep' : 'Cache';
+  if (meta.source === 'ai') return meta.tier === 'deep' ? 'AI deep' : 'AI fast';
+  return '';
+}
+
+// Badge (signature | cache | AI fast | AI deep) with its age, plus the
+// follow-up actions: Ask AI anyway / Regenerate / Deep analysis / 👍 👎.
+// rerun(options) repeats the request with {tier, regenerate, skip_signature}.
+function explainMetaNode(meta, rerun) {
+  const bar = document.createElement('div');
+  bar.className = 'explain-meta';
+  const label = sourceLabel(meta || {});
+  if (!label) return bar;
+  const badge = document.createElement('span');
+  badge.className = `source-badge source-${meta.source}${meta.tier === 'deep' ? ' source-deep' : ''}`;
+  const age = ageFrom(meta);
+  badge.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
+  if (meta.signature && meta.signature.title) badge.title = `Known pattern: ${meta.signature.title} (no AI call)`;
+  else if (meta.source === 'cache') badge.title = 'Answer reused for the same log pattern (no AI call)';
+  bar.appendChild(badge);
+  const button = (text, title, onClick) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'ghost explain-meta-btn';
+    b.textContent = text;
+    b.title = title;
+    b.addEventListener('click', (ev) => { ev.stopPropagation(); onClick(b); });
+    bar.appendChild(b);
+    return b;
+  };
+  if (meta.source === 'signature') {
+    button('Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
+      () => rerun({ skip_signature: true }));
+  } else {
+    button('Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
+  }
+  if (meta.tier !== 'deep') {
+    button('Deep analysis', 'Ask the deep model (separate cache and daily budget)',
+      () => rerun({ tier: 'deep', skip_signature: true }));
+  }
+  if (meta.cache_key && meta.source !== 'signature') {
+    const note = document.createElement('span');
+    note.className = 'subtle explain-feedback-note';
+    // One vote per answer and browser session; voting again changes it.
+    const vote = async (value, btns) => {
+      btns.forEach((b, i) => b.setAttribute('aria-pressed', String((i === 0) === (value === 'up'))));
+      try {
+        await fetchJson('/api/ai/feedback', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Logscope-Client': feedbackClientId() },
+          body: JSON.stringify({ key: meta.cache_key, vote: value }),
+        });
+        note.textContent = value === 'down' ? 'Thanks — answers with 2 or more net 👎 are replaced.' : 'Thanks.';
+      } catch (err) {
+        note.textContent = `Feedback not saved: ${err.message}`;
+      }
+    };
+    const up = button('👍', 'Helpful', () => vote('up', [up, down]));
+    const down = button('👎', 'Not helpful: drop this cached answer', () => vote('down', [up, down]));
+    up.setAttribute('aria-label', 'Helpful');
+    down.setAttribute('aria-label', 'Not helpful');
+    bar.appendChild(note);
+  }
+  return bar;
+}
+
+// Random id for this browser session (sessionStorage): the server keeps one
+// 👍/👎 per cached answer and client id.
+function feedbackClientId() {
+  const key = 'logscope.feedback.clientId';
+  try {
+    let id = window.sessionStorage.getItem(key);
+    if (!id) {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      id = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+      window.sessionStorage.setItem(key, id);
+    }
+    return id;
+  } catch (_) {
+    if (!state.feedbackClientId) {
+      const bytes = new Uint8Array(16);
+      window.crypto.getRandomValues(bytes);
+      state.feedbackClientId = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+    return state.feedbackClientId;
+  }
+}
+
+function explainOptionsQuery(options = {}) {
+  const out = {};
+  if (options.tier === 'deep') out.tier = 'deep';
+  if (options.regenerate) out.regenerate = '1';
+  if (options.skip_signature) out.skip_signature = '1';
+  return out;
 }
 
 // ─── Per-line "Explain this log" ─────────────────────────────────────────────
@@ -700,6 +828,7 @@ function lineExplainMarkup(rowId, item) {
   if (lineState.status === 'done') {
     const result = document.createElement('div');
     result.className = 'line-explain-result';
+    result.appendChild(explainMetaNode(lineState.rawResult || {}, (options) => explainLine(rowId, item, options)));
     const summary = document.createElement('div');
     summary.className = 'line-explain-summary';
     summary.textContent = lineState.summary;
@@ -734,15 +863,15 @@ function lineExplainMarkup(rowId, item) {
   return box;
 }
 
-async function explainLine(rowId, item) {
-  if (!state.aiConfigured) return;
+async function explainLine(rowId, item, options = {}) {
+  if (!aiFeatureOn('explain_line')) return;
   state.lineExplainState.set(rowId, { status: 'loading' });
   renderAll();
   try {
     const result = await fetchJson('/api/explain-line', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: item.id }),
+      body: JSON.stringify({ id: item.id, ...explainOptionsQuery(options) }),
     });
     if (result.error) {
       state.lineExplainState.set(rowId, { status: 'error', error: result.error });
@@ -1120,14 +1249,31 @@ function renderAnomalies() {
 
     const summaryEl = node.querySelector('.anomaly-summary-text');
     const actionEl = node.querySelector('.anomaly-action-text');
+    // Free template summary until (or instead of) an AI summary.
+    const templateSummary = anomaly.template_summary || {};
+    const sourceEl = node.querySelector('.anomaly-source');
+    const meta = anomaly.ai_meta || null;
     if (anomaly.ai_summary) {
       summaryEl.textContent = anomaly.ai_summary;
+      const label = meta ? sourceLabel(meta) : 'AI';
+      if (label) {
+        const age = meta ? ageFrom(meta) : null;
+        sourceEl.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
+        sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
+        sourceEl.hidden = false;
+      }
     } else {
-      summaryEl.textContent = 'Awaiting AI summary…';
+      summaryEl.textContent = templateSummary.headline || 'No summary yet.';
       summaryEl.classList.add('muted');
+      sourceEl.textContent = 'Template';
+      sourceEl.className = 'anomaly-source source-badge source-template';
+      sourceEl.title = 'Computed from the detection counts and log templates (no AI call)';
+      sourceEl.hidden = false;
     }
     if (anomaly.ai_suggested_action) {
       actionEl.textContent = `→ ${anomaly.ai_suggested_action}`;
+    } else if (!anomaly.ai_summary && templateSummary.signature) {
+      actionEl.textContent = `Known pattern: ${templateSummary.signature.title}`;
     } else {
       actionEl.hidden = true;
     }
@@ -1142,6 +1288,24 @@ function renderAnomalies() {
       ? formatTimestamp(anomaly.detected_at)
       : '—';
 
+    const btnSummarize = node.querySelector('.anomaly-btn-summarize');
+    const btnDeep = node.querySelector('.anomaly-btn-deep');
+    if (aiFeatureOn('anomaly_manual_summary')) {
+      const fromSignature = meta && meta.source === 'signature';
+      btnSummarize.hidden = false;
+      btnDeep.hidden = false;
+      if (fromSignature) btnSummarize.textContent = '✦ Ask AI anyway';
+      else if (anomaly.ai_summary) btnSummarize.textContent = '✦ Regenerate';
+      btnSummarize.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        summarizeAnomaly(anomaly, btnSummarize, fromSignature ? { skip_signature: true }
+          : anomaly.ai_summary ? { regenerate: true, skip_signature: true } : {});
+      });
+      btnDeep.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        summarizeAnomaly(anomaly, btnDeep, { tier: 'deep', skip_signature: true });
+      });
+    }
     const btnTroubleshoot = node.querySelector('.anomaly-btn-troubleshoot');
     const btnReviewed = node.querySelector('.anomaly-btn-reviewed');
     const btnDismissed = node.querySelector('.anomaly-btn-dismissed');
@@ -1201,6 +1365,19 @@ function renderAnomalies() {
 function fillAnomalyDetail(container, anomaly) {
   container.innerHTML = '';
   const evidence = anomaly.evidence || {};
+  if (anomaly.evidence_error) addDetailBlock(container, 'Evidence unavailable', anomaly.evidence_error);
+  const ts = anomaly.template_summary;
+  if (ts) {
+    const lines = [ts.headline];
+    const c = ts.counts || {};
+    if (c.current !== undefined && c.current !== null) {
+      lines.push(`Count ${c.current}${c.expected !== null && c.expected !== undefined ? ` · expected ${c.expected}` : ''}`
+        + `${c.ratio ? ` · ${c.ratio}× baseline` : ''}${c.baseline_avg_per_hour !== null && c.baseline_avg_per_hour !== undefined ? ` · baseline ${c.baseline_avg_per_hour}/h` : ''}`);
+    }
+    for (const t of ts.templates || []) lines.push(`${t.count}× ${t.template}`);
+    if (ts.signature) lines.push('', `Known pattern: ${ts.signature.title}`, ts.signature.explanation);
+    addDetailBlock(container, 'Template summary (no AI)', lines.join('\n'));
+  }
 
   const msgs = evidence.sample_messages;
   if (msgs && msgs.length) {
@@ -1253,8 +1430,8 @@ function openAnomalyLogs(anomaly) {
     : anomaly.type === 'severity_shift' ? (anomaly.severity || '') : '';
   setSelectValue(el('severity_bucket'), severity);
   el('q').value = '';
+  el('qmodeRaw').checked = false;
   if (windowRange) setExactRange(windowRange.start, windowRange.before);
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   switchTab('logs', { history: null });
@@ -1369,9 +1546,10 @@ async function focusAnomaly(id, { openInActionable = false } = {}) {
 
 function updateExplainButton() {
   const btn = el('explainBtn');
+  btn.hidden = state.aiFeatures.explain_filtered === false;
   if (!state.aiConfigured) {
     btn.disabled = true;
-    btn.title = 'AI provider not configured — set ai.provider in config.yaml';
+    btn.title = 'AI provider not configured — set it in the Settings tab or config.yaml';
     return;
   }
   const coolingDown = Date.now() < state.explainCooldownUntil;
@@ -1392,10 +1570,11 @@ function startExplainCooldown() {
   }, EXPLAIN_COOLDOWN_MS + 50);
 }
 
-async function runExplain() {
-  if (!state.aiConfigured) return;
+async function runExplain(options = {}) {
+  if (!aiFeatureOn('explain_filtered')) return;
   if (Date.now() < state.explainCooldownUntil) return;
   startExplainCooldown();
+  el('explainMeta').replaceChildren();
 
   const panel = el('explainPanel');
   const summaryEl = el('explainSummary');
@@ -1409,7 +1588,7 @@ async function runExplain() {
   cachedBadge.hidden = true;
 
   try {
-    const params = new URLSearchParams(queryFromFilters());
+    const params = new URLSearchParams({ ...queryFromFilters(), ...explainOptionsQuery(options) });
     const result = await fetchJson(`/api/explain?${params.toString()}`, { method: 'POST' });
     summaryEl.classList.remove('thinking');
     if (result.error) {
@@ -1422,9 +1601,10 @@ async function runExplain() {
         actionEl.textContent = `→ ${result.suggested_action}`;
         actionEl.hidden = false;
       }
-      if (result.cached) {
-        cachedBadge.hidden = false;
-      }
+      el('explainMeta').replaceChildren(explainMetaNode(result, (opts) => {
+        state.explainCooldownUntil = 0;
+        runExplain(opts).catch(() => {});
+      }));
       setPlanFromExplainResult(result, 'logs');
     }
   } catch (err) {
@@ -1444,6 +1624,7 @@ el('explainDismiss').addEventListener('click', () => {
   el('explainSummary').classList.remove('explain-error', 'thinking');
   el('explainAction').hidden = true;
   el('explainCachedBadge').hidden = true;
+  el('explainMeta').replaceChildren();
 });
 
 // ─── Actionable Troubleshooting Workspace ────────────────────────────────────
@@ -2453,10 +2634,6 @@ async function pollTail() {
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
 }
 
-function syncFiltersFromUi() {
-  state.filters = queryFromFilters();
-}
-
 function startTailPolling() {
   stopTailPolling();
   state.tailRequestId += 1;
@@ -2927,6 +3104,10 @@ function renderInsightsCard(status) {
     }
   }
   if (ins.last_error) kvBlock(card, `Last detection error${ins.last_error_at ? ` (${describeAge(ins.last_error_at)})` : ''}`, ins.last_error, 'error');
+  for (const warning of status.ai_warnings || []) {
+    kvBlock(card, 'AI', warning, 'warn');
+    tone = worstTone(tone, 'warn');
+  }
   if (ins.last_ai_error) {
     kvBlock(card, `Last AI summary error${ins.last_ai_error_at ? ` (${describeAge(ins.last_ai_error_at)})` : ''}`, ins.last_ai_error, 'warn');
     tone = worstTone(tone, 'warn');
@@ -3080,6 +3261,8 @@ async function refreshStatus() {
     const status = await fetchJson('/api/status');
     if (requestId !== state.pipeline.requestId) return status;
     state.lastStatus = status;
+    applyAiStatus(status);
+    updateAlertsBadge(status);
     state.pipeline.fetchedAt = Date.now();
     state.pipeline.error = '';
     updateHealthFromStatus(status);
@@ -3135,8 +3318,9 @@ el('refreshPipeline').addEventListener('click', () => {
 // drilldowns, opening context) add a history entry; refinements (context
 // size, expanding an anomaly) replace the current one.
 //
-//   tab     dashboard | insights | actionable | pipeline   (logs when absent)
+//   tab     dashboard | insights | actionable | alerts | pipeline   (logs when absent)
 //   scope, ns, pod, ctr, sev, q                             filters
+//   qmode   raw: q is full-text query syntax (phrase when absent)
 //   xscope, xns, xpod, xctr, xsev   values left out, comma-separated
 //   range   1h | 6h | 24h | 7d | all   (today when absent; relative to "now")
 //   from, to   ISO-8601 UTC, [from, to) — an exact range (either may be absent)
@@ -3186,7 +3370,7 @@ function parseUrlState(search) {
   } catch (_) {
     params = new URLSearchParams();
   }
-  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
+  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
   const tab = params.get('tab');
   if (TABS.includes(tab)) out.tab = tab;
   for (const [key, field, max] of URL_FILTERS) {
@@ -3200,6 +3384,7 @@ function parseUrlState(search) {
     out.exclude[field] = Array.from(new Set(kept)).slice(0, FIELD_EXCLUDE_MAX);
   }
   out.q = cleanParam(params.get('q'), 500);
+  if (out.q && params.get('qmode') === 'raw') out.qmode = 'raw';
   const range = params.get('range');
   if (URL_RANGES.includes(range)) out.range = range;
   out.from = cleanTime(params.get('from'));
@@ -3228,6 +3413,7 @@ function buildUrlParams() {
   }
   const q = el('q').value.trim();
   if (q) params.set('q', q);
+  if (currentQmode()) params.set('qmode', currentQmode());
   const preset = el('rangePreset').value;
   if (!state.rangeExact && URL_RANGES.includes(preset)) {
     if (preset !== 'today') params.set('range', preset);
@@ -3306,6 +3492,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [...(parsed.exclude[field] || [])];
     forgetHistogramZoom();
     el('q').value = parsed.q || '';
+    el('qmodeRaw').checked = parsed.qmode === 'raw';
     if (parsed.from || parsed.to) {
       setExactRange(parsed.from, parsed.to);
     } else {
@@ -3316,7 +3503,6 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     state.context.lines = parsed.ctx;
     state.context.limitToRange = !parsed.ctxAll;
     state.focusAnomalyId = parsed.anomaly;
-    syncFiltersFromUi();
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });
@@ -3465,6 +3651,7 @@ function renderViewsMenu() {
       <button type="button" class="view-item-btn${view.pinned ? ' pinned' : ''}" data-view-action="pin" aria-pressed="${view.pinned ? 'true' : 'false'}" title="${pinLabel}" aria-label="${pinLabel}: ${name}">${view.pinned ? '★' : '☆'}</button>
       <button type="button" class="view-item-btn" data-view-action="up" title="Move up" aria-label="Move ${name} up"${canUp ? '' : ' disabled'}>↑</button>
       <button type="button" class="view-item-btn" data-view-action="down" title="Move down" aria-label="Move ${name} down"${canDown ? '' : ' disabled'}>↓</button>
+      <button type="button" class="view-item-btn" data-view-action="alert" title="Create an alert on this view" aria-label="Create an alert on ${name}">🔔</button>
       <button type="button" class="view-item-btn" data-view-action="edit" title="Rename or edit" aria-label="Rename ${name}">✎</button>
       <button type="button" class="view-item-btn" data-view-action="delete" title="Delete" aria-label="Delete ${name}">✕</button>
     </div>`;
@@ -3679,6 +3866,9 @@ el('viewsList').addEventListener('click', (event) => {
     runViewChange(() => viewRequest('PATCH', `/api/views/${id}`, { pinned: !view.pinned }));
   } else if (action === 'up' || action === 'down') {
     moveView(view, action === 'up' ? -1 : 1);
+  } else if (action === 'alert') {
+    setViewsMenuOpen(false);
+    openAlertForm({ viewId: view.id });
   } else if (action === 'edit') {
     openSaveViewDialog('edit', view);
   } else if (action === 'delete') {
@@ -3754,6 +3944,1214 @@ el('pinnedViewsCards').addEventListener('click', (event) => {
   }
 });
 
+// ─── Alerts ──────────────────────────────────────────────────────────────────
+// Rules on saved views (/api/alerts/...). Reads are open; creating, editing
+// and deleting rules or channels needs the admin token (the Settings tab's,
+// kept in sessionStorage); muting does not, so on-call can silence a rule.
+
+const ALERT_STATE_LABELS = { ok: 'ok', pending: 'pending', firing: 'firing', unknown: 'unknown', resolved: 'resolved', disabled: 'disabled' };
+const ALERT_METRIC_LABELS = { count: 'entries', error_count: 'error entries', distinct_pods: 'distinct pods' };
+const alertsState = {
+  rules: [], channels: [], watermark: null, loaded: false, loading: false, error: '',
+  expanded: new Set(), history: new Map(), editingId: null, backtestTimer: null, backtestId: 0, requestId: 0,
+};
+
+function updateAlertsBadge(status) {
+  const firing = Number(status?.alerts?.firing || 0);
+  const badge = el('alertsBadge');
+  badge.hidden = !(firing > 0);
+  badge.textContent = firing > 0 ? String(firing) : '';
+  badge.title = firing > 0 ? `${firing} alert rule${firing === 1 ? '' : 's'} firing` : '';
+}
+
+// fetch for /api/alerts; admin requests carry the Settings admin token.
+async function alertsRequest(url, { method = 'GET', body, admin = false } = {}) {
+  const headers = {};
+  if (admin) headers.Authorization = `Bearer ${settingsToken()}`;
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (err) {
+    throw new Error(`Network error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) throw new SettingsAuthError(data.error || 'A valid admin token is required');
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`);
+    err.field = data.field;
+    throw err;
+  }
+  return data;
+}
+
+async function loadAlerts() {
+  const requestId = ++alertsState.requestId;
+  alertsState.loading = true;
+  try {
+    const [rules, channels] = await Promise.all([
+      alertsRequest('/api/alerts/rules'), alertsRequest('/api/alerts/channels'),
+    ]);
+    if (requestId !== alertsState.requestId) return;
+    alertsState.rules = Array.isArray(rules.rules) ? rules.rules : [];
+    alertsState.watermark = rules.watermark || null;
+    alertsState.channels = Array.isArray(channels.channels) ? channels.channels : [];
+    alertsState.loaded = true;
+    alertsState.error = '';
+    updateAlertsBadge({ alerts: { firing: rules.firing } });
+  } catch (err) {
+    if (requestId === alertsState.requestId) alertsState.error = `Could not load alerts: ${err.message}`;
+  } finally {
+    if (requestId === alertsState.requestId) alertsState.loading = false;
+  }
+  if (!state.views.loaded) await loadViews();
+  renderAlerts();
+}
+
+function alertMinutes(seconds) {
+  const minutes = Number(seconds) / 60;
+  return minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60}h` : `${minutes}m`;
+}
+
+function alertConditionText(rule) {
+  const metric = ALERT_METRIC_LABELS[rule.metric] || rule.metric;
+  const per = rule.group_by !== 'none' ? ` per ${rule.group_by}` : '';
+  const times = Number(rule.for_evals) > 1 ? `, ${rule.for_evals}× in a row` : '';
+  return `${metric}${per} ${rule.op} ${rule.threshold} over ${alertMinutes(rule.window_s)} (every ${alertMinutes(rule.interval_s)}${times})`;
+}
+
+// Small bar sparkline (inline SVG) of the latest evaluations.
+function alertSparkMarkup(values, threshold) {
+  const points = (Array.isArray(values) ? values : []).map(Number).filter(Number.isFinite);
+  if (!points.length) return '<span class="alert-spark-empty">—</span>';
+  const max = Math.max(...points, Number(threshold) || 0, 1);
+  const width = 3;
+  const gap = 1;
+  const height = 18;
+  const bars = points.map((value, i) => {
+    const h = Math.max(1, Math.round((value / max) * height));
+    return `<rect x="${i * (width + gap)}" y="${height - h}" width="${width}" height="${h}"></rect>`;
+  }).join('');
+  const t = Number(threshold);
+  const line = Number.isFinite(t) && t > 0
+    ? `<line x1="0" x2="${points.length * (width + gap)}" y1="${height - Math.round((t / max) * height)}" y2="${height - Math.round((t / max) * height)}"></line>` : '';
+  return `<svg class="alert-spark" width="${points.length * (width + gap)}" height="${height}" viewBox="0 0 ${points.length * (width + gap)} ${height}" aria-hidden="true">${bars}${line}</svg>`;
+}
+
+function alertBadgeMarkup(status) {
+  const stateName = ALERT_STATE_LABELS[status?.state] || 'unknown';
+  const badges = [`<span class="alert-badge alert-badge-${escapeHtml(stateName)}">${escapeHtml(stateName)}</span>`];
+  if (status?.muted) badges.push('<span class="alert-badge alert-badge-muted">muted</span>');
+  return badges.join(' ');
+}
+
+function alertWatermarkText(mark) {
+  if (!mark) return 'Rules on saved views, evaluated up to the ingest watermark.';
+  if (!mark.at) return 'Waiting for the first complete S3 poll: rules report unknown until then.';
+  const lag = Number(mark.lag_secs);
+  const text = `Data complete up to ${formatTimestamp(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
+  return mark.stale ? `${text} The pipeline is stale: absence rules (<, <=) report unknown.` : text;
+}
+
+function renderAlerts() {
+  el('alertsSubtitle').textContent = alertWatermarkText(alertsState.watermark);
+  const errorBox = el('alertsError');
+  errorBox.hidden = !alertsState.error;
+  errorBox.textContent = alertsState.error;
+  const list = el('alertsList');
+  if (!alertsState.rules.length) {
+    list.innerHTML = `<div class="empty-state">${escapeHtml(alertsState.loaded
+      ? 'No alert rules yet. Save a view, then “Create alert” here or from the Views menu (🔔).'
+      : 'Loading…')}</div>`;
+    return;
+  }
+  const viewNames = new Map(state.views.list.map((view) => [view.id, view.name]));
+  list.innerHTML = alertsState.rules.map((rule) => {
+    const id = Number(rule.id);
+    const status = rule.status || {};
+    const lastValue = status.last_value === null || status.last_value === undefined ? '—' : String(status.last_value);
+    const viewName = rule.view_id === null ? '(no view)' : viewNames.get(rule.view_id) || `view #${Number(rule.view_id)}`;
+    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatTimestamp(rule.mute_until)}` : '';
+    const notes = [];
+    if (rule.disabled_reason) notes.push(rule.disabled_reason);
+    if (status.unknown_reason) notes.push(`Unknown: ${status.unknown_reason}`);
+    if (status.overflow) notes.push(`${status.overflow} more groups than max_groups were not evaluated`);
+    const groups = (status.groups || []).filter((g) => g.group && g.state !== 'ok').slice(0, 10);
+    const expanded = alertsState.expanded.has(id);
+    return `<div class="alert-rule" data-alert-id="${id}">
+      <div class="alert-rule-main">
+        <div class="alert-rule-title">${alertBadgeMarkup(status)} <span class="alert-rule-name">${escapeHtml(rule.name)}</span></div>
+        <div class="alert-rule-meta">${escapeHtml(viewName)} · ${escapeHtml(alertConditionText(rule))} · urgency ${escapeHtml(rule.urgency)}${escapeHtml(muteText)}</div>
+        ${notes.length ? `<div class="alert-rule-note">${notes.map(escapeHtml).join(' · ')}</div>` : ''}
+        ${groups.length ? `<div class="alert-groups">${groups.map((g) => `<span class="chip alert-group alert-group-${escapeHtml(g.state)}">${escapeHtml(g.group)}: ${escapeHtml(String(g.value ?? '—'))}</span>`).join('')}</div>` : ''}
+      </div>
+      <div class="alert-rule-value" title="Latest value">${escapeHtml(lastValue)}</div>
+      <div class="alert-rule-spark" title="Latest evaluations">${alertSparkMarkup(status.spark, rule.threshold)}</div>
+      <div class="alert-rule-actions">
+        ${status.muted
+          ? '<button type="button" class="ghost" data-alert-action="unmute">Unmute</button>'
+          : `<details class="alert-mute"><summary class="ghost-like">Mute</summary>
+              <div class="alert-mute-menu">
+                <button type="button" data-alert-action="mute" data-mute="1h">1 hour</button>
+                <button type="button" data-alert-action="mute" data-mute="4h">4 hours</button>
+                <button type="button" data-alert-action="mute" data-mute="24h">24 hours</button>
+                <span class="alert-inline"><input type="number" min="1" max="720" step="1" placeholder="hours" aria-label="Custom mute in hours" data-mute-hours />
+                <button type="button" data-alert-action="mute" data-mute="custom">Mute</button></span>
+              </div></details>`}
+        <button type="button" class="ghost" data-alert-action="history" aria-expanded="${expanded ? 'true' : 'false'}">History</button>
+        <button type="button" class="ghost" data-alert-action="edit">Edit</button>
+        <button type="button" class="ghost" data-alert-action="delete">Delete</button>
+      </div>
+      ${expanded ? `<div class="alert-history">${alertHistoryMarkup(alertsState.history.get(id))}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+function alertHistoryMarkup(history) {
+  if (!history) return '<div class="subtle">Loading…</div>';
+  if (history.error) return `<div class="views-error">${escapeHtml(history.error)}</div>`;
+  if (!history.items.length) return '<div class="subtle">No state changes recorded yet (kept 30 days).</div>';
+  const rows = history.items.map((e) => `<tr>
+      <td>${escapeHtml(formatTimestamp(e.ts))}</td>
+      <td>${escapeHtml(e.group_key || '—')}</td>
+      <td>${escapeHtml(e.from_state || '—')} → <b>${escapeHtml(e.state)}</b>${e.muted ? ' (muted)' : ''}</td>
+      <td>${escapeHtml(e.value === null || e.value === undefined ? '—' : String(e.value))}</td>
+      <td>${alertDeliveryMarkup(e)}${e.detail ? ` <span class="subtle">${escapeHtml(e.detail)}</span>` : ''}</td>
+    </tr>`).join('');
+  return `<table class="alert-history-table"><thead><tr><th>When</th><th>Group</th><th>State</th><th>Value</th><th>Notification</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// Delivery status of one history row: sent, queued / retrying (with the next
+// attempt), failed_final, superseded; "Retry now" (admin) when retryable.
+const ALERT_DELIVERY_LABELS = {
+  no: '—', sent: 'sent', queued: 'queued', retrying: 'retrying', failed: 'failed',
+  failed_final: 'failed (gave up)', superseded: 'superseded',
+};
+
+function alertDeliveryMarkup(e) {
+  const label = ALERT_DELIVERY_LABELS[e.notified] || String(e.notified || '—');
+  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(e.notified || 'no')}">${escapeHtml(label)}</span>`];
+  const attempts = Number(e.attempts || 0);
+  if (attempts > 1 || (attempts && e.notified !== 'sent')) parts.push(`<span class="subtle">${attempts} attempt${attempts === 1 ? '' : 's'}</span>`);
+  if ((e.notified === 'retrying' || e.notified === 'queued') && e.next_attempt_at) {
+    parts.push(`<span class="subtle">next ${escapeHtml(formatTimestamp(e.next_attempt_at))}</span>`);
+  }
+  if (e.error) parts.push(`<span class="alert-error-text">${escapeHtml(e.error)}</span>`);
+  if (e.retryable) parts.push(`<button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`);
+  return parts.join(' ');
+}
+
+async function loadAlertHistory(id) {
+  try {
+    const data = await alertsRequest(`/api/alerts/events?rule=${encodeURIComponent(id)}&limit=25`);
+    alertsState.history.set(id, { items: Array.isArray(data.items) ? data.items : [] });
+  } catch (err) {
+    alertsState.history.set(id, { error: err.message, items: [] });
+  }
+  renderAlerts();
+}
+
+async function alertAction(rule, action, button) {
+  const id = Number(rule.id);
+  try {
+    if (action === 'mute') {
+      let duration = button.dataset.mute;
+      if (duration === 'custom') {
+        const hours = Number(button.closest('.alert-mute-menu')?.querySelector('[data-mute-hours]')?.value);
+        if (!Number.isFinite(hours) || hours <= 0 || hours > 720) throw new Error('Enter 1 to 720 hours');
+        duration = Math.round(hours * 3600);
+      }
+      await alertsRequest(`/api/alerts/rules/${id}/mute`, { method: 'POST', body: { duration } });
+    } else if (action === 'unmute') {
+      await alertsRequest(`/api/alerts/rules/${id}/mute`, { method: 'DELETE' });
+    } else if (action === 'history') {
+      if (alertsState.expanded.has(id)) {
+        alertsState.expanded.delete(id);
+        renderAlerts();
+      } else {
+        alertsState.expanded.add(id);
+        renderAlerts();
+        await loadAlertHistory(id);
+      }
+      return;
+    } else if (action === 'edit') {
+      openAlertForm({ rule });
+      return;
+    } else if (action === 'delete') {
+      if (!window.confirm(`Delete the alert rule “${rule.name}” and its history?`)) return;
+      await alertsRequest(`/api/alerts/rules/${id}`, { method: 'DELETE', admin: true });
+    } else if (action === 'retry') {
+      const eventId = Number(button.dataset.eventId);
+      if (!Number.isInteger(eventId)) return;
+      button.disabled = true;
+      await alertsRequest(`/api/alerts/events/${eventId}/retry`, { method: 'POST', admin: true });
+      // The delivery thread picks it up right away; show the outcome shortly.
+      await loadAlertHistory(id);
+      window.setTimeout(() => { if (alertsState.expanded.has(id)) loadAlertHistory(id); }, 3000);
+      return;
+    }
+    await loadAlerts();
+  } catch (err) {
+    alertsState.error = err instanceof SettingsAuthError
+      ? `${action === 'retry' ? 'Retrying' : 'Deleting'} needs the admin token: unlock the Settings tab first.`
+      : `${err.message}`;
+    renderAlerts();
+  }
+}
+
+// ── Rule form with a live backtest ──
+
+function renderAlertChannels(selected) {
+  const box = el('alertChannelList');
+  if (!alertsState.channels.length) {
+    box.innerHTML = '<div class="subtle">No channels yet: add one under Channels. Events are still recorded.</div>';
+    return;
+  }
+  box.innerHTML = alertsState.channels.map((channel) => {
+    const id = Number(channel.id);
+    const checked = selected.includes(id) ? ' checked' : '';
+    return `<label class="toggle"><input type="checkbox" data-alert-channel="${id}"${checked} /> ${escapeHtml(channel.name)} <span class="subtle">(${escapeHtml(channel.type)}${channel.read_only ? ', environment' : ''})</span></label>`;
+  }).join('');
+}
+
+async function openAlertForm({ viewId = null, rule = null } = {}) {
+  if (!state.views.loaded) await loadViews();
+  if (!alertsState.loaded) await loadAlerts();
+  alertsState.editingId = rule ? Number(rule.id) : null;
+  el('alertFormTitle').textContent = rule ? 'Edit alert' : 'Create alert';
+  const select = el('alertView');
+  select.innerHTML = state.views.list.map((view) => `<option value="${Number(view.id)}">${escapeHtml(view.name)}</option>`).join('');
+  const chosen = rule?.view_id ?? viewId ?? state.views.currentId ?? state.views.list[0]?.id ?? null;
+  if (chosen !== null) select.value = String(chosen);
+  const viewName = state.views.list.find((view) => view.id === Number(chosen))?.name || '';
+  el('alertName').value = rule?.name || (viewName ? `${viewName}: too many entries` : '');
+  el('alertMetric').value = rule?.metric || 'count';
+  el('alertOp').value = rule?.op || '>';
+  el('alertThreshold').value = rule ? String(rule.threshold) : '10';
+  el('alertWindow').value = String((rule?.window_s || 300) / 60);
+  el('alertInterval').value = String((rule?.interval_s || 60) / 60);
+  el('alertFor').value = String(rule?.for_evals || 1);
+  el('alertGroupBy').value = rule?.group_by || 'none';
+  el('alertUrgency').value = rule?.urgency || 'high';
+  el('alertRenotify').value = String(rule ? rule.renotify_s / 3600 : 6);
+  el('alertResolved').checked = rule ? Boolean(rule.notify_resolved) : true;
+  el('alertAi').checked = Boolean(rule?.ai_summary);
+  el('alertEnabled').checked = rule ? Boolean(rule.enabled) : true;
+  renderAlertChannels(rule?.channel_ids || []);
+  el('alertTokenField').hidden = Boolean(settingsToken());
+  el('alertToken').value = '';
+  el('alertFormError').hidden = true;
+  el('alertBacktest').textContent = state.views.list.length ? '' : 'Save a view first: alerts count what a saved view matches.';
+  el('alertModal').showModal();
+  el('alertName').focus();
+  scheduleAlertBacktest();
+}
+
+function alertFormBody() {
+  const minutes = (id) => Math.round(Number(el(id).value) * 60);
+  return {
+    name: el('alertName').value.trim(),
+    view_id: el('alertView').value ? Number(el('alertView').value) : null,
+    metric: el('alertMetric').value,
+    op: el('alertOp').value,
+    threshold: Number(el('alertThreshold').value),
+    window_s: minutes('alertWindow'),
+    interval_s: minutes('alertInterval'),
+    for_evals: Math.round(Number(el('alertFor').value)),
+    group_by: el('alertGroupBy').value,
+    urgency: el('alertUrgency').value,
+    renotify_s: Math.round(Number(el('alertRenotify').value) * 3600),
+    notify_resolved: el('alertResolved').checked,
+    ai_summary: el('alertAi').checked,
+    enabled: el('alertEnabled').checked,
+    channel_ids: Array.from(el('alertChannelList').querySelectorAll('[data-alert-channel]'))
+      .filter((box) => box.checked).map((box) => Number(box.dataset.alertChannel)),
+  };
+}
+
+function scheduleAlertBacktest() {
+  window.clearTimeout(alertsState.backtestTimer);
+  alertsState.backtestTimer = window.setTimeout(runAlertBacktest, 500);
+}
+
+async function runAlertBacktest() {
+  const body = alertFormBody();
+  if (body.view_id === null) return;
+  const requestId = ++alertsState.backtestId;
+  const box = el('alertBacktest');
+  box.textContent = 'Backtesting the last 7 days…';
+  try {
+    const result = await alertsRequest('/api/alerts/backtest', {
+      method: 'POST',
+      body: {
+        view_id: body.view_id, metric: body.metric, op: body.op, threshold: body.threshold,
+        window_s: body.window_s, interval_s: body.interval_s, for_evals: body.for_evals, range_s: 604800,
+      },
+    });
+    if (requestId !== alertsState.backtestId) return;
+    const fired = Number(result.fired || 0);
+    const series = (result.series || []).map((point) => Number(point.value));
+    const last = (result.fires || []).slice(-3).map((f) => formatTimestamp(f.at)).join(', ');
+    box.innerHTML = `<div><b>Would have fired ${escapeHtml(String(fired))} time${fired === 1 ? '' : 's'} in 7 days</b>${body.group_by !== 'none' ? ' (all groups together)' : ''}${result.approximate ? ' · approximate' : ''}</div>
+      ${last ? `<div class="subtle">Latest: ${escapeHtml(last)}</div>` : ''}
+      <div class="alert-backtest-spark">${alertSparkMarkup(series.slice(-200), body.threshold)}</div>`;
+  } catch (err) {
+    if (requestId !== alertsState.backtestId) return;
+    box.textContent = `Backtest unavailable: ${err.message}`;
+  }
+}
+
+async function submitAlertForm() {
+  const body = alertFormBody();
+  const errorBox = el('alertFormError');
+  errorBox.hidden = true;
+  const token = el('alertToken').value.trim();
+  if (token) setSettingsToken(token);
+  if (!body.name) {
+    errorBox.textContent = 'Enter a name.';
+    errorBox.hidden = false;
+    return;
+  }
+  const id = alertsState.editingId;
+  try {
+    await alertsRequest(id === null ? '/api/alerts/rules' : `/api/alerts/rules/${id}`, {
+      method: id === null ? 'POST' : 'PATCH', body, admin: true,
+    });
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      setSettingsToken('');
+      el('alertTokenField').hidden = false;
+      errorBox.textContent = 'Saving an alert needs the admin token (the same one as the Settings tab).';
+    } else {
+      errorBox.textContent = err.field ? `${err.field}: ${err.message}` : err.message;
+    }
+    errorBox.hidden = false;
+    return;
+  }
+  el('alertModal').close();
+  await loadAlerts();
+}
+
+// ── Channels (admin) ──
+
+function renderChannels() {
+  const list = el('channelsList');
+  if (!alertsState.channels.length) {
+    list.innerHTML = '<div class="subtle">No channels yet.</div>';
+    return;
+  }
+  list.innerHTML = alertsState.channels.map((channel) => {
+    const id = Number(channel.id);
+    const readOnly = Boolean(channel.read_only);
+    return `<div class="channel-row" data-channel-id="${id}">
+      <span class="channel-name">${escapeHtml(channel.name)}</span>
+      <span class="subtle">${escapeHtml(channel.type)} · ${escapeHtml(channel.url_hint || '')}${channel.has_secret ? ' · signed' : ''}${readOnly ? ' · from the environment, read-only' : ''}</span>
+      <span class="channel-actions">
+        <button type="button" class="ghost" data-channel-action="test">Test</button>
+        ${readOnly ? '' : '<button type="button" class="ghost" data-channel-action="delete">Delete</button>'}
+      </span>
+      <span class="channel-result" data-channel-result></span>
+    </div>`;
+  }).join('');
+}
+
+async function openChannels() {
+  if (!alertsState.loaded) await loadAlerts();
+  renderChannels();
+  el('channelTokenField').hidden = Boolean(settingsToken());
+  el('channelError').hidden = true;
+  el('channelsModal').showModal();
+}
+
+function channelAuthFailed() {
+  setSettingsToken('');
+  el('channelTokenField').hidden = false;
+  el('channelError').textContent = 'Channel changes need the admin token (the same one as the Settings tab).';
+  el('channelError').hidden = false;
+}
+
+async function addChannel() {
+  const token = el('channelToken').value.trim();
+  if (token) setSettingsToken(token);
+  const body = { name: el('channelName').value.trim(), type: el('channelType').value, url: el('channelUrl').value.trim() };
+  const secret = el('channelSecret').value;
+  if (secret) body.secret = secret;
+  el('channelError').hidden = true;
+  try {
+    await alertsRequest('/api/alerts/channels', { method: 'POST', body, admin: true });
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      channelAuthFailed();
+    } else {
+      el('channelError').textContent = err.field ? `${err.field}: ${err.message}` : err.message;
+      el('channelError').hidden = false;
+    }
+    return;
+  }
+  el('channelName').value = '';
+  el('channelUrl').value = '';
+  el('channelSecret').value = '';
+  await loadAlerts();
+  renderChannels();
+}
+
+el('alertsRefresh').addEventListener('click', () => loadAlerts());
+el('alertsCreateBtn').addEventListener('click', () => openAlertForm());
+el('alertsChannelsBtn').addEventListener('click', () => openChannels());
+el('alertsList').addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-alert-action]') : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const id = Number(button.closest('[data-alert-id]')?.dataset.alertId);
+  const rule = alertsState.rules.find((item) => Number(item.id) === id);
+  if (rule) alertAction(rule, button.dataset.alertAction, button);
+});
+el('alertForm').addEventListener('input', (event) => {
+  if (event.target instanceof HTMLElement && ['alertName', 'alertToken'].includes(event.target.id)) return;
+  scheduleAlertBacktest();
+});
+el('alertForm').addEventListener('change', () => scheduleAlertBacktest());
+el('alertForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  submitAlertForm();
+});
+el('alertCancel').addEventListener('click', () => el('alertModal').close());
+el('channelForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  addChannel();
+});
+el('channelsClose').addEventListener('click', () => el('channelsModal').close());
+el('channelsList').addEventListener('click', async (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-channel-action]') : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  const row = button.closest('[data-channel-id]');
+  const id = Number(row?.dataset.channelId);
+  const result = row?.querySelector('[data-channel-result]');
+  const token = el('channelToken').value.trim();
+  if (token) setSettingsToken(token);
+  try {
+    if (button.dataset.channelAction === 'test') {
+      if (result) result.textContent = 'Sending…';
+      const data = await alertsRequest(`/api/alerts/channels/${id}/test`, { method: 'POST', admin: true });
+      if (result) result.textContent = data.ok ? 'Delivered' : `Failed: ${data.error || 'unknown error'}`;
+    } else if (button.dataset.channelAction === 'delete') {
+      if (!window.confirm('Delete this channel? Rules stop sending to it.')) return;
+      await alertsRequest(`/api/alerts/channels/${id}`, { method: 'DELETE', admin: true });
+      await loadAlerts();
+      renderChannels();
+    }
+  } catch (err) {
+    if (err instanceof SettingsAuthError) channelAuthFailed();
+    else if (result) result.textContent = err.message;
+  }
+});
+
+// ─── Ask: natural-language filters ───────────────────────────────────────────
+// POST /api/ai/filters turns a request into proposed filters (URL form, see
+// VIEW_FILTER_KEYS). The proposal is only previewed; Apply writes it into the
+// filter controls and the URL like opening a link. Shown while AI is
+// configured and nl_filters is on.
+
+const ASK_KEY_LABELS = {
+  scope: 'Scope', ns: 'Namespace', pod: 'Pod', ctr: 'Container', sev: 'Severity',
+  q: 'Search', qmode: 'Search mode',
+  xscope: 'Not scope', xns: 'Not namespace', xpod: 'Not pod', xctr: 'Not container', xsev: 'Not severity',
+  range: 'Range', from: 'From', to: 'To',
+};
+const ASK_RANGE_LABELS = { today: 'Today', '1h': 'Last hour', '6h': 'Last 6 hours', '24h': 'Last 24 hours', '7d': 'Last 7 days', all: 'All time' };
+const askState = { requestId: 0, loading: false, proposal: null, text: '' };
+
+function renderAskBox() {
+  const on = aiFeatureOn('nl_filters');
+  el('askBox').hidden = !on;
+  if (!on) dismissAsk();
+}
+
+function askValueText(key, value) {
+  if (key === 'range') return ASK_RANGE_LABELS[value] || value;
+  if (key === 'from' || key === 'to') return formatTimestamp(value);
+  return value;
+}
+
+// Changes from the filters on screen: added / removed / changed chips. The
+// default range (today) and search mode (phrase) are absent in both forms.
+function askChanges(current, proposed) {
+  const changes = [];
+  for (const key of VIEW_FILTER_KEYS) {
+    const before = current[key] || '';
+    const after = proposed[key] || '';
+    if (before === after) continue;
+    if (VIEW_EXCLUDE_KEYS.has(key) && before && after
+      && before.split(',').sort().join(',') === after.split(',').sort().join(',')) continue;
+    changes.push({ key, kind: !before ? 'added' : !after ? 'removed' : 'changed', before, after });
+  }
+  return changes;
+}
+
+function askChipMarkup(change) {
+  const label = escapeHtml(ASK_KEY_LABELS[change.key] || change.key);
+  const before = escapeHtml(askValueText(change.key, change.before));
+  const after = escapeHtml(askValueText(change.key, change.after));
+  const sign = { added: '+', removed: '−', changed: '~' }[change.kind];
+  const value = change.kind === 'added' ? after
+    : change.kind === 'removed' ? `<s>${before}</s>`
+      : `<s>${before}</s> → ${after}`;
+  return `<span class="chip ask-chip ask-chip-${change.kind}" title="${escapeHtml(change.kind)}"><b>${sign}</b> ${label}: ${value}</span>`;
+}
+
+function renderAskPreview() {
+  const box = el('askPreview');
+  const proposal = askState.proposal;
+  if (!proposal) {
+    box.hidden = true;
+    box.innerHTML = '';
+    return;
+  }
+  const filters = proposal.filters && typeof proposal.filters === 'object' ? proposal.filters : {};
+  const changes = askChanges(currentViewFilters(), filters);
+  const warnings = Array.isArray(proposal.warnings) ? proposal.warnings : [];
+  const confidence = Number(proposal.confidence);
+  const confidenceText = proposal.confidence !== null && proposal.confidence !== undefined && Number.isFinite(confidence)
+    ? `${Math.round(confidence * 100)}% confident` : '';
+  const chips = changes.length
+    ? `<div class="ask-chips">${changes.map(askChipMarkup).join('')}</div>`
+    : '<div class="ask-note">Same as the filters already applied.</div>';
+  box.innerHTML = `
+    ${proposal.explanation ? `<p class="ask-explanation">${escapeHtml(proposal.explanation)}</p>` : ''}
+    ${confidenceText || proposal.cached ? `<div class="ask-meta">${escapeHtml([confidenceText, proposal.cached ? 'cached answer' : ''].filter(Boolean).join(' · '))}</div>` : ''}
+    ${chips}
+    ${warnings.length ? `<ul class="ask-warnings">${warnings.map((w) => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : ''}
+    <div class="ask-actions">
+      <button type="button" data-ask-action="apply"${changes.length ? '' : ' disabled'}>Apply</button>
+      <button type="button" class="ghost" data-ask-action="save">Apply &amp; save as view</button>
+      <button type="button" class="ghost" data-ask-action="dismiss">Dismiss</button>
+    </div>`;
+  box.hidden = false;
+}
+
+function setAskStatus(text, kind = '') {
+  const status = el('askStatus');
+  status.hidden = !text;
+  status.textContent = text;
+  status.className = `ask-status${kind ? ` ask-status-${kind}` : ''}`;
+}
+
+function dismissAsk() {
+  askState.requestId += 1; // a reply still in flight is ignored
+  askState.loading = false;
+  askState.proposal = null;
+  el('askSubmit').disabled = false;
+  el('askSubmit').textContent = 'Ask';
+  setAskStatus('');
+  renderAskPreview();
+}
+
+async function submitAsk() {
+  const text = el('askInput').value.trim();
+  if (!text || askState.loading) return;
+  if (text.length > 500) {
+    setAskStatus('Keep the request under 500 characters.', 'error');
+    return;
+  }
+  const requestId = ++askState.requestId;
+  askState.loading = true;
+  askState.proposal = null;
+  askState.text = text;
+  renderAskPreview();
+  el('askSubmit').disabled = true;
+  el('askSubmit').textContent = 'Asking…';
+  setAskStatus('Working out the filters…');
+  let tz = 'UTC';
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (_) {}
+  let res = null;
+  let data = {};
+  let networkError = '';
+  try {
+    res = await fetch('/api/ai/filters', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, tz, current: currentViewFilters() }),
+    });
+    data = await res.json().catch(() => ({}));
+  } catch (err) {
+    networkError = err instanceof Error ? err.message : String(err);
+  }
+  if (requestId !== askState.requestId) return;
+  askState.loading = false;
+  el('askSubmit').disabled = false;
+  el('askSubmit').textContent = 'Ask';
+  if (networkError) {
+    setAskStatus(`Network error: ${networkError}`, 'error');
+    return;
+  }
+  if (!res.ok) {
+    if (res.status === 403 && data.error === 'ai_feature_disabled') {
+      state.aiFeatures = { ...state.aiFeatures, nl_filters: false };
+      renderAskBox();
+      return;
+    }
+    if (res.status === 503 && data.error === 'ai_disabled') {
+      setAskStatus('No AI provider is configured (Settings → AI).', 'error');
+      return;
+    }
+    if (res.status === 503 && data.error === 'budget') {
+      setAskStatus(data.message || 'The daily AI budget is used up; try again after 00:00 UTC.', 'error');
+      return;
+    }
+    const message = typeof data.error === 'string' && data.error ? data.error : `${res.status} ${res.statusText}`;
+    setAskStatus(`Could not work out filters: ${message}`, 'error');
+    return;
+  }
+  setAskStatus('');
+  askState.proposal = data;
+  renderAskPreview();
+}
+
+// Writes the proposal into the filter controls and the URL (same tab; the
+// open view, if any, shows as modified).
+async function applyAsk() {
+  const proposal = askState.proposal;
+  if (!proposal) return;
+  const params = new URLSearchParams();
+  for (const key of VIEW_FILTER_KEYS) {
+    const value = proposal.filters?.[key];
+    if (typeof value === 'string' && value) params.set(key, value);
+  }
+  if (state.activeTab !== 'logs') params.set('tab', state.activeTab);
+  if (state.views.currentId !== null) params.set('view', String(state.views.currentId));
+  await applyUrlState(parseUrlState(params.toString()), { history: 'push' });
+}
+
+el('askForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  submitAsk();
+});
+el('askPreview').addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('[data-ask-action]') : null;
+  if (!(button instanceof HTMLButtonElement) || button.disabled) return;
+  const action = button.dataset.askAction;
+  if (action === 'dismiss') {
+    dismissAsk();
+    return;
+  }
+  const proposal = askState.proposal;
+  const text = askState.text;
+  applyAsk().then(() => {
+    dismissAsk();
+    if (action !== 'save') return;
+    state.views.currentId = null; // a new view, not an update of the open one
+    updateUrl('replace');
+    openSaveViewDialog('save');
+    el('saveViewName').value = text.slice(0, 80);
+    el('saveViewDescription').value = (proposal?.explanation || '').slice(0, 500);
+    el('saveViewName').select();
+  }).catch((err) => setAskStatus(`Could not apply the filters: ${err.message}`, 'error'));
+});
+
+// ─── AI features and the Settings tab ────────────────────────────────────────
+
+// A feature's buttons show only when AI is configured and the feature is on.
+function aiFeatureOn(name) {
+  return state.aiConfigured && state.aiFeatures[name] !== false;
+}
+
+function applyAiStatus(status) {
+  const features = status.ai_features && typeof status.ai_features === 'object' ? status.ai_features : {};
+  const configured = Boolean(status.ai_configured);
+  const changed = configured !== state.aiConfigured
+    || JSON.stringify(features) !== JSON.stringify(state.aiFeatures);
+  state.aiConfigured = configured;
+  state.aiFeatures = { ...features };
+  const warnings = Array.isArray(status.ai_warnings) ? status.ai_warnings : [];
+  const badge = el('settingsBadge');
+  badge.hidden = warnings.length === 0;
+  badge.textContent = warnings.length ? '!' : '';
+  badge.title = warnings.join('\n');
+  if (!changed) return;
+  updateExplainButton();
+  renderAskBox();
+  if (state.items && state.items.length) renderAll();
+  if (state.insightsLoaded) renderAnomalies();
+}
+
+async function summarizeAnomaly(anomaly, btn, options = {}) {
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = options.tier === 'deep' ? 'Analyzing…' : '✦ Summarizing…';
+  try {
+    const result = await postJson(`/api/anomalies/${encodeURIComponent(anomaly.id)}/summarize`,
+      explainOptionsQuery(options));
+    if (result.degraded) throw new Error(result.error || 'The daily AI budget is used up');
+    await fetchInsights();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = original;
+    btn.title = `Failed: ${err.message}`;
+    showInsightsError(`AI summary failed: ${err.message}`);
+  }
+}
+
+const SETTINGS_TOKEN_KEY = 'logscope.settings.adminToken';
+const FEATURE_LABELS = {
+  explain_line: ['Explain this line', 'Per-line AI explanation in the Logs tab'],
+  explain_filtered: ['Explain these logs', 'AI summary of the currently filtered logs'],
+  anomaly_auto_summary: ['Automatic anomaly summaries', 'Every detected anomaly is summarized in the background (uses the deep model)'],
+  anomaly_manual_summary: ['Summarize anomaly on request', 'The ✦ Summarize button on Insights rows (uses the deep model)'],
+  nl_filters: ['Natural-language filters', 'The Ask box above the filters: proposes filters from a plain-language request'],
+  deep_analysis: ['Deep analysis', 'Every "Deep analysis" run (deep model), whatever it explains'],
+  settings_test: ['Connection tests', 'Settings → Test connection'],
+};
+const SOURCE_LABELS = { env: 'environment', ui: 'Settings', config: 'config.yaml', none: 'not set' };
+const settingsState = { data: null, usage: null, loading: false, test: null, prices: null };
+
+function settingsToken() {
+  try { return window.sessionStorage.getItem(SETTINGS_TOKEN_KEY) || ''; } catch (_) { return ''; }
+}
+
+function setSettingsToken(value) {
+  try {
+    if (value) window.sessionStorage.setItem(SETTINGS_TOKEN_KEY, value);
+    else window.sessionStorage.removeItem(SETTINGS_TOKEN_KEY);
+  } catch (_) {}
+}
+
+class SettingsAuthError extends Error {}
+
+// fetch with the admin token; a 401 locks the tab again.
+async function settingsRequest(url, { method = 'GET', body } = {}) {
+  const headers = { Authorization: `Bearer ${settingsToken()}` };
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  let res;
+  try {
+    res = await fetch(url, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch (err) {
+    throw new Error(`Network error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  let data = {};
+  try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) throw new SettingsAuthError(data.error || 'The admin token was not accepted');
+  if (!res.ok) {
+    const err = new Error(data.error || `${res.status} ${res.statusText}`);
+    err.field = data.field;
+    throw err;
+  }
+  return data;
+}
+
+function lockSettings(message = '') {
+  setSettingsToken('');
+  settingsState.data = null;
+  settingsState.usage = null;
+  settingsState.test = null;
+  settingsState.prices = null;
+  el('settingsBody').hidden = true;
+  el('settingsUnlock').hidden = false;
+  el('settingsLock').hidden = true;
+  el('settingsRefresh').hidden = true;
+  el('settingsSubtitle').textContent = 'Unlock with the admin token to view or change AI settings.';
+  const errorEl = el('settingsUnlockError');
+  errorEl.hidden = !message;
+  errorEl.textContent = message;
+  el('settingsContent').innerHTML = '';
+}
+
+function openSettings() {
+  if (!settingsToken()) {
+    lockSettings();
+    return;
+  }
+  if (!settingsState.data && !settingsState.loading) loadSettings().catch(() => {});
+}
+
+function settingsMessage(text, tone = 'ok') {
+  const node = el('settingsMessage');
+  node.hidden = !text;
+  node.className = `settings-message tone-${tone}`;
+  node.textContent = text;
+}
+
+async function loadSettings() {
+  settingsState.loading = true;
+  el('settingsSubtitle').textContent = 'Loading…';
+  try {
+    const [data, usage] = await Promise.all([
+      settingsRequest('/api/settings/ai'),
+      settingsRequest('/api/settings/ai/usage?days=7'),
+    ]);
+    settingsState.data = data;
+    settingsState.usage = usage;
+    settingsState.prices = null;
+    el('settingsUnlock').hidden = true;
+    el('settingsBody').hidden = false;
+    el('settingsLock').hidden = false;
+    el('settingsRefresh').hidden = false;
+    el('settingsSubtitle').textContent = 'Changes apply immediately, without a restart. Values set by environment variables are read-only here.';
+    renderSettings();
+  } catch (err) {
+    if (err instanceof SettingsAuthError) lockSettings(err.message);
+    else el('settingsSubtitle').textContent = `Could not load settings: ${err.message}`;
+  } finally {
+    settingsState.loading = false;
+  }
+}
+
+async function saveSettings(body, okText) {
+  settingsMessage('Saving…', 'info');
+  try {
+    settingsState.data = await settingsRequest('/api/settings/ai', { method: 'PUT', body });
+    settingsState.usage = await settingsRequest('/api/settings/ai/usage?days=7').catch(() => settingsState.usage);
+    settingsState.prices = null;
+    settingsMessage(okText, 'ok');
+    renderSettings();
+    refreshStatus().catch(() => {});
+  } catch (err) {
+    if (err instanceof SettingsAuthError) {
+      lockSettings(err.message);
+      return;
+    }
+    settingsMessage(`Not saved: ${err.message}`, 'error');
+  }
+}
+
+function sourceBadge(source) {
+  const label = SOURCE_LABELS[source] || source || '';
+  return `<span class="settings-source source-${escapeHtml(source || 'none')}" title="Value comes from ${escapeHtml(label)}">${escapeHtml(label)}</span>`;
+}
+
+function settingsField(id, label, value, source, { placeholder = '', type = 'text' } = {}) {
+  const locked = source === 'env';
+  return `
+    <label class="settings-field">
+      <span class="settings-label">${escapeHtml(label)} ${sourceBadge(source)}</span>
+      <input id="${escapeHtml(id)}" type="${escapeHtml(type)}" value="${escapeHtml(value || '')}" placeholder="${escapeHtml(placeholder)}" autocomplete="off" spellcheck="false" ${locked ? 'disabled title="Set by an environment variable"' : ''} />
+    </label>`;
+}
+
+function numberOrNull(raw) {
+  const text = String(raw ?? '').trim();
+  if (!text) return null;
+  const value = Number(text);
+  if (!Number.isFinite(value)) throw new Error(`'${text}' is not a number`);
+  return value;
+}
+
+function formatUsd(value) {
+  const number = Number(value || 0);
+  return `$${number < 1 ? number.toFixed(4) : number.toFixed(2)}`;
+}
+
+function settingsBarRow(label, value, max, text, alt = false) {
+  const width = max > 0 ? Math.max(value > 0 ? 4 : 0, Math.round((value / max) * 100)) : 0;
+  return `
+    <div class="dashboard-bar-row settings-bar-row">
+      <span class="dashboard-bar-label">${escapeHtml(label)}</span>
+      <span class="dashboard-bar-track"><span class="dashboard-bar-fill${alt ? ' dashboard-bar-fill-alt' : ''}" style="width:${Math.min(100, width)}%"></span></span>
+      <span class="dashboard-bar-count">${escapeHtml(text)}</span>
+    </div>`;
+}
+
+function providerCardMarkup(data) {
+  const src = data.sources || {};
+  const providerLocked = src.provider === 'env';
+  const options = ['<option value="">(config.yaml default)</option>']
+    .concat((data.providers || []).map((p) => `<option value="${escapeHtml(p)}" ${p === data.provider ? 'selected' : ''}>${escapeHtml(p)}</option>`));
+  const keyLocked = data.key_source === 'env';
+  const keyState = data.key_set
+    ? `Set (${escapeHtml(SOURCE_LABELS[data.key_source] || data.key_source)}) · ends in ${escapeHtml(data.key_last4 || '????')}`
+    : 'Not set';
+  const keyNote = keyLocked
+    ? `Set by $${escapeHtml(data.key_env)}; change it there (it takes precedence over a stored key).`
+    : data.key_storage_available
+      ? 'Write-only: the stored key is never shown. Leave empty to keep it.'
+      : 'Key storage is unavailable on this server; set the key by environment variable.';
+  const test = settingsState.test;
+  const testText = !test ? ''
+    : test.pending ? 'Testing…'
+      : test.ok ? `OK · ${escapeHtml(formatCount(test.latency_ms))} ms · ${test.model}`
+        : `Failed${test.model ? ` (${test.model})` : ''}: ${test.error || 'unknown error'}`;
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Provider</h3></div>
+      <label class="settings-field">
+        <span class="settings-label">Provider ${sourceBadge(src.provider)}</span>
+        <select id="setProvider" ${providerLocked ? 'disabled title="Set by an environment variable"' : ''}>${options.join('')}</select>
+      </label>
+      ${settingsField('setModel', 'Model', data.model, src.model, { placeholder: 'model id' })}
+      ${settingsField('setDeepModel', 'Deep model (anomaly summaries)', data.deep_model, src.deep_model, { placeholder: 'empty = same as model' })}
+      ${settingsField('setBaseUrl', 'Base URL', data.base_url, src.base_url, { placeholder: 'empty = provider default' })}
+      <div class="subtle settings-hint">Allowed hosts: ${escapeHtml((data.allowed_hosts || []).join(', '))}. https is required except for localhost.</div>
+      <label class="settings-field">
+        <span class="settings-label">API key ${sourceBadge(data.key_source)}</span>
+        <input id="setApiKey" type="password" value="" placeholder="${escapeHtml(keyState)}" autocomplete="new-password" spellcheck="false" ${keyLocked || !data.key_storage_available ? 'disabled' : ''} />
+      </label>
+      <div class="subtle settings-hint">${keyNote}</div>
+      ${data.key_source === 'ui' ? '<label class="toggle settings-clear"><input id="setClearKey" type="checkbox" /> Remove the stored key</label>' : ''}
+      <div class="settings-actions">
+        <button id="saveProvider" type="button">Save</button>
+        <button id="testProvider" type="button" class="ghost" title="One minimal request with the saved settings (no log content)">Test connection</button>
+      </div>
+      <div id="settingsTestResult" class="settings-test ${test && !test.pending ? (test.ok ? 'tone-ok' : 'tone-error') : ''}" ${testText ? '' : 'hidden'}>${escapeHtml(testText)}</div>
+    </section>`;
+}
+
+function featuresCardMarkup(data) {
+  const rows = (data.features || []).map((name) => {
+    const [label, help] = FEATURE_LABELS[name] || [name, ''];
+    return `
+      <label class="settings-toggle">
+        <input type="checkbox" data-feature="${escapeHtml(name)}" ${data.flags && data.flags[name] ? 'checked' : ''} />
+        <span><strong>${escapeHtml(label)}</strong><span class="subtle">${escapeHtml(help)}</span></span>
+      </label>`;
+  });
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Features</h3></div>
+      <div class="settings-toggles">${rows.join('')}</div>
+      <div class="subtle settings-hint">A feature that is off answers 403 and its buttons are hidden.</div>
+      <div class="settings-actions"><button id="saveFeatures" type="button">Save features</button></div>
+    </section>`;
+}
+
+function budgetsCardMarkup(data) {
+  const budgets = data.budgets || {};
+  const calls = budgets.daily_calls || {};
+  const valueOf = (v) => (v === null || v === undefined ? '' : String(v));
+  const callInputs = (data.budget_features || data.features || []).map((name) => `
+      <label class="settings-field settings-field-compact">
+        <span class="settings-label">${escapeHtml((FEATURE_LABELS[name] || [name])[0])}</span>
+        <input type="number" min="0" step="1" data-budget-calls="${escapeHtml(name)}" value="${escapeHtml(valueOf(calls[name]))}" placeholder="no limit" />
+      </label>`);
+  const status = (data.budget_status || []).map((item) => settingsBarRow(
+    item.budget, Math.min(item.ratio, 1), 1,
+    `${item.budget === 'daily_cost_usd' ? formatUsd(item.used) : formatCount(item.used)} / ${item.budget === 'daily_cost_usd' ? formatUsd(item.limit) : formatCount(item.limit)}`,
+    item.ratio >= 0.8,
+  ));
+  return `
+    <section class="settings-card">
+      <div class="pipeline-card-head"><h3>Daily budgets <span class="subtle">· UTC days</span></h3></div>
+      <div class="settings-row">
+        <label class="settings-field settings-field-compact">
+          <span class="settings-label">Tokens per day</span>
+          <input id="setDailyTokens" type="number" min="0" step="1" value="${escapeHtml(valueOf(budgets.daily_tokens))}" placeholder="no limit" />
+        </label>
+        <label class="settings-field settings-field-compact">
+          <span class="settings-label">Cost per day (USD)</span>
+          <input id="setDailyCost" type="number" min="0" step="0.01" value="${escapeHtml(valueOf(budgets.daily_cost_usd))}" placeholder="no limit" />
+        </label>
+      </div>
+      <div class="settings-label settings-sub">Calls per day, by feature</div>
+      <div class="settings-row settings-row-wrap">${callInputs.join('')}</div>
+      <div class="subtle settings-hint">Empty = no limit. Over budget, calls are skipped (the answer says so) until 00:00 UTC; at 80% a warning shows in the Pipeline tab and, when notifications are on, in Mattermost.</div>
+      ${status.length ? `<div class="dashboard-bars settings-bars">${status.join('')}</div>` : ''}
+      <div class="settings-actions"><button id="saveBudgets" type="button">Save budgets</button></div>
+    </section>`;
+}
+
+function pricesCardMarkup(data) {
+  if (!settingsState.prices) {
+    settingsState.prices = Object.entries(data.prices || {}).map(([model, p]) => ({
+      model, input: p.input ?? '', output: p.output ?? '', cached: p.cached ?? '',
+    }));
+  }
+  const rows = settingsState.prices.map((row, index) => `
+      <tr>
+        <td><input type="text" data-price="${index}" data-col="model" value="${escapeHtml(row.model)}" placeholder="model id" spellcheck="false" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="input" value="${escapeHtml(String(row.input))}" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="output" value="${escapeHtml(String(row.output))}" /></td>
+        <td><input type="number" min="0" step="0.001" data-price="${index}" data-col="cached" value="${escapeHtml(String(row.cached))}" placeholder="= input" /></td>
+        <td><button type="button" class="ghost" data-price-remove="${index}" aria-label="Remove ${escapeHtml(row.model || 'row')}">✕</button></td>
+      </tr>`);
+  return `
+    <section class="settings-card settings-card-wide">
+      <div class="pipeline-card-head"><h3>Prices <span class="subtle">· USD per million tokens</span></h3>${sourceBadge(data.prices_source)}</div>
+      <div class="settings-table-wrap"><table class="pipeline-table settings-prices">
+        <thead><tr><th>Model</th><th>Input</th><th>Output</th><th>Cached input</th><th></th></tr></thead>
+        <tbody>${rows.join('') || '<tr><td colspan="5" class="subtle">No prices: tokens are counted, cost is unknown.</td></tr>'}</tbody>
+      </table></div>
+      <div class="settings-actions">
+        <button id="addPrice" type="button" class="ghost">Add model</button>
+        <button id="savePrices" type="button">Save prices</button>
+        ${data.prices_source === 'ui' ? '<button id="resetPrices" type="button" class="ghost" title="Use webapp.ai.prices from config.yaml again">Use config.yaml prices</button>' : ''}
+      </div>
+    </section>`;
+}
+
+function usageCardMarkup(usage) {
+  if (!usage) return '';
+  const featureRows = (scope) => {
+    const entries = Object.entries(scope.by_feature || {});
+    if (!entries.length) return '<tr><td colspan="7" class="subtle">No AI requests.</td></tr>';
+    return entries.map(([name, u]) => `
+        <tr>
+          <td>${escapeHtml((FEATURE_LABELS[name] || [name])[0])}</td>
+          <td>${escapeHtml(formatCount(u.calls))}${u.errors ? ` <span class="subtle">(${escapeHtml(formatCount(u.errors))} failed)</span>` : ''}</td>
+          <td>${escapeHtml(formatCount(u.tokens))}</td>
+          <td>${escapeHtml(formatUsd(u.cost_usd))}${u.unpriced_calls ? ' <span class="subtle" title="Calls to models without a price">+?</span>' : ''}</td>
+          <td>${escapeHtml(String(u.cache_hit_pct))}%</td>
+          <td>${escapeHtml(String(u.signature_hit_pct ?? 0))}%</td>
+          <td>${escapeHtml(formatCount(u.blocked))}</td>
+        </tr>`).join('');
+  };
+  const table = (title, scope) => `
+      <h4 class="settings-sub">${escapeHtml(title)}</h4>
+      <div class="settings-table-wrap"><table class="pipeline-table settings-usage">
+        <thead><tr><th>Feature</th><th>AI calls</th><th>Tokens</th><th>Cost</th><th>Cache hits</th><th>Signature hits</th><th>Blocked</th></tr></thead>
+        <tbody>${featureRows(scope)}</tbody>
+      </table></div>`;
+  const days = usage.by_day || [];
+  const served = (d) => d.calls + d.cache_hits + (d.signature_hits || 0);
+  const maxCalls = Math.max(0, ...days.map(served));
+  // settingsBarRow escapes the label and text.
+  const dayBars = days.map((d) => settingsBarRow(
+    d.day, served(d), maxCalls,
+    `${formatCount(d.calls)} AI · ${formatCount(served(d) - d.calls)} free · ${formatCount(d.tokens)} tok · ${formatUsd(d.cost_usd)}`,
+  ));
+  const features = Object.entries((usage.period || {}).by_feature || {});
+  const maxTokens = Math.max(0, ...features.map(([, u]) => u.tokens));
+  const featureBars = features.map(([name, u]) => settingsBarRow(
+    (FEATURE_LABELS[name] || [name])[0], u.tokens, maxTokens, `${escapeHtml(formatCount(u.tokens))} tok`, true,
+  ));
+  return `
+    <section class="settings-card settings-card-wide">
+      <div class="pipeline-card-head"><h3>Usage</h3><span class="subtle">UTC days · cached answers and blocked calls are free</span></div>
+      ${table(`Today (${usage.today ? usage.today.date : ''})`, usage.today || {})}
+      ${table(`Last ${usage.days} days (from ${usage.period ? usage.period.from : ''})`, usage.period || {})}
+      ${(() => {
+        const t = (usage.period || {}).total || {};
+        const labels = ['cache hits', 'signature hits', 'answered without an AI call'];
+        return `<div class="settings-rates">${['cache_hit_pct', 'signature_hit_pct', 'free_pct'].map((k, i) => `
+          <div class="settings-rate"><span class="settings-rate-value">${escapeHtml(String(t[k] ?? 0))}%</span>
+          <span class="subtle">${escapeHtml(labels[i])}, last ${escapeHtml(String(usage.days))} days</span></div>`).join('')}</div>`;
+      })()}
+      <h4 class="settings-sub">Requests per day</h4>
+      <div class="dashboard-bars settings-bars">${dayBars.join('')}</div>
+      ${featureBars.length ? `<h4 class="settings-sub">Tokens by feature, last ${usage.days} days</h4><div class="dashboard-bars settings-bars">${featureBars.join('')}</div>` : ''}
+    </section>`;
+}
+
+function renderSettings() {
+  const data = settingsState.data;
+  if (!data) return;
+  const warnings = (data.warnings || []).concat((data.budget_status || [])
+    .filter((b) => b.ratio >= 0.8)
+    .map((b) => `Budget ${b.budget} is at ${Math.round(b.ratio * 100)}% today${b.used >= b.limit ? ' — calls are being skipped' : ''}.`));
+  const warnEl = el('settingsWarnings');
+  warnEl.hidden = !warnings.length;
+  warnEl.innerHTML = warnings.map((w) => `<div>${escapeHtml(w)}</div>`).join('');
+  el('settingsContent').innerHTML = providerCardMarkup(data) + featuresCardMarkup(data) + budgetsCardMarkup(data)
+    + pricesCardMarkup(data) + usageCardMarkup(settingsState.usage);
+  bindSettingsEvents(data);
+}
+
+function collectPriceRows() {
+  for (const input of el('settingsContent').querySelectorAll('[data-price]')) {
+    const row = settingsState.prices[Number(input.dataset.price)];
+    if (row) row[input.dataset.col] = input.value;
+  }
+}
+
+function bindSettingsEvents(data) {
+  const src = data.sources || {};
+  el('saveProvider').addEventListener('click', () => {
+    const body = {};
+    if (src.provider !== 'env') body.provider = el('setProvider').value;
+    if (src.model !== 'env') body.model = el('setModel').value.trim();
+    if (src.deep_model !== 'env') body.deep_model = el('setDeepModel').value.trim();
+    if (src.base_url !== 'env') body.base_url = el('setBaseUrl').value.trim();
+    const clear = el('setClearKey');
+    const key = el('setApiKey').value;
+    if (clear && clear.checked) body.api_key = '__clear__';
+    else if (key && data.key_source !== 'env') body.api_key = key;
+    el('setApiKey').value = '';
+    saveSettings(body, 'Provider settings saved.');
+  });
+  el('testProvider').addEventListener('click', async () => {
+    settingsState.test = { pending: true };
+    renderSettings();
+    try {
+      settingsState.test = await settingsRequest('/api/settings/ai/test', { method: 'POST' });
+      [settingsState.data, settingsState.usage] = await Promise.all([
+        settingsRequest('/api/settings/ai'), settingsRequest('/api/settings/ai/usage?days=7'),
+      ]);
+    } catch (err) {
+      if (err instanceof SettingsAuthError) {
+        lockSettings(err.message);
+        return;
+      }
+      settingsState.test = { ok: false, error: err.message };
+    }
+    renderSettings();
+  });
+  el('saveFeatures').addEventListener('click', () => {
+    const flags = {};
+    for (const box of el('settingsContent').querySelectorAll('[data-feature]')) flags[box.dataset.feature] = box.checked;
+    saveSettings({ flags }, 'Features saved.');
+  });
+  el('saveBudgets').addEventListener('click', () => {
+    try {
+      const dailyCalls = {};
+      for (const input of el('settingsContent').querySelectorAll('[data-budget-calls]')) {
+        dailyCalls[input.dataset.budgetCalls] = numberOrNull(input.value);
+      }
+      saveSettings({
+        budgets: {
+          daily_tokens: numberOrNull(el('setDailyTokens').value),
+          daily_cost_usd: numberOrNull(el('setDailyCost').value),
+          daily_calls: dailyCalls,
+        },
+      }, 'Budgets saved.');
+    } catch (err) {
+      settingsMessage(`Not saved: ${err.message}`, 'error');
+    }
+  });
+  el('addPrice').addEventListener('click', () => {
+    collectPriceRows();
+    settingsState.prices.push({ model: '', input: '', output: '', cached: '' });
+    renderSettings();
+  });
+  for (const btn of el('settingsContent').querySelectorAll('[data-price-remove]')) {
+    btn.addEventListener('click', () => {
+      collectPriceRows();
+      settingsState.prices.splice(Number(btn.dataset.priceRemove), 1);
+      renderSettings();
+    });
+  }
+  el('savePrices').addEventListener('click', () => {
+    collectPriceRows();
+    try {
+      const prices = {};
+      for (const row of settingsState.prices) {
+        const model = String(row.model || '').trim();
+        if (!model) continue;
+        const entry = { input: numberOrNull(row.input), output: numberOrNull(row.output) };
+        const cached = numberOrNull(row.cached);
+        if (cached !== null) entry.cached = cached;
+        prices[model] = entry;
+      }
+      saveSettings({ prices }, 'Prices saved.');
+    } catch (err) {
+      settingsMessage(`Not saved: ${err.message}`, 'error');
+    }
+  });
+  const reset = el('resetPrices');
+  if (reset) reset.addEventListener('click', () => saveSettings({ prices: null }, 'Using the config.yaml prices.'));
+}
+
+el('settingsUnlock').addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const token = el('settingsToken').value.trim();
+  el('settingsToken').value = '';
+  if (!token) return;
+  setSettingsToken(token);
+  el('settingsUnlockError').hidden = true;
+  loadSettings().catch(() => {});
+});
+el('settingsLock').addEventListener('click', () => lockSettings());
+el('settingsRefresh').addEventListener('click', () => {
+  settingsMessage('');
+  loadSettings().catch(() => {});
+});
+
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
@@ -3770,7 +5168,7 @@ async function init() {
     el('health').textContent = `Status unavailable: ${err.message}`;
   }
   if (status) {
-    state.aiConfigured = Boolean(status.ai_configured);
+    applyAiStatus(status);
     state.actionsEnabled = status.actions_enabled === true;
     if (status.last_successful_ingest_at) {
       el('freshness').textContent = fmtFreshness(status.last_successful_ingest_at);
@@ -3792,7 +5190,6 @@ async function init() {
 
 // Applying filters is a navigation: one history entry, results view shown.
 function reloadLogs() {
-  syncFiltersFromUi();
   resetOlderLogsState();
   closeContext({ history: null });
   updateUrl('push');
@@ -3870,9 +5267,15 @@ el('clearFilters').addEventListener('click', () => {
   for (const [field] of FILTER_EXCLUDES) state.exclude[field] = [];
   forgetHistogramZoom();
   el('q').value = '';
+  el('qmodeRaw').checked = false;
   el('rangePreset').value = 'today';
   setDefaultDateRange();
   reloadLogs();
+});
+// Switching the search mode re-runs a search that is already there.
+el('qmodeRaw').addEventListener('change', () => {
+  if (el('q').value.trim()) reloadLogs();
+  else updateUrl('replace');
 });
 el('securityShortcut').addEventListener('click', () => {
   el('scope').value = 'security';
@@ -4001,14 +5404,6 @@ el('openInActionableBtn').addEventListener('click', () => {
   switchTab('actionable');
 });
 
-const actionableAnalyzeLogsBtn = el('actionableAnalyzeLogsBtn');
-if (actionableAnalyzeLogsBtn) {
-  actionableAnalyzeLogsBtn.addEventListener('click', async () => {
-    await runExplain();
-    switchTab('actionable');
-  });
-}
-
 el('actionableRefreshBtn').addEventListener('click', async () => {
   const selVal = el('actionableSourceSelect').value;
   if (selVal && selVal.startsWith('anomaly-')) {
@@ -4046,16 +5441,24 @@ el('actionableResetStepsBtn').addEventListener('click', () => {
   resetActionableSteps();
 });
 
-el('confirmCancelBtn').addEventListener('click', () => {
-  el('actionConfirmModal').close();
+// Every way out of the confirm dialog except "Execute" drops the pending
+// mutation: the Cancel button, Esc (the dialog's cancel event) and a click on
+// the backdrop. A stale confirmation must never run later.
+function dismissConfirmModal() {
   state.actionable.pendingMutation = null;
+  const modal = el('actionConfirmModal');
+  if (modal.open) modal.close();
+}
+
+el('confirmCancelBtn').addEventListener('click', dismissConfirmModal);
+el('actionConfirmModal').addEventListener('cancel', dismissConfirmModal);
+el('actionConfirmModal').addEventListener('click', (event) => {
+  // A click on the dialog element itself (not its content) is the backdrop.
+  if (event.target === el('actionConfirmModal')) dismissConfirmModal();
 });
 
 el('confirmExecuteBtn').addEventListener('click', () => {
-  el('actionConfirmModal').close();
   const pending = state.actionable.pendingMutation;
-  if (pending) {
-    state.actionable.pendingMutation = null;
-    executeActionableStep(pending.key, pending);
-  }
+  dismissConfirmModal();
+  if (pending) executeActionableStep(pending.key, pending);
 });

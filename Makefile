@@ -2,6 +2,7 @@
 # image-multi, and nothing touches a cluster (k3s-import only prints commands).
 #
 #   make test                 pytest
+#   make render               generate deploy/*.yaml from config.yaml (gitignored)
 #   make bin                  onefile binary -> dist/logscope-<version>-linux-<arch>
 #   make image                container image for this machine's arch (--load)
 #   make smoke                build image + binary, run scripts/smoke.sh
@@ -16,8 +17,8 @@ SHELL := /bin/bash
 VERSION   ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo 0.0.0+unknown)
 REVISION  ?= $(shell git rev-parse HEAD 2>/dev/null)
 CREATED   ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-SOURCE    ?= https://github.com/owner/logscope
-IMAGE     ?= ghcr.io/owner/logscope
+SOURCE    ?= https://github.com/ajith4Tech/logscope
+IMAGE     ?= ghcr.io/ajith4tech/logscope
 # Image tag: VERSION without a leading "v" ("+" is not allowed in tags).
 TAG       ?= $(subst +,-,$(patsubst v%,%,$(VERSION)))
 ARCH      ?= $(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
@@ -25,6 +26,8 @@ PLATFORMS ?= linux/amd64,linux/arm64
 INCLUDE_KUBECTL ?= false
 PYTHON    ?= python3
 PUSH      ?= 0
+# LATEST=1 also tags $(IMAGE):latest (release CI sets it for stable vX.Y.Z tags only).
+LATEST    ?= 0
 DIST      ?= dist
 BIN        = $(DIST)/logscope-$(VERSION)-linux-$(ARCH)
 
@@ -32,7 +35,7 @@ BUILD_ARGS = --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) \
              --build-arg CREATED=$(CREATED) --build-arg SOURCE=$(SOURCE) \
              --build-arg INCLUDE_KUBECTL=$(INCLUDE_KUBECTL)
 
-.PHONY: help deps-lock test bin image image-multi smoke k3s-import sbom scan version
+.PHONY: help deps-lock test render bin image image-multi smoke k3s-import sbom scan version
 
 help:
 	@sed -n '2,13p' Makefile | sed 's/^# \{0,1\}//'
@@ -51,6 +54,10 @@ deps-lock:
 test:
 	$(PYTHON) -m pytest -q
 
+# Rendered outputs hold real cluster/S3 config; they are gitignored.
+render:
+	$(PYTHON) -m logscope render
+
 bin:
 	@mkdir -p $(DIST)
 	docker buildx build --platform linux/$(ARCH) --target bin $(BUILD_ARGS) \
@@ -67,7 +74,8 @@ image-multi:
 	@if [ "$(PUSH)" != "1" ]; then \
 	    echo "image-multi pushes $(IMAGE):$(TAG) for $(PLATFORMS); re-run with PUSH=1 to do it." >&2; exit 1; fi
 	docker buildx build --platform $(PLATFORMS) $(BUILD_ARGS) \
-	    --sbom=true --provenance=mode=max --push -t $(IMAGE):$(TAG) .
+	    --sbom=true --provenance=mode=max --push -t $(IMAGE):$(TAG) \
+	    $(if $(filter 1,$(LATEST)),-t $(IMAGE):latest) .
 
 smoke:
 	IMAGE=$(IMAGE) TAG=$(TAG) VERSION=$(VERSION) BIN=$(BIN) scripts/smoke.sh

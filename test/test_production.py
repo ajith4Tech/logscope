@@ -299,13 +299,13 @@ def test_readyz_tolerates_busy_database_within_grace():
     with tempfile.TemporaryDirectory() as td:
         app = _make_webapp(Path(td) / "webapp.sqlite")
         server = _serve(app)
-        app.storage.lock.acquire()
+        app.storage._lock.acquire()
         try:
             assert _request(server, "GET", "/readyz") == (200, {"status": "ok", "db": "busy"})
             app._db_busy_since -= 3600  # busy far beyond the grace period
             assert _request(server, "GET", "/readyz")[0] == 503
         finally:
-            app.storage.lock.release()
+            app.storage._lock.release()
             server.shutdown()
             server.server_close()
         assert app.ready() == (True, False)
@@ -410,7 +410,9 @@ def test_malformed_cursor_is_a_client_error():
             assert str(exc) == "Invalid cursor", bad
         else:
             raise AssertionError(f"accepted {bad!r}")
-    assert decode_cursor(_b64('{"ts": "2026-09-07T00:00:00Z", "id": 3}')) == ("2026-09-07T00:00:00Z", 3)
+    # A cursor from before ts_epoch (text "ts") still pages from the same instant.
+    assert decode_cursor(_b64('{"ts": "2026-09-07T00:00:00Z", "id": 3}')) == (1788739200.0, 3)
+    assert decode_cursor(_b64('{"e": 1788739200.5, "id": 3}')) == (1788739200.5, 3)
 
     with tempfile.TemporaryDirectory() as td:
         server = _serve(_make_webapp(Path(td) / "webapp.sqlite"))
