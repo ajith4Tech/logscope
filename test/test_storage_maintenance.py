@@ -12,6 +12,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import upsert_anomaly  # noqa: E402
+
 from webapp.api import dbtool  # noqa: E402
 from webapp.api.storage import LogStorage  # noqa: E402
 
@@ -316,11 +318,13 @@ import json  # noqa: E402
 import shutil  # noqa: E402
 import threading  # noqa: E402
 
+_DISK_FULL = sqlite3.OperationalError("database or disk is full")
+
 
 class _FailNth:
     """Connection proxy that raises on the nth statement containing `needle`."""
 
-    def __init__(self, conn, needle, nth=1, error=sqlite3.OperationalError("database or disk is full")):
+    def __init__(self, conn, needle, nth=1, error=_DISK_FULL):
         self._conn, self._needle, self._left, self._error = conn, needle, nth, error
 
     def _check(self, sql):
@@ -542,7 +546,7 @@ def _populate_app_db(db):
     storage.ingest_state(last_poll_at="2026-09-07T00:00:00Z", last_successful_ingest_at="2026-09-07T00:00:00Z",
                          last_object_last_modified=None)
     store = AnomalyStore(db)
-    anomaly_id = store.upsert_anomaly(type="error_rate_spike", namespace="app", pod="", rule_key="",
+    anomaly_id = upsert_anomaly(store, type="error_rate_spike", namespace="app", pod="", rule_key="",
                                       severity="error", evidence={"window_start": "2026-09-07T10:00:00Z"},
                                       detected_day="2026-09-07")
     store.save_ai_summary(anomaly_id, "summary", "action", [{"title": "t", "command": "kubectl get pods"}])

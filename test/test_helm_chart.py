@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import render as R  # noqa: E402
+
 from webapp.api.config import load_app_config  # noqa: E402
 
 pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
@@ -268,7 +269,9 @@ def test_credential_checksums_roll_workloads_without_exposing_values():
               "vector": {"enabled": True}}
     docs1, _ = _helm(_merge(BASE, inline))
     docs2, _ = _helm(_merge(BASE, _merge(inline, {"s3": {"credentials": {"vector": {"secretAccessKey": "rotated-not-real"}}}})))
-    ann = lambda docs, kind, name: _find(docs, kind, name)["spec"]["template"]["metadata"]["annotations"]
+    def ann(docs, kind, name):
+        return _find(docs, kind, name)["spec"]["template"]["metadata"]["annotations"]
+
     v1, v2 = ann(docs1, "DaemonSet", "logscope-vector"), ann(docs2, "DaemonSet", "logscope-vector")
     assert v1["checksum/credentials"] != v2["checksum/credentials"]
     # Rotating Vector's key does not restart the web app.
@@ -405,3 +408,30 @@ def test_settings_secret_refs_and_allowed_hosts():
         cfg = load_app_config(p)
     assert cfg.ai.prices == {"m-1": {"input": 1.0, "output": 2.0}}
     assert cfg.ai.budgets == {"daily_tokens": 1000} and cfg.ai.features == {"anomaly_auto_summary": True}
+
+
+def test_alert_values_reach_config_and_env():
+    from webapp.api.config import DEFAULT_ALERTS
+
+    docs, _ = _helm(_merge(BASE, {"alerts": {"displayTz": "Asia/Kolkata", "publicUrl": "https://logs.example.com",
+                                             "allowedHosts": ["mm.chat.svc", "hooks.internal"],
+                                             "watermarkMarginSecs": 300}}))
+    raw = _find(docs, "ConfigMap", "logscope-webapp-config")["data"]["config.yaml"]
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "config.yaml"
+        p.write_text(raw)
+        cfg = load_app_config(p)
+    assert (cfg.alerts.display_tz, cfg.alerts.public_url) == ("Asia/Kolkata", "https://logs.example.com")
+    assert cfg.alerts.watermark_margin_secs == 300
+    # The watermark assumes Vector's batch timeout: the chart and render.py use the same value.
+    assert cfg.alerts.s3_batch_timeout_secs == R.S3_BATCH_TIMEOUT_SECS == DEFAULT_ALERTS["s3_batch_timeout_secs"]
+    env = {e["name"]: e.get("value") for e in _find(docs, "Deployment", "logscope-webapp")
+           ["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert env["LOGSCOPE_ALERT_ALLOWED_HOSTS"] == "mm.chat.svc,hooks.internal"
+    _, err = _helm(_merge(BASE, {"webapp": {"extraEnv": [{"name": "LOGSCOPE_ALERT_ALLOWED_HOSTS", "value": "x"}]}}),
+                   expect_ok=False)
+    assert "webapp.extraEnv must not set LOGSCOPE_ALERT_ALLOWED_HOSTS" in err
+    default_docs, _ = _helm(BASE)
+    default_env = {e["name"] for e in _find(default_docs, "Deployment", "logscope-webapp")
+                   ["spec"]["template"]["spec"]["containers"][0]["env"]}
+    assert "LOGSCOPE_ALERT_ALLOWED_HOSTS" not in default_env

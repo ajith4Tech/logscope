@@ -33,10 +33,11 @@ import secrets
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .ai_summary import SUPPORTED_PROVIDERS, capture_usage, is_local_base_url
 from .config import AiConfig
@@ -44,12 +45,13 @@ from .state import StateDB
 
 logger = logging.getLogger(__name__)
 
-ADMIN_TOKEN_ENV = "LOGSCOPE_ADMIN_TOKEN"
-SECRET_KEY_ENV = "LOGSCOPE_SECRET_KEY"
-SECRET_KEY_PREVIOUS_ENV = "LOGSCOPE_SECRET_KEY_PREVIOUS"
+# Names of variables and files that hold credentials, not credentials.
+ADMIN_TOKEN_ENV = "LOGSCOPE_ADMIN_TOKEN"  # noqa: S105
+SECRET_KEY_ENV = "LOGSCOPE_SECRET_KEY"  # noqa: S105
+SECRET_KEY_PREVIOUS_ENV = "LOGSCOPE_SECRET_KEY_PREVIOUS"  # noqa: S105
 ALLOWED_HOSTS_ENV = "LOGSCOPE_AI_ALLOWED_HOSTS"
-ADMIN_TOKEN_FILE = "admin.token"
-SECRET_KEY_FILE = "secret.key"
+ADMIN_TOKEN_FILE = "admin.token"  # noqa: S105
+SECRET_KEY_FILE = "secret.key"  # noqa: S105
 # Environment variables that pin a field (and make it read-only in the UI).
 FIELD_ENV = {
     "provider": "LOGSCOPE_AI_PROVIDER",
@@ -67,7 +69,9 @@ TEST_FEATURE = "settings_test"
 # Every "Deep analysis" run is metered under this feature (whatever it
 # explains), so it has its own daily_calls budget.
 DEEP_FEATURE = "deep_analysis"
-BUDGET_FEATURES = FEATURES + (DEEP_FEATURE,)
+# Optional AI summary in alert notifications (a per-rule opt-in, not a flag).
+ALERT_FEATURE = "alert_summary"
+BUDGET_FEATURES = FEATURES + (DEEP_FEATURE, ALERT_FEATURE)
 TIERS = ("fast", "deep")
 OUTCOMES = ("ok", "error", "cache_hit", "budget_blocked", "signature")
 # Outcomes that reached the provider: they count against the budgets.
@@ -935,6 +939,8 @@ def budget_response(budget: str) -> dict[str, Any]:
 def _result_chars(result: Any) -> int:
     if not isinstance(result, dict):
         return 0
+    if "summary" not in result and "steps" not in result:  # e.g. a complete_json object
+        return len(json.dumps(result, ensure_ascii=False, default=str))
     return len(json.dumps({k: result.get(k) for k in ("summary", "steps")}, ensure_ascii=False))
 
 

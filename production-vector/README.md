@@ -12,8 +12,12 @@ S3 key layout (from config `sinks.s3.key_prefix`; shown with the default
 
 ```
 s3://$BUCKET/k3s-logs/logs/{error|warning|info|debug|metrics}/%Y/%m/%d/%H_%M_%S_<batch>.log.gz
-s3://$BUCKET/k3s-logs/logs/security/<severity>/%Y/%m/%d/%H_%M_%S_<batch>.log.gz   # Falco copy, when enabled
+s3://$BUCKET/k3s-logs/logs/security/<severity>/%Y/%m/%d/%H_%M_%S_<batch>.log.gz   # Falco events, when enabled
 ```
+
+Keys are partitioned by severity only, not by scope (infra vs namespace): the
+line carries the namespace and the web app derives the scope from it. Falco
+events are written once, under `security/` only; the main sink leaves them out.
 
 Helm values and Vector config are rendered from the repo-root `config.yaml`
 (`sinks.s3.*`). Do not put real bucket/region/ARNs in git; `config.example.yaml`
@@ -25,7 +29,7 @@ only has empty examples.
 |---|---|
 | Extra hostPath for checkpoints (`paths.checkpoint`, DirectoryOrCreate) | Chart default `/var/lib/vector` mount — do not duplicate |
 | S3 sink when `sinks.s3.enabled` | File sink when `sinks.file.enabled` |
-| Env `AWS_REGION` / `S3_BUCKET` + Secret keys, or IRSA annotation | No AWS env |
+| Bucket and region written literally into the sink (Vector 0.57+ does not interpolate `${ENV}` by default; the `AWS_REGION` / `S3_BUCKET` env vars are set but not read by the config). Keys from the Secret `sinks.s3.secret_name` as env, or IRSA annotation | No AWS env |
 
 **Not previously tested against live S3 in this repo.** Batch size (50MB),
 timeout (600s), gzip, disk buffer (2.5 GiB per S3 sink, so 5 GiB with Falco
@@ -37,15 +41,16 @@ trusting the pipeline.
 **Inferred (not copied from a running S3 deploy):**
 
 - `sinks.s3.irsa_role_arn` — if set, annotates the Vector ServiceAccount with
-  `eks.amazonaws.com/role-arn` and **omits** static access keys. The old kit
-  always used Secret `vector-s3-creds`. IRSA was not wired in Vector values
-  before; verify assume-role and that you do not also inject keys.
-- Multiline `reduce` `group_by` uses `pod_name` + `container_name` +
-  `pod_namespace` when `multiline.enabled` is true. Never used on the old S3
-  kit (`multiline.enabled: false` by default).
-- Classify VRL always sets `scope` (infra vs `namespaces/<ns>`). S3
-  `key_prefix` does not use `scope` unless you add it. Extra field is unused
-  for S3; harmless.
+  `eks.amazonaws.com/role-arn` and **omits** static access keys. Otherwise the
+  keys come from the Secret named by `sinks.s3.secret_name` (default
+  `vector-s3-creds`). IRSA was not wired in Vector values before; verify
+  assume-role and that you do not also inject keys.
+- Multiline `reduce` is **on by default** (`multiline.enabled: true`), grouped
+  by `pod_name` + `container_name` + `pod_namespace`. The old S3 kit never
+  used it; set `multiline.enabled: false` to ship physical lines.
+- Classify VRL always sets `scope` (infra vs `namespaces/<ns>`). The default
+  S3 `key_prefix` does not use `scope`, and the web app assumes it does not
+  (it lists `<root>/<severity>/` prefixes).
 - Namespace lookup prefers `kubernetes.pod_namespace`, then
   `namespace_name` (local Vector behavior). Old `vector.toml` only read
   `namespace_name`.
@@ -69,8 +74,10 @@ NS=$(python3 -c "import yaml; print(yaml.safe_load(open('../config.yaml'))['clus
 kubectl apply -f ../deploy/namespace.yaml
 kubectl label ns "$NS" vector.dev/exclude=true --overwrite
 
-# Static keys (skip if irsa_role_arn is set in config):
-kubectl -n "$NS" create secret generic vector-s3-creds \
+# Static keys (skip if irsa_role_arn is set in config). The name must equal
+# sinks.s3.secret_name (default vector-s3-creds):
+SECRET=$(python3 -c "import yaml; print(yaml.safe_load(open('../config.yaml'))['sinks']['s3'].get('secret_name') or 'vector-s3-creds')")
+kubectl -n "$NS" create secret generic "$SECRET" \
   --from-literal=AWS_ACCESS_KEY_ID=... \
   --from-literal=AWS_SECRET_ACCESS_KEY=...
 

@@ -46,6 +46,9 @@ routing:
 falco:
   enabled: true
   namespace: falco
+  # Falco's own container(s) in that namespace; other pods and sidecars there
+  # (e.g. falcoctl) are classified like any workload.
+  containers: [falco]
   priority_map:
     emergency: error
     alert: error
@@ -111,7 +114,7 @@ severity:
     - name: error
       level_equals: [err]
       level_contains: [error, fatal, panic, critical, emerg, alert]
-      klog: "E"
+      klog: ["E", "F"]          # klog E#### and F#### (fatal) lines
       keywords:
         - error
         - failed
@@ -173,7 +176,6 @@ backup:
 webapp:
   backend:
     poll_interval_secs: 30
-    db_path: /tmp/logscope-webapp.sqlite
     page_size_default: 200
     page_size_max: 1000
   # Logscope Insights — statistical anomaly detection over the same records store.

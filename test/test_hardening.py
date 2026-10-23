@@ -13,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import upsert_anomaly  # noqa: E402
 from test_production import JSON, _make_webapp, _request, _serve  # noqa: E402
 
 from webapp.api.insights import AnomalyStore  # noqa: E402
@@ -109,7 +110,7 @@ def test_stored_plans_are_rederived_with_the_current_parser():
 
         LogStorage(db)
         store = AnomalyStore(db)
-        anomaly_id = store.upsert_anomaly(type="error_rate_spike", namespace="app", pod="", rule_key="",
+        anomaly_id = upsert_anomaly(store, type="error_rate_spike", namespace="app", pod="", rule_key="",
                                           severity="error", evidence={"window_start": "2026-09-07T10:00:00Z"},
                                           detected_day="2026-09-07")
         # Saved by an older parser: "deployment foo" became a restart of a
@@ -138,7 +139,6 @@ import io  # noqa: E402
 import sqlite3  # noqa: E402
 
 import pytest  # noqa: E402
-
 from test_production import CONFIG, FakeS3, _gz, _S3WithFailures  # noqa: E402
 
 from webapp.api import ingest as ingest_mod  # noqa: E402
@@ -438,7 +438,7 @@ def test_insights_status_shows_provider_failures_without_failing_detection(tmp_p
     db = tmp_path / "db.sqlite"
     LogStorage(db)
     store = AnomalyStore(db)
-    store.upsert_anomaly(type="error_rate_spike", namespace="app", pod="", rule_key="", severity="error",
+    upsert_anomaly(store, type="error_rate_spike", namespace="app", pod="", rule_key="", severity="error",
                          evidence={"window_start": "2026-09-07T10:00:00Z"}, detected_day="2026-09-07")
 
     def failing(_):

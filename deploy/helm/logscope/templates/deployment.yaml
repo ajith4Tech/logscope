@@ -116,6 +116,11 @@ spec:
                   optional: true
             {{- end }}
             {{- end }}
+            {{- with .Values.alerts.allowedHosts }}
+            # Alert channel hosts allowed over http / on private addresses.
+            - name: LOGSCOPE_ALERT_ALLOWED_HOSTS
+              value: {{ join "," . | quote }}
+            {{- end }}
             {{- with .Values.ai.allowedHosts }}
             - name: LOGSCOPE_AI_ALLOWED_HOSTS
               value: {{ join "," . | quote }}

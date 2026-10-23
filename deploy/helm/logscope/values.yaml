@@ -128,6 +128,29 @@ mattermost:
   maxAgeHours: 6
 
 # ---------------------------------------------------------------------------
+# Alerts on saved views (UI: Alerts tab). Rules and channels are created in
+# the UI (writes need the Settings admin token) and stored in the state
+# database; webhook URLs are encrypted with the settings master key. The
+# Mattermost webhook above, when set, is offered as a read-only default channel.
+# Alerts assume ONE web app replica (the evaluator and its state live in the
+# pod); the chart enforces replicaCount <= 1 and the Recreate strategy.
+# Webhooks need outbound HTTPS from the pod: see "NetworkPolicy and egress"
+# in README.md.
+# ---------------------------------------------------------------------------
+alerts:
+  # IANA zone for times in notifications, e.g. Asia/Kolkata.
+  displayTz: UTC
+  # Public URL of the UI for deep links in notifications, e.g.
+  # https://logscope.example.com. Empty = mattermost.linkBaseUrl, else no links.
+  publicUrl: ""
+  # Hosts a channel URL may use besides public https hosts: http is allowed
+  # and private/loopback addresses are not refused for these (link-local and
+  # cloud metadata addresses always are). e.g. [mattermost.chat.svc.cluster.local]
+  allowedHosts: []
+  # Seconds subtracted from the ingest watermark; every alert window ends there.
+  watermarkMarginSecs: 120
+
+# ---------------------------------------------------------------------------
 # Log classification — shared by chart-managed Vector and the web app.
 # With an EXISTING Vector install, keep these identical to the config.yaml it
 # was rendered from (scripts/render.py), or the web app misreads its output.
@@ -141,6 +164,7 @@ logscope:
   falco:
     enabled: true
     namespace: falco      # namespace where Falco pods run
+    containers: [falco]   # Falco's own container name(s) there; other containers are ordinary workloads
     priority_map:         # all 8 Falco priorities → a severity bucket name
       emergency: error
       alert: error
@@ -164,7 +188,7 @@ logscope:
       - name: error
         level_equals: [err]
         level_contains: [error, fatal, panic, critical, emerg, alert]
-        klog: "E"
+        klog: ["E", "F"]   # klog E#### and F#### (fatal)
         keywords: [error, failed, failure, exception, traceback, panic, fatal, critical, emerg, segmentation fault]
       - name: warning
         level_contains: [warn]

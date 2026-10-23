@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "test"))
 
+from helpers import cache_stats, in_flight, upsert_anomaly  # noqa: E402
 from test_ai_settings import (  # noqa: E402,F401
     ADMIN,
     ANSWER,
@@ -32,6 +33,7 @@ from test_ai_settings import (  # noqa: E402,F401
     _usage_rows,
     served,
 )
+
 from webapp.api import ai_summary  # noqa: E402
 from webapp.api.ai_cache import AiCache, SingleFlight  # noqa: E402
 from webapp.api.ai_summary import (  # noqa: E402
@@ -41,7 +43,6 @@ from webapp.api.ai_summary import (  # noqa: E402
     prepare_untrusted_payload,
 )
 from webapp.api.config import AiConfig  # noqa: E402
-from webapp.api.explain import anomaly_template_summary  # noqa: E402
 from webapp.api.insights import InsightsJob  # noqa: E402
 from webapp.api.state import StateDB  # noqa: E402
 from webapp.api.storage import open_connection  # noqa: E402
@@ -125,7 +126,7 @@ def test_single_flight_shares_one_provider_call(tmp_path, monkeypatch):
     for t in threads:
         t.start()
     for _ in range(100):
-        if app.ai_cache.flight.in_flight() and len(calls) == 1:
+        if in_flight(app.ai_cache.flight) and len(calls) == 1:
             break
         time.sleep(0.01)
     time.sleep(0.2)  # the other two are waiting on the same key
@@ -150,7 +151,7 @@ def test_ttl_expiry(tmp_path, monkeypatch):
     assert cache.get("line:fast:x:error")["hits"] == 1
     now[0] += timedelta(hours=2)
     assert cache.get("line:fast:x:error") is None
-    assert cache.stats()["entries"] == 0  # removed, not just hidden
+    assert cache_stats(cache)["entries"] == 0  # removed, not just hidden
 
     calls = _counting_openai(monkeypatch)
     app = _configured_app(tmp_path / "app", monkeypatch, cache_ttl_hours=1)
@@ -282,7 +283,7 @@ def test_deep_tier_uses_deep_model_separate_cache_and_budget(tmp_path, served, m
 
 def _anomaly(app, *, type_="new_falco_rule", namespace="", severity="error", rule_key="Odd binary ran",
              messages=("odd binary /tmp/x ran",), window="2026-09-07T10:00:00Z", day="2026-09-07"):
-    return app.anomaly_store.upsert_anomaly(
+    return upsert_anomaly(app.anomaly_store,
         type=type_, namespace=namespace, pod="", rule_key=rule_key, severity=severity, detected_day=day,
         evidence={"window_start": window, "current_count": 12, "expected_count": 3.0, "baseline_avg_per_hour": 3.0,
                   "observed_minutes": 60, "baseline_window_days": 7, "sample_messages": list(messages)})
@@ -386,7 +387,7 @@ def test_batching_up_to_five_anomalies_in_one_call(tmp_path, monkeypatch):
     assert [a["id"] for a in first] == same_window[:5]  # at most 5, same window
     worker.process(first)
     assert len(calls) == 1 and "summaries" in calls[0]["messages"][0]["content"]
-    for anomaly_id, name in zip(same_window[:5], "abcde"):
+    for anomaly_id, name in zip(same_window[:5], "abcde", strict=True):
         saved = app.anomaly_store.get_anomaly(anomaly_id)
         assert saved["ai_summary"] == f"Summary for rule {name}" and saved["ai_meta"]["tier"] == "fast"
     rest = worker.take_batch(timeout=0)

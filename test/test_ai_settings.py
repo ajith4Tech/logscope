@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "test"))
 
 from test_production import CONFIG, JSON, _raw, _request, _serve  # noqa: E402
+
 from webapp.api import ai_settings  # noqa: E402
 from webapp.api.ai_settings import (  # noqa: E402
     AuthFailureLimiter,

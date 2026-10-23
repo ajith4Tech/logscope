@@ -13,7 +13,7 @@ are no deployment scripts.
 │        ▼                                         │
 │ Vector DaemonSet ── classify (VRL) ──────────────┼──► AWS S3 bucket
 │  ▲  severity buckets, infra vs namespace,        │    <keyPrefix>/<bucket>/YYYY/MM/DD/…gz
-│  │  Falco JSON → scope "security"                │    (+ security/<bucket>/… for Falco)
+│  │  Falco JSON → scope "security"                │    (Falco: security/<bucket>/… only)
 │  │                                               │         │
 │ Falco DaemonSet ── JSON alerts on stdout         │         │ poll every 30s (read-only)
 │  (kernel events → rules)                         │         ▼
@@ -29,7 +29,7 @@ are no deployment scripts.
 | Component | Responsibility | Where it runs | Managed by this chart |
 |---|---|---|---|
 | **Falco** | Detects runtime security events and prints them as JSON to stdout | k3s (privileged DaemonSet) | Optional: `falco.enabled` (official chart 9.1.0, vendored). Default: use the existing install |
-| **Vector** | Tails all pod logs, classifies severity and scope, writes gzip objects to S3. Falco events are recognised by namespace and written twice: to their severity prefix and to `security/` | k3s (DaemonSet) | Optional: `vector.enabled`. Default: use the existing install (`scripts/render.py` + `vector/vector`) |
+| **Vector** | Tails all pod logs, classifies severity and scope, writes gzip objects to S3. Falco events are recognised by namespace and container (`logscope.falco.containers`) and written once, under `security/<severity>/` | k3s (DaemonSet) | Optional: `vector.enabled`. Default: use the existing install (`scripts/render.py` + `vector/vector`) |
 | **S3** | Durable log store. Its lifecycle rule is the retention policy | External (AWS) | No. Bucket, IAM and lifecycle rule are prerequisites |
 | **Logscope web app** | Polls S3, caches in SQLite, serves the UI/API, detects anomalies, requests AI summaries | k3s (Deployment + PVC) | Always |
 | **AI provider** | Summarises anomalies and explains logs on request. It receives log samples | External API | No. Configured via `ai.*` |
@@ -212,7 +212,9 @@ blocked calls).
   for local hosts; anything else gets `422`.
 - **Feature flags.** `explain_line`, `explain_filtered`,
   `anomaly_auto_summary` (default **off**: anomalies are summarized only on
-  request), `anomaly_manual_summary`, `nl_filters` (reserved). A disabled
+  request), `anomaly_manual_summary`, `nl_filters` (the Ask box: proposes
+  filters from a plain-language request via `POST /api/ai/filters`, fast
+  model, never applied without a click; no log content is sent). A disabled
   feature answers `403 {"error": "ai_feature_disabled"}` and its buttons are
   hidden.
 - **Budgets** (UTC days): `daily_tokens`, `daily_cost_usd`, and per-feature
@@ -250,6 +252,67 @@ as not set (`key_set: false`), the tab and `/api/status` show a warning, and
 the key has to be entered again. A key from `ai.apiKey`/`ai.existingSecret`
 is not affected. Rotating the admin token is a Secret update (or deleting
 `/state/admin.token`) followed by a restart.
+
+### Alerts on saved views (Alerts tab)
+
+A rule counts what a saved view matches (`count`, `error_count` or
+`distinct_pods`) over a window of 5 min to 24 h, every 1 to 60 min, and
+compares it with a threshold (`>`, `>=`, `<`, `<=`), optionally per namespace
+or pod (at most 20 groups; the rest is reported as overflow). At most 100
+rules. Creating, changing or deleting rules and channels needs the Settings
+admin token; muting (1 h, 4 h, 24 h or custom) does not, so on-call can
+silence a rule from the UI (rate limited per address). The rule form shows a
+backtest ("would have fired N times in 7 days") computed from the histogram
+buckets.
+
+- **Watermark.** Every window ends at the ingest watermark, never at "now":
+  per S3 prefix, the start of its latest complete listing minus Vector's
+  batch timeout (600 s), held back to the key time of any object that is
+  still failing; the oldest prefix wins, minus `alerts.watermarkMarginSecs`.
+  `/api/status` → `watermark` shows it. When it is more than 3 × the batch
+  timeout (30 min) behind, the pipeline is stale: `<`/`<=` rules report
+  *unknown* instead of firing on missing data, and one `pipeline_stale` alert
+  goes to the default (environment Mattermost) channel.
+- **States.** ok → pending (until the required consecutive breaches) →
+  firing → resolved → ok. Notifications on firing, again every
+  `renotify` interval while firing (default 6 h), and on resolved if enabled.
+  A muted rule still records its events. Every transition is kept in the
+  state database for 30 days, and the evaluator rebuilds its state from it at
+  start, so a restart neither forgets nor re-sends a firing alert.
+- **Channels.** Mattermost or Slack incoming webhooks, or a generic JSON
+  webhook (optionally signed: `X-Logscope-Signature: sha256=<HMAC-SHA256 of the
+  body>`). URLs and signing secrets are encrypted with the settings master key
+  and are write-only (the UI shows the last six characters). 10 s timeout, 5
+  attempts with backoff, no redirects; failures are stored with the event.
+  Channel URLs must be https and must not resolve to link-local, cloud
+  metadata, loopback or private addresses; list internal hosts (e.g. an
+  in-cluster Mattermost) in `alerts.allowedHosts` to allow http and private
+  addresses for them (link-local and metadata stay refused). The Mattermost
+  webhook from `mattermost.*` is offered as a read-only default channel; its
+  URL never leaves the environment variable.
+- **Content.** Rule, value vs threshold, the window in `alerts.displayTz`,
+  the three most frequent message templates with counts (redacted, no raw log
+  lines), the matching known-pattern title, and a link to the Logs tab with
+  the view's filters and that window when `alerts.publicUrl` (or
+  `mattermost.linkBaseUrl`) is set. A rule can opt in to an AI summary (fast
+  model, metered and budgeted as `alert_summary`; skipped, not blocking, when
+  over budget).
+- **One replica.** The evaluator and its in-memory state live in the web app
+  pod; two replicas would evaluate and notify twice. The chart allows only
+  `replicaCount` 0 or 1 and uses the `Recreate` strategy, so this holds.
+
+### NetworkPolicy and egress
+
+The chart's NetworkPolicy restricts **ingress** only. Outbound traffic is
+whatever the namespace allows. If your cluster applies a default-deny egress
+policy, the web app pod needs egress to:
+
+- S3 (`s3.<region>.amazonaws.com`, TCP 443) for ingestion;
+- the AI provider API (TCP 443) when AI is enabled;
+- every alert channel's host (TCP 443, or the port in an allowed http URL),
+  and the Mattermost server for anomaly notifications;
+- DNS (kube-dns, UDP/TCP 53), since channel hosts are resolved and checked
+  before each delivery.
 
 ## Image
 
@@ -539,7 +602,8 @@ failures are also logged with a traceback.
 - **Rate limiting covers AI calls only.** Other API endpoints aren't
   throttled, and the AI limit is in memory and per pod (see
   [Request protections](#request-protections-in-the-web-app)).
-- **Single web app replica** (SQLite); no high availability.
+- **Single web app replica** (SQLite); no high availability. Alerts rely on
+  it too: a second replica would evaluate and notify every rule twice.
 - **S3 only, AWS endpoints.** There is no custom S3 endpoint (MinIO/Ceph), no
   IRSA wiring in the chart, and no file-sink mode in the chart.
 - **Vector runs as root with host log mounts**; Falco is privileged (upstream

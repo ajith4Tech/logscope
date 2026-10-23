@@ -83,7 +83,10 @@ timestamp format, infra scope "infra", namespace scope prefix "namespaces/".
 {{- $l = append $l "# ---- klog prefixes ----" -}}
 {{- $l = append $l `if bkt == "" {` -}}
 {{- range $i, $b := $klog -}}
-{{- $rx := include "logscope.vrl.rx" (printf `^%s\d{4}\s` (regexQuoteMeta (toString $b.klog))) -}}
+{{- $pfxs := list -}}
+{{- range (kindIs "slice" $b.klog | ternary $b.klog (list $b.klog)) }}{{ $pfxs = append $pfxs (regexQuoteMeta (toString .)) }}{{ end -}}
+{{- $alt := ternary (first $pfxs) (printf "(?:%s)" (join "|" $pfxs)) (eq (len $pfxs) 1) -}}
+{{- $rx := include "logscope.vrl.rx" (printf `^%s\d{4}\s` $alt) -}}
 {{- $l = append $l (printf "  %s match(text, r'%s') { bkt = %s }" (ternary "if" "else if" (eq $i 0)) $rx (include "logscope.vrl.str" $b.name)) -}}
 {{- end -}}
 {{- $l = append $l "}" -}}
@@ -154,9 +157,11 @@ timestamp format, infra scope "infra", namespace scope prefix "namespaces/".
 {{- $out := `out = ts + " - " + ns + " - " + pod + "/" + contnr + " - " + flat` -}}
 {{- if .Values.logscope.falco.enabled -}}
 {{- $pm := .Values.logscope.falco.priority_map -}}
-{{- $l = append $l "# ---- falco (detect via config namespace; parallel sink uses .falco) ----" -}}
+{{- $containers := list -}}
+{{- range (.Values.logscope.falco.containers | default (list "falco")) }}{{ $containers = append $containers (include "logscope.vrl.str" .) }}{{ end -}}
+{{- $l = append $l "# ---- falco (detect via config namespace + container; sinks split on .falco) ----" -}}
 {{- $l = append $l "falco_hit = false" -}}
-{{- $l = append $l (printf "if ns == %s {" (include "logscope.vrl.str" .Values.logscope.falco.namespace)) -}}
+{{- $l = append $l (printf "if ns == %s && includes([%s], contnr) {" (include "logscope.vrl.str" .Values.logscope.falco.namespace) (join ", " $containers)) -}}
 {{- $l = append $l "  falco_hit = true" -}}
 {{- $l = append $l `  scope = "security"` -}}
 {{- $l = append $l `  fout, foerr = get(obj, ["output"])` -}}
@@ -228,9 +233,12 @@ timestamp format, infra scope "infra", namespace scope prefix "namespaces/".
 {{- $classifyInput = "multiline" -}}
 {{- end -}}
 {{- $_ := set $transforms "classify_and_scope" (dict "type" "remap" "inputs" (list $classifyInput) "drop_on_error" true "reroute_dropped" false "source" (include "logscope.vector.vrl" .)) -}}
-{{- $sinks := dict "s3_logs" (include "logscope.vector.s3sink" (list . "classify_and_scope" .Values.s3.keyPrefix) | fromJson) -}}
+{{- $mainInput := ternary "regular_events" "classify_and_scope" (and .Values.logscope.falco.enabled true) -}}
+{{- $sinks := dict "s3_logs" (include "logscope.vector.s3sink" (list . $mainInput .Values.s3.keyPrefix) | fromJson) -}}
 {{- if .Values.logscope.falco.enabled -}}
+{{- /* Falco events go to S3 once, under security/ (the web app reads them there). */ -}}
 {{- $_ := set $transforms "falco_security" (dict "type" "filter" "inputs" (list "classify_and_scope") "condition" ".falco == true") -}}
+{{- $_ := set $transforms "regular_events" (dict "type" "filter" "inputs" (list "classify_and_scope") "condition" ".falco != true") -}}
 {{- $falcoPrefix := "k3s-logs/logs/{{ scope }}/{{ log_type }}/%Y/%m/%d/%H_%M_%S_" -}}
 {{- if contains "{{ log_type }}" .Values.s3.keyPrefix -}}
 {{- $falcoPrefix = replace "{{ log_type }}" "{{ scope }}/{{ log_type }}" .Values.s3.keyPrefix -}}

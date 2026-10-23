@@ -12,6 +12,7 @@ Mutating actions (such as rollout restart or rollback) require explicit confirma
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -23,8 +24,9 @@ import shlex
 import subprocess
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -690,7 +692,8 @@ def _run_command(argv: list[str], *, timeout: float, max_bytes: int) -> tuple[in
     """Run argv without a shell. Returns (exit code, stdout, stderr,
     output_limited, timed_out). Each stream keeps at most max_bytes; past
     that the process is stopped instead of buffering the rest."""
-    proc = subprocess.Popen(
+    # argv comes from build_kubectl_argv (allowlisted verbs, validated names), never a shell string.
+    proc = subprocess.Popen(  # noqa: S603
         argv, shell=False, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         env=_command_env(),
     )
@@ -708,10 +711,8 @@ def _run_command(argv: list[str], *, timeout: float, max_bytes: int) -> tuple[in
                     buf += data[:room]
                 if len(data) > room:
                     limited.set()
-                    try:
+                    with contextlib.suppress(OSError):
                         proc.kill()
-                    except OSError:
-                        pass
         finally:
             stream.close()
 
@@ -774,19 +775,3 @@ def run_described_action(described: dict[str, Any]) -> dict[str, Any]:
         "duration_ms": duration_ms,
     }
 
-
-def execute_action(
-    action_data: dict[str, Any],
-    *,
-    confirmed: bool = False,
-) -> dict[str, Any]:
-    """Validate and execute a structured Kubernetes diagnostic action.
-
-    Accepts the shapes listed in resolve_action. Mutating actions require
-    confirmed=True; the confirmation response carries the exact command.
-    The HTTP API additionally requires a ConfirmationTokens token.
-    """
-    described = describe_action(resolve_action(action_data))
-    if described["is_mutating"] and not confirmed:
-        return confirmation_response(described)
-    return run_described_action(described)

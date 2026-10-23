@@ -11,8 +11,9 @@ import json
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any
 
 from .state import StateDB
 
@@ -22,7 +23,7 @@ FRONT_TTL_SECS = 60.0
 SINGLE_FLIGHT_WAIT_SECS = 600.0
 _PRUNE_EVERY_SECS = 3600.0
 DROP_NET_DOWN = 2
-KINDS = ("line", "filtered", "anomaly")
+KINDS = ("line", "filtered", "anomaly", "nl_filters")
 TIERS = ("fast", "deep")
 
 
@@ -75,10 +76,6 @@ class SingleFlight:
             with self._lock:
                 self._calls.pop(key, None)
             call.done.set()
-
-    def in_flight(self) -> int:
-        with self._lock:
-            return len(self._calls)
 
 
 class AiCache:
@@ -206,11 +203,3 @@ class AiCache:
             removed = self._db.conn.execute("DELETE FROM ai_cache WHERE created_at <= ?", (cutoff,)).rowcount
             self._db.conn.execute("DELETE FROM ai_cache_votes WHERE key NOT IN (SELECT key FROM ai_cache)")
             return removed
-
-    def stats(self) -> dict[str, Any]:
-        with self._db.lock:
-            row = self._db.conn.execute(
-                "SELECT COUNT(*), COALESCE(SUM(hits), 0), COALESCE(SUM(helpful_up), 0), "
-                "COALESCE(SUM(helpful_down), 0) FROM ai_cache").fetchone()
-        return {"entries": int(row[0]), "hits": int(row[1]), "helpful_up": int(row[2]), "helpful_down": int(row[3]),
-                "ttl_hours": self.ttl.total_seconds() / 3600}

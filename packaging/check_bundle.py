@@ -67,9 +67,7 @@ def check(entries: list[str]) -> list[str]:
         parts = path.parts
         if any(fnmatch.fnmatch(path.name, pattern) for pattern in FORBIDDEN_NAMES):
             problems.append(f"forbidden file: {entry}")
-        elif parts and len(parts) > 1 and parts[0] in FORBIDDEN_TOP_DIRS:
-            problems.append(f"forbidden directory: {entry}")
-        elif FORBIDDEN_ANY_DIRS.intersection(parts[:-1]):
+        elif parts and len(parts) > 1 and parts[0] in FORBIDDEN_TOP_DIRS or FORBIDDEN_ANY_DIRS.intersection(parts[:-1]):
             problems.append(f"forbidden directory: {entry}")
     return problems
 

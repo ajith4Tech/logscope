@@ -2,7 +2,10 @@
 
 Centralized Kubernetes (k3s) log collection. **Vector** runs as a DaemonSet, tails
 every container log, classifies severity, and writes **infra** vs **per-namespace**
-files — or ships the same classified lines to S3.
+files — or ships the same classified lines to S3. S3 objects are keyed by
+severity only (`<key_prefix root>/<severity>/%Y/%m/%d/…`), **not** by scope;
+Falco events are the one exception (`…/security/<severity>/…`, see below). The
+web app derives infra vs namespace from each line's namespace.
 
 Clone the repo, copy `config.example.yaml` → `config.yaml`, set your node path and
 namespaces, render, deploy. No code changes.
@@ -13,12 +16,16 @@ Identity and classification live in **one YAML file**. `scripts/render.py` write
 cluster install files into `deploy/` (Helm values, namespace, backup CronJob,
 raw `vector.yaml`).
 
-**Why a Python pre-processor (not Vector env templating)?** Vector can substitute
-`${ENV}` into a few sink fields, but it cannot build VRL from a namespace glob
-list, a line-format template, or a keyword table. Helm already `tpl`s
-`customConfig`, which is why file-sink paths use `{{`{{ scope }}`}}`. A small
-render step keeps one source of truth. Cost: Python 3 + PyYAML before `helm
-upgrade`. Alternative would be a hand-maintained Vector config per cluster.
+**Why a Python pre-processor (not Vector env templating)?** Vector 0.57+ disables
+`${ENV}` interpolation in its config by default, and even with it enabled it
+could not build VRL from a namespace glob list, a line-format template, or a
+keyword table. So `render` writes literal values into the config (S3 bucket and
+region included; the `AWS_REGION` / `S3_BUCKET` env vars it also sets are not
+read by the config). AWS keys still come from the environment, read by Vector's
+AWS SDK, not by interpolation. Helm already `tpl`s `customConfig`, which is
+why file-sink paths use `{{`{{ scope }}`}}`. A small render step keeps one
+source of truth. Cost: Python 3 + PyYAML before `helm upgrade`. Alternative
+would be a hand-maintained Vector config per cluster.
 
 Environment variables override YAML after load (`LOGSCOPE_CLUSTER_NAMESPACE`,
 `LOGSCOPE_PATHS_HOST_PATH`, `LOGSCOPE_S3_BUCKET`, … — full list in
@@ -41,7 +48,7 @@ config edit, not a Vector rewrite.
 ├── logs/infra/{error,warning,info,debug,metrics}.log
 ├── logs/namespaces/<ns>/{error,warning,info,debug,metrics}.log
 ├── logs/security/{error,warning,info,debug}.log   # Falco (scope=security)
-├── logs/security.log                              # every Falco event (dual-write)
+├── logs/security.log                              # every Falco event again (file kit only)
 └── backups/current/          # incremental mirror (CronJob)
 ```
 
@@ -91,6 +98,15 @@ Same `config.yaml`. Set `sinks.s3.enabled: true`, `sinks.s3.region`,
 values). Optionally `sinks.file.enabled: false` if you do not want node files.
 Re-render, then follow [`production-vector/README.md`](./production-vector/README.md).
 
+**Credentials.** Without `sinks.s3.irsa_role_arn`, Vector reads
+`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` from the Kubernetes Secret named
+by `sinks.s3.secret_name` (default `vector-s3-creds`) in `cluster.namespace`.
+[`deploy/k3s/s3-secret.example.yaml`](./deploy/k3s/s3-secret.example.yaml)
+creates it: its `metadata.name` must equal `sinks.s3.secret_name`. The web app
+(and `logscope s3-lifecycle`, unless given `--secret`) read the keys from the
+file `deploy/k3s/s3-secret.yaml` itself (whatever its `metadata.name`), else
+from `AWS_*` env / the default AWS chain.
+
 **S3 retention** (`sinks.s3.retention_days`, default 30): after setting it in
 `config.yaml`, run once:
 
@@ -108,9 +124,23 @@ and redeploying Vector alone does **not** update the live rule.
 
 ## Classification
 
-Priority (unchanged): structured level → embedded JSON/logfmt → klog `E####` /
-`W####` / `I####` → Prometheus shape → keywords → `info`. Rules are
-`severity.buckets` in config.
+The first rule that sets a bucket wins, in this order (rules are
+`severity.buckets` in config):
+
+1. structured level field (`severity.structured_fields`), mapped through each
+   bucket's `level_equals` / `level_contains`;
+2. a level embedded in the raw line: JSON `"level":"…"` (`json_level_keys`),
+   then logfmt `level=…` (`logfmt_level`);
+3. klog prefixes: `E####` and `F####` (fatal) → error, `W####` → warning,
+   `I####` → info (`klog:` per bucket, a letter or a list);
+4. Prometheus exposition shape → the bucket with `prometheus: true`;
+5. `severity.extra_patterns` (regex → bucket);
+6. keywords (`keywords:` per bucket);
+7. `severity.default` (`info`).
+
+Then the **Falco override**: for Falco's own containers (see below) scope
+becomes `security`, the message becomes Falco's `output`, and Falco's
+`priority` replaces the bucket via `falco.priority_map`.
 
 ## Multiline aggregation
 
@@ -157,8 +187,11 @@ flowing through the existing `kubernetes_logs` source (JSON lines: `output`,
 `priority`, `rule`, `time`, `output_fields`). There is **no additional Vector
 source**.
 
-Classification (config-driven; namespace is `falco.namespace`, not a hardcoded
-string):
+Classification (config-driven): a line is Falco's when its pod is in
+`falco.namespace` **and** its container is listed in `falco.containers`
+(default `[falco]`, the official chart's container name). Other pods and
+sidecars in that namespace (e.g. `falcoctl`) are classified like any other
+workload.
 
 - **scope** is set to `security` (even if that namespace would otherwise be
   infra or `namespaces/<ns>`).
@@ -168,12 +201,18 @@ string):
 - The tagged line’s message is Falco’s `output` field (rule name prefixed
   when it is not already in `output`).
 
-**Dual-write** (parallel sinks, not exclusive routing): every Falco event is
-written to **both** `security.log` (unconditional) **and** the mapped
-severity file under `logs/security/` (`error.log` / `warning.log` /
-`info.log` / `debug.log`). Non-Falco events are unchanged. Set
-`falco.enabled: false` to skip this path entirely; Falco-namespace logs then
-use normal classification.
+**File sink:** every Falco event is written to **both** `security.log` and
+the mapped severity file under `logs/security/` (`error.log` / `warning.log` /
+`info.log` / `debug.log`).
+
+**S3:** every Falco event is written **once**, under
+`<key_prefix root>/security/<severity>/…` (the `falco_security_s3` sink); the
+main S3 sink leaves Falco events out. The web app reads Falco events from the
+`security/` prefix only (lines tagged ` scope=security` found in a regular
+prefix, written there by older versions, are skipped as duplicates).
+
+Non-Falco events are unchanged. Set `falco.enabled: false` to skip this path
+entirely; Falco-namespace logs then use normal classification.
 
 Deploy Falco (not run by `scripts/render.py`):
 
@@ -192,6 +231,7 @@ turn on JSON + stdout. Keep Helm `-n` / `namespaceOverride` in sync with
 falco:
   enabled: true
   namespace: falco          # which namespace Falco's own pods run in — used to detect Falco output
+  containers: [falco]       # Falco's container name(s) in those pods
   priority_map:             # Falco priority scale -> Logscope severity buckets
     emergency: error
     alert: error
@@ -243,9 +283,53 @@ From a source checkout the same commands run as `python3 -m logscope ...`
 (`python3 -m webapp.api.server`, `python -m webapp.api.dbtool`,
 `scripts/render.py`, `scripts/apply_s3_lifecycle.py`).
 
+The log cache (SQLite, rebuildable from S3) defaults to
+`$XDG_CACHE_HOME/logscope/cache.sqlite`, else `~/.cache/logscope/cache.sqlite`
+(never `/tmp`); `webapp.backend.db_path` or `LOGSCOPE_WEBAPP_DB_PATH` override
+it (the Helm chart keeps it on its PVC). Saved views, alerts and AI settings
+live in a separate state database (`$XDG_DATA_HOME/logscope/state.sqlite`).
+Every time filter, window and bucket uses each record's event time in UTC
+epoch seconds (`ts_epoch`); a timestamp without a zone is taken as UTC, and a
+line whose timestamp does not parse is placed at its S3 object's time and
+counted in `/api/status` (`timestamp_fallbacks`). A cache from an older
+version is backfilled in the background (`storage.ts_backfill` in
+`/api/status` while it runs).
+
+### API added since v0.3.0
+
+Reads are open; "admin" means the `Authorization: Bearer <admin token>` header
+(see the chart README). Cross-origin browser requests are refused for every
+write.
+
+| Method and path | Auth | Purpose |
+|---|---|---|
+| `GET`, `PUT /api/settings/ai` | admin | AI provider, model, key (write-only), feature flags, budgets |
+| `POST /api/settings/ai/test` | admin | One minimal call with the saved settings |
+| `GET /api/settings/ai/usage?days=N` | admin | Calls, tokens and estimated cost per feature |
+| `POST /api/anomalies/{id}/summarize` | — | AI summary of one anomaly (`tier`, `regenerate`, `skip_signature`) |
+| `POST /api/ai/filters` | — | Natural language → proposed filters (nothing is applied) |
+| `POST /api/ai/feedback` | — | 👍/👎 on a cached answer (`X-Logscope-Client` header) |
+| `GET`, `POST /api/alerts/channels` | POST: admin | Notification channels (URLs are write-only) |
+| `PATCH`, `DELETE /api/alerts/channels/{id}` | admin | Change or delete a channel |
+| `POST /api/alerts/channels/{id}/test` | admin | Send a test notification |
+| `GET`, `POST /api/alerts/rules` | POST: admin | Alert rules with their live status and the ingest watermark |
+| `GET`, `PATCH`, `DELETE /api/alerts/rules/{id}` | PATCH/DELETE: admin | One rule |
+| `POST`, `DELETE /api/alerts/rules/{id}/mute` | — (rate limited) | Mute (`duration` or `until`) / unmute |
+| `GET /api/alerts/events?rule=&state=&since=&cursor=&limit=` | — | Transition history with delivery status (`sent`, `queued`, `retrying`, `failed_final`, `superseded`) |
+| `POST /api/alerts/events/{id}/retry` | admin | Retry a queued or failed notification now |
+| `POST /api/alerts/backtest` | — | Replay a rule over up to 7 days of history |
+
+Alert notifications are delivered durably: one that no channel accepts is
+retried after 30 s, 1, 2, 5, 10 and 30 min, then hourly for up to a day
+(then `failed_final`); retries survive restarts, and an older firing
+notification is dropped (`superseded`) once a newer transition of the same
+rule and group was delivered.
+
 ### AI cost
 
-AI is optional, and most requests never reach a provider. Every explanation
+AI is optional (`webapp.ai.provider`: `openrouter`, `gemini`, `openai` or
+`anthropic`; anything else, e.g. `none`, leaves it off), and most requests
+never reach a provider. Every explanation
 (one line, the filtered logs, an anomaly) is answered by the cheapest source
 first. The UI shows which one answered and how old the answer is:
 
@@ -370,7 +454,11 @@ only the web app uses this image. Deploying the chart is described in
 
 ## Notes
 
-- Image pin: chart **0.57.0** → `timberio/vector:0.57.0-debian` (not in YAML config).
-- Checkpoints: `/var/lib/vector` (config `paths.checkpoint`). First boot skips
-  files older than 3600s (`ignore_older_secs`, not in YAML).
+- Image pin: chart **0.57.0** → `timberio/vector:0.57.0-debian`, written as
+  `image.tag` into both rendered values files (not in YAML config).
+- Checkpoints: Vector's `data_dir` is `paths.checkpoint` (default
+  `/var/lib/vector`) in both kits. `values-agent.yaml` always adds a hostPath
+  mount of it (`DirectoryOrCreate`), whatever `sinks.s3.enabled` says;
+  `values-local.yaml` adds none. First boot skips files older than 3600s
+  (`ignore_older_secs`, not in YAML).
 - Fluent Bit manifests: [`archive/fluent-bit/`](./archive/fluent-bit/) (reference only).

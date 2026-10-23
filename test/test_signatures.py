@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "test"))
 
 from test_ai_settings import ANSWER, ENV_KEY, JSON, _app, _clean_env, _ids, _request, _usage_rows, served  # noqa: E402,F401
+
 from webapp.api.actions import describe_action, resolve_action  # noqa: E402
 from webapp.api.config import load_app_config  # noqa: E402
 from webapp.api.signatures import (  # noqa: E402

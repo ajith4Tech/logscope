@@ -10,12 +10,13 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from helpers import pod_pattern  # noqa: E402
+
 from webapp.api.patterns import (  # noqa: E402
     count_bucket,
     digest_records,
     namespace_pattern,
     normalize_message,
-    pod_pattern,
     template_id,
 )
 

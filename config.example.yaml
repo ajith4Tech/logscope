@@ -16,9 +16,9 @@ paths:
   # Node directory mounted into Vector (and the backup job) at /data.
   # Create it on every node before the first deploy (Directory, not create).
   host_path: /var/lib/logscope
-  # Vector file checkpoints (incremental tail). The Agent chart already mounts
-  # /var/lib/vector for the local file-sink install — only the S3 values file
-  # adds an extra hostPath when sinks.s3.enabled is true (see README flag).
+  # Vector's data_dir (read checkpoints, S3 disk buffers) in both kits.
+  # deploy/values-agent.yaml always mounts it as a hostPath (DirectoryOrCreate),
+  # whether or not sinks.s3.enabled; deploy/values-local.yaml adds no mount.
   checkpoint: /var/lib/vector
 
 routing:
@@ -35,13 +35,17 @@ routing:
   namespace_scope_prefix: namespaces/
 
 # Falco (falcosecurity/falco) — optional. Logscope does not install Falco's
-# ruleset. When enabled, Vector classifies Falco pod stdout (JSON) from
-# kubernetes_logs: scope=security, priority_map → severity bucket, and
-# dual-writes security.log plus the mapped severity file.
+# ruleset. When enabled, Vector classifies the stdout (JSON) of Falco's own
+# containers (namespace + containers below) from kubernetes_logs:
+# scope=security, priority_map → severity bucket. File sink: security.log plus
+# the mapped severity file. S3: written once, under security/<bucket>/ only.
 # Keep namespace in sync with helm -n / deploy/k3s/falco-values.yaml.
 falco:
   enabled: true
   namespace: falco
+  # Falco's own container(s) in that namespace; other pods and sidecars there
+  # (e.g. falcoctl) are classified like any workload.
+  containers: [falco]
   priority_map:
     emergency: error
     alert: error
@@ -107,7 +111,7 @@ severity:
     - name: error
       level_equals: [err]
       level_contains: [error, fatal, panic, critical, emerg, alert]
-      klog: "E"
+      klog: ["E", "F"]          # klog E#### and F#### (fatal) lines
       keywords:
         - error
         - failed
@@ -167,9 +171,23 @@ backup:
   log: /data/backups/backup.log
 
 webapp:
+  # IANA zone for times in alert notifications.
+  display_tz: UTC
+  # Public URL of the UI for deep links in alert notifications (empty =
+  # mattermost.link_base_url, else no links).
+  public_url: ""
+  # Alerts on saved views (Alerts tab). Windows end at the ingest watermark:
+  # per S3 prefix, the start of its latest complete listing minus Vector's
+  # batch timeout (a failing object holds its prefix back), minus this margin.
+  # Channel hosts allowed over http or on private addresses: LOGSCOPE_ALERT_ALLOWED_HOSTS.
+  alerts:
+    watermark_margin_secs: 120
+    s3_batch_timeout_secs: 600   # Vector's sinks.s3 batch.timeout_secs (render.py uses 600)
   backend:
     poll_interval_secs: 30
-    db_path: /tmp/logscope-webapp.sqlite
+    # Log cache (SQLite; rebuildable from S3). Default: $XDG_CACHE_HOME/logscope/cache.sqlite,
+    # else ~/.cache/logscope/cache.sqlite. LOGSCOPE_WEBAPP_DB_PATH overrides (the chart sets it to its PVC).
+    # db_path: /var/lib/logscope/cache.sqlite
     page_size_default: 200
     page_size_max: 1000
   # Logscope Insights — statistical anomaly detection over the same records store.
@@ -187,15 +205,17 @@ webapp:
     sample_timestamps_max: 10      # sample timestamps kept in evidence
     min_baseline_hours: 24         # history needed before detectors fire ("learning" until then)
     min_partial_window_minutes: 15 # evaluate the current hour once this much of it has passed
-  # AI summarization (stage 2). Only invoked for newly-detected anomalies.
-  # 'none' disables AI calls; keys come from the env var below, never from files.
-  # OpenRouter: POST https://openrouter.ai/api/v1/chat/completions (Bearer ${OPENROUTER_API_KEY}).
-  # Gemini: POST https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent (x-goog-api-key: ${GEMINI_API_KEY}).
+  # AI (optional). Providers: openrouter, gemini, openai, anthropic; anything
+  # else (e.g. none) leaves AI off. The Settings tab overrides these. Keys come
+  # from the env var below (default per provider: OPENROUTER_API_KEY,
+  # GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY) or the Settings tab,
+  # never from this file. base_url overrides the provider endpoint (e.g. a local
+  # OpenAI-compatible server with provider openai).
   # model must be set explicitly; reasoning_effort is passed only to models that support it.
   ai:
-    provider: openrouter            # none | openrouter | gemini
+    provider: openrouter            # openrouter | gemini | openai | anthropic | none
     model: ""                       # user sets explicitly, e.g. a free-tier model — don't hardcode a default that may not exist/be free later
-    api_key_env: OPENROUTER_API_KEY # key itself NEVER in config, env var only (e.g. OPENROUTER_API_KEY or GEMINI_API_KEY)
+    api_key_env: OPENROUTER_API_KEY # key itself NEVER in config: this env var, or the Settings tab
     max_anomalies_per_tick: 5
     reasoning_effort: medium        # low|medium|high — only passed to models that support it; ignored otherwise, don't error
     # deep_model: ""                # model for anomaly summaries; "" = model

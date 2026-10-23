@@ -18,7 +18,8 @@ sys.path.insert(0, str(ROOT))
 
 from test_production import CONFIG, JSON, _request, _serve  # noqa: E402
 
-from webapp.api import dbtool, state as state_mod  # noqa: E402
+from webapp.api import dbtool  # noqa: E402
+from webapp.api import state as state_mod
 from webapp.api.config import load_app_config  # noqa: E402
 from webapp.api.server import WebApp  # noqa: E402
 from webapp.api.state import (  # noqa: E402
