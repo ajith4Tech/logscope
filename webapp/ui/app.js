@@ -32,7 +32,6 @@ const state = {
     stale: false, // filters changed while the Logs tab was hidden
     histogram: null, // last /api/histogram response
     prevRange: null, // range before the first histogram zoom (for "Reset range")
-    drag: null, // { from, to } bucket indexes while selecting
     rangeTotal: null, // entries in the applied range (histogram sum), null until loaded
     rangeTruncated: false, // the histogram left out its oldest buckets
   },
@@ -66,6 +65,8 @@ const state = {
   expandedRows: new Set(),
   rowGroups: new Map(), // row id of each rendered row -> its group (for one-row re-renders)
   collapseDuplicates: true,
+  filtersCollapsed: false, // wide screens: filter sidebar hidden (remembered in localStorage)
+  filtersDrawerOpen: false, // narrow screens: filter drawer open
   aiConfigured: false,
   // Feature flags from /api/status (ai_features); a feature turned off in
   // Settings hides its buttons.
@@ -139,8 +140,8 @@ function dashboardContextText() {
   if (filters.severity_bucket) parts.push(`severity=${filters.severity_bucket}`);
   if (filters.q) parts.push(`search=${filters.q}`);
   if (FILTER_EXCLUDES.some(([, param]) => filters[param])) parts.push('exclusions applied');
-  if (filters.start || filters.before) parts.push('time range applied');
-  return parts.length ? `Overview for ${parts.join(', ')}` : 'Overview for the current filter set';
+  const range = rangeLabel();
+  return parts.length ? `${range} · ${parts.join(', ')}` : `${range} · all logs`;
 }
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
@@ -166,8 +167,14 @@ function switchTab(name, { history = 'push' } = {}) {
     const active = tab === name;
     el(tabId).classList.toggle('active', active);
     el(tabId).setAttribute('aria-selected', active ? 'true' : 'false');
+    el(tabId).tabIndex = active ? 0 : -1; // the tab list is one Tab stop
     el(panelId).hidden = !active;
   }
+  // The filter panel and active-filter bar only belong to tabs the filters apply to.
+  const filtered = FILTER_TABS.includes(name);
+  el('layout').classList.toggle('no-filters', !filtered);
+  el('filterBar').hidden = !filtered;
+  if (!filtered) closeFiltersDrawer({ refocus: false });
 
   // The dashboard only loads when it is shown and its data is out of date
   // (filters changed since the last load); switching tabs alone never reloads it.
@@ -196,6 +203,208 @@ function switchTab(name, { history = 'push' } = {}) {
 for (const tab of TABS) {
   el(TAB_IDS[tab][0]).addEventListener('click', () => switchTab(tab));
 }
+
+// ARIA tabs with manual activation: arrow keys, Home and End move focus
+// between tabs; Enter or Space (a button click) opens the focused tab, since
+// opening one can start a load.
+document.querySelector('[role="tablist"]').addEventListener('keydown', (event) => {
+  const tabs = TABS.map((tab) => el(TAB_IDS[tab][0]));
+  const index = tabs.indexOf(document.activeElement);
+  if (index === -1) return;
+  let next = null;
+  if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+  else if (event.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+  else if (event.key === 'Home') next = 0;
+  else if (event.key === 'End') next = tabs.length - 1;
+  if (next === null) return;
+  event.preventDefault();
+  tabs[next].focus();
+  tabs[next].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+});
+
+// Edge fades on the tab strip show that it scrolls sideways when it does.
+function updateTabFades() {
+  const scroller = el('tabScroller');
+  const max = scroller.scrollWidth - scroller.clientWidth;
+  scroller.classList.toggle('fade-left', scroller.scrollLeft > 2);
+  scroller.classList.toggle('fade-right', max - scroller.scrollLeft > 2);
+}
+el('tabScroller').addEventListener('scroll', updateTabFades, { passive: true });
+window.addEventListener('resize', updateTabFades);
+
+// ─── Filter panel: collapse, drawer, active-filter chips ─────────────────────
+// Wide screens: a sidebar that can be hidden (remembered per browser). At
+// 1024px and below: a slide-in drawer opened from "Filters (n)" that keeps
+// focus inside it until it closes.
+
+const FILTER_TABS = ['logs', 'insights', 'dashboard'];
+const DRAWER_QUERY = window.matchMedia('(max-width: 1024px)');
+const FILTERS_COLLAPSED_KEY = 'logscope.filters.collapsed';
+const FIELDS_COLLAPSED_KEY = 'logscope.fields.collapsed';
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+// localStorage can be missing or throw (private windows, blocked site data);
+// `fallback` applies then and when nothing was stored yet.
+function readFlag(key, fallback = false) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value === '1';
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function writeFlag(key, on) {
+  try { window.localStorage.setItem(key, on ? '1' : '0'); } catch (_) { /* not remembered */ }
+}
+
+function isDrawerMode() {
+  return Boolean(DRAWER_QUERY && DRAWER_QUERY.matches);
+}
+
+function applyFiltersLayout() {
+  const drawer = isDrawerMode();
+  el('layout').classList.toggle('filters-collapsed', !drawer && state.filtersCollapsed);
+  el('filtersToggle').setAttribute('aria-expanded', String(drawer ? state.filtersDrawerOpen : !state.filtersCollapsed));
+  el('filtersCollapse').title = drawer ? 'Close filters' : 'Hide filters';
+  el('filtersCollapse').setAttribute('aria-label', el('filtersCollapse').title);
+  el('filtersCollapse').textContent = drawer ? '✕' : '‹';
+}
+
+function setFiltersInert(on) {
+  for (const node of [el('skipToResults'), document.querySelector('.topbar'), el('tabScroller'), document.querySelector('.main-content')]) {
+    if (node) node.inert = on;
+  }
+}
+
+function openFiltersDrawer() {
+  const panel = el('filtersPanel');
+  state.filtersDrawerOpen = true;
+  panel.classList.add('drawer-open');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  el('filtersBackdrop').hidden = false;
+  setFiltersInert(true);
+  applyFiltersLayout();
+  const first = panel.querySelector(FOCUSABLE);
+  if (first) first.focus();
+}
+
+function closeFiltersDrawer({ refocus = true } = {}) {
+  if (!state.filtersDrawerOpen) return;
+  const panel = el('filtersPanel');
+  state.filtersDrawerOpen = false;
+  panel.classList.remove('drawer-open');
+  panel.removeAttribute('role');
+  panel.removeAttribute('aria-modal');
+  el('filtersBackdrop').hidden = true;
+  setFiltersInert(false);
+  applyFiltersLayout();
+  if (refocus) el('filtersToggle').focus();
+}
+
+el('filtersToggle').addEventListener('click', () => {
+  if (isDrawerMode()) {
+    openFiltersDrawer();
+    return;
+  }
+  state.filtersCollapsed = !state.filtersCollapsed;
+  writeFlag(FILTERS_COLLAPSED_KEY, state.filtersCollapsed);
+  applyFiltersLayout();
+});
+el('filtersCollapse').addEventListener('click', () => {
+  if (isDrawerMode()) {
+    closeFiltersDrawer();
+    return;
+  }
+  state.filtersCollapsed = true;
+  writeFlag(FILTERS_COLLAPSED_KEY, true);
+  applyFiltersLayout();
+  el('filtersToggle').focus();
+});
+el('filtersBackdrop').addEventListener('click', () => closeFiltersDrawer());
+// Esc closes the drawer (after an open combobox or menu inside it has used
+// it); Tab wraps around inside it as well as the rest of the page being inert.
+el('filtersPanel').addEventListener('keydown', (event) => {
+  if (!state.filtersDrawerOpen) return;
+  if (event.key === 'Escape' && !event.defaultPrevented) {
+    event.preventDefault();
+    closeFiltersDrawer();
+  } else if (event.key === 'Tab') {
+    const items = Array.from(el('filtersPanel').querySelectorAll(FOCUSABLE)).filter((node) => node.offsetParent !== null);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+});
+if (DRAWER_QUERY && DRAWER_QUERY.addEventListener) {
+  DRAWER_QUERY.addEventListener('change', () => {
+    if (!isDrawerMode()) closeFiltersDrawer({ refocus: false });
+    applyFiltersLayout();
+  });
+}
+
+// Active filters as removable chips above the results; "Filters (n)" counts them.
+function activeFilterChips() {
+  const chips = [];
+  for (const [field, label] of FIELD_SIDEBAR) {
+    const value = el(field).value.trim();
+    if (value) chips.push({ text: `${label}: ${value}`, remove: () => { el(field).value = ''; } });
+    for (const excluded of state.exclude[field]) {
+      chips.push({
+        text: `not ${label}: ${excluded}`,
+        remove: () => { state.exclude[field] = state.exclude[field].filter((v) => v !== excluded); },
+      });
+    }
+  }
+  const q = el('q').value.trim();
+  if (q) chips.push({ text: `${currentQmode() ? 'Raw query' : 'Search'}: ${q}`, remove: () => { el('q').value = ''; } });
+  return chips;
+}
+
+function renderFilterChips() {
+  const chips = activeFilterChips();
+  el('filtersCount').textContent = chips.length ? ` (${chips.length})` : '';
+  el('filterBar').classList.toggle('is-empty', !chips.length);
+  const box = el('filterChips');
+  box.replaceChildren(...chips.map((chip, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'filter-chip';
+    button.setAttribute('role', 'listitem');
+    button.dataset.index = String(index);
+    button.setAttribute('aria-label', `Remove filter ${chip.text}`);
+    button.innerHTML = `<span>${escapeHtml(chip.text)}</span><span class="filter-chip-x" aria-hidden="true">✕</span>`;
+    button.addEventListener('click', () => {
+      chip.remove();
+      reloadLogs();
+      // Keep keyboard focus in the chip bar: the chip now at this place, else
+      // the toggle, else (the bar hides when empty) the first filter.
+      const next = el('filterChips').children[Math.min(index, el('filterChips').children.length - 1)];
+      (next || (el('filtersToggle').offsetParent ? el('filtersToggle') : el('scope'))).focus();
+    });
+    return button;
+  }));
+}
+
+// "Skip to results": the first log row (on the Logs tab), past the top bar,
+// tabs and filters.
+el('skipToResults').addEventListener('click', (event) => {
+  event.preventDefault();
+  if (state.activeTab !== 'logs') switchTab('logs');
+  if (state.context.recordId !== null) closeContext();
+  const first = el('rows').querySelector('.message-button');
+  const target = first || el('logListHost');
+  target.scrollIntoView({ block: 'nearest' });
+  target.focus();
+});
 
 // ─── Date helpers ────────────────────────────────────────────────────────────
 
@@ -241,9 +450,9 @@ function currentRange() {
   };
 }
 
-// The header chip names the applied range and, once for the whole page, the
-// browser time zone that every displayed time is in.
-function updateRangeChip() {
+// The applied range in words: "Today · 2 Nov 2026", "Last 7 days", or the
+// exact bounds.
+function rangeLabel() {
   const preset = el('rangePreset').value;
   const { start, before } = currentRange();
   const fmt = (iso) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
@@ -257,10 +466,17 @@ function updateRangeChip() {
   } else {
     label = start ? `${fmt(start)} – ${before ? fmt(before) : 'now'}` : `Until ${fmt(before)}`;
   }
+  return label;
+}
+
+// The top-bar chip names the applied range and, once for the whole page, the
+// browser time zone that every displayed time is in (the zone part is hidden
+// on narrow screens; it stays in the tooltip).
+function updateRangeChip() {
   const zone = timeZoneLabel();
   const chip = el('defaultWindowChip');
-  chip.textContent = `${label} · ${zone}`;
-  chip.title = `All times on this page are in ${zone}`;
+  chip.innerHTML = `<span class="range-label">${escapeHtml(rangeLabel())}</span><span class="range-zone"> · ${escapeHtml(zone)}</span>`;
+  chip.title = `Applied range: ${rangeLabel()} · all times on this page are in ${zone}`;
 }
 
 function timeZoneLabel() {
@@ -294,8 +510,34 @@ function fmtFreshness(value) {
   if (!value) return 'Waiting for ingestion';
   const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+// Top bar: "Updated 12s ago" with a dot: live (green), stale (amber: older
+// than the ingest stale threshold) or paused (grey: Live tail off).
+function renderFreshness() {
+  const value = state.lastUpdatedAt || state.lastStatus?.last_successful_ingest_at || null;
+  const live = el('live').checked;
+  const staleSecs = Number(state.lastStatus?.ingest?.stale_after_secs) || 300;
+  const age = value ? (Date.now() - Date.parse(value)) / 1000 : Infinity;
+  const tone = !live ? 'paused' : age > staleSecs ? 'stale' : 'live';
+  const text = value ? `Updated ${fmtFreshness(value)}` : 'Waiting for data';
+  el('freshness').textContent = text;
+  const box = el('liveStatus');
+  box.dataset.tone = tone;
+  box.title = `${text}${value ? ` (${formatTimestamp(value)})` : ''} · Live tail ${live ? 'on' : 'off'}${tone === 'stale' ? ' · data is stale' : ''}`;
+}
+
+// Top bar ingest health: a dot and a few words; the full text is in the
+// tooltip and accessible name, and the Pipeline tab has the details.
+function setHealth(tone, short, full) {
+  el('health').textContent = short;
+  const pill = el('healthStatus');
+  pill.dataset.tone = tone;
+  pill.title = `${full} · open the Pipeline tab for details`;
+  pill.setAttribute('aria-label', `Ingest health: ${full}. Open the Pipeline tab.`);
 }
 
 // Exclusions as API parameters, comma-separated (Kubernetes names, scopes
@@ -418,7 +660,9 @@ function dashboardStateEls() {
   };
 }
 
-function dashboardChartRow(item, kind, maxCount) {
+// tone: 'severity' colours each bar by its severity, 'error' uses the error
+// colour, anything else is neutral (totals).
+function dashboardChartRow(item, kind, maxCount, tone = 'neutral') {
   const value = item.value ?? '';
   const count = Number(item.count ?? 0);
   const width = maxCount > 0 && count > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0; // no bar for 0
@@ -429,53 +673,29 @@ function dashboardChartRow(item, kind, maxCount) {
   return `
     <button type="button" class="${cls}" data-dashboard-action="${escapeHtml(action)}" data-dashboard-value="${escapeHtml(actionValue)}" ${clickable ? '' : 'disabled'}>
       <span class="dashboard-bar-label">${escapeHtml(dashboardLabel(value))}</span>
-      <span class="dashboard-bar-track"><span class="dashboard-bar-fill" style="width:${width}%"></span></span>
+      <span class="dashboard-bar-track"><span class="dashboard-bar-fill bar-${escapeHtml(tone === 'severity' ? value || 'neutral' : tone)}" style="width:${width}%"></span></span>
       <span class="dashboard-bar-count">${formatCount(count)}</span>
     </button>
   `;
 }
 
-// One hourly bucket. Clicking opens Logs for exactly that hour, as the
-// half-open interval [hour, hour + 1h) in UTC, keeping the other filters
-// (and the severity of the error chart). Empty buckets are not clickable.
-function dashboardTimelineRow(item, maxCount, severity, metricKey = 'total_logs') {
-  const bucketStart = item.timestamp ? new Date(item.timestamp) : null;
-  const valid = Boolean(bucketStart) && Number.isFinite(bucketStart.getTime());
-  const label = valid ? formatTimestamp(item.timestamp) : '—';
-  const count = Number(item[metricKey] ?? 0);
-  const width = maxCount > 0 && count > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0; // no bar for 0
-  const startIso = valid ? bucketStart.toISOString() : '';
-  const endIso = valid ? new Date(bucketStart.getTime() + HOUR_MS).toISOString() : '';
-  const clickable = valid && count > 0;
-  const title = valid
-    ? `${startIso.slice(0, 16).replace('T', ' ')} – ${endIso.slice(11, 16)} UTC (end exclusive)${clickable ? ' · open these logs' : ' · no entries in this hour'}`
-    : 'Unknown time bucket';
-  return `
-    <button type="button" class="dashboard-bar-row${clickable ? ' dashboard-action' : ''}" title="${escapeHtml(title)}" data-dashboard-action="hour" data-dashboard-value="${escapeHtml(startIso)}" data-dashboard-severity="${escapeHtml(severity)}" ${clickable ? '' : 'disabled'}>
-      <span class="dashboard-bar-label dashboard-bar-label-wide">${escapeHtml(label)}</span>
-      <span class="dashboard-bar-track dashboard-bar-track-timeline"><span class="dashboard-bar-fill dashboard-bar-fill-alt" style="width:${width}%"></span></span>
-      <span class="dashboard-bar-count">${formatCount(count)}</span>
-    </button>
-  `;
-}
-
-function renderDashboardList(container, items, kind) {
+function renderDashboardList(container, items, kind, tone = 'neutral') {
   if (!container) return;
   if (!items.length) {
     container.innerHTML = '<div class="empty-state dashboard-empty-inline">No data for the selected filters.</div>';
     return;
   }
   const maxCount = Math.max(...items.map((item) => Number(item.count ?? 0)), 1);
-  container.innerHTML = items.map((item) => dashboardChartRow(item, kind, maxCount)).join('');
+  container.innerHTML = items.map((item) => dashboardChartRow(item, kind, maxCount, tone)).join('');
 }
 
 function renderDashboardSummary(summary) {
   const cards = [
     { label: 'Total Logs', value: summary.total_logs, action: 'logs' },
-    { label: 'Errors', value: summary.error_count, action: 'severity', actionValue: 'error' },
+    { label: 'Errors', value: summary.error_count, action: 'severity', actionValue: 'error', tone: 'error' },
     { label: 'Warnings', value: summary.warning_count, action: 'severity', actionValue: 'warning' },
     { label: 'Info', value: summary.info_count, action: 'severity', actionValue: 'info' },
-    { label: 'Security', value: summary.security_count, action: 'security', actionValue: 'security' },
+    { label: 'Security', value: summary.security_count, action: 'security', actionValue: 'security', tone: 'security' },
     { label: 'Namespaces', value: summary.unique_namespaces },
     { label: 'Pods', value: summary.unique_pods },
   ];
@@ -487,40 +707,51 @@ function renderDashboardSummary(summary) {
     const attrs = clickable
       ? `type="button" class="dashboard-summary-card dashboard-action" data-dashboard-action="${escapeHtml(card.action)}" data-dashboard-value="${escapeHtml(card.actionValue || '')}"`
       : 'class="dashboard-summary-card"';
-    return `<${tag} ${attrs}><span class="dashboard-summary-label">${escapeHtml(card.label)}</span><span class="dashboard-summary-value">${formatCount(card.value)}</span></${tag}>`;
+    // Zeros are dimmed; non-zero errors and security counts take their colour.
+    const value = Number(card.value || 0);
+    const tone = value === 0 ? ' is-zero' : card.tone ? ` tone-${card.tone}` : '';
+    return `<${tag} ${attrs.replace('class="dashboard-summary-card', `class="dashboard-summary-card${tone}`)}><span class="dashboard-summary-label">${escapeHtml(card.label)}</span><span class="dashboard-summary-value">${formatCount(card.value)}</span></${tag}>`;
   }).join('');
+}
+
+const dashboardCharts = { volume: null, errors: null };
+
+// A bar of a Dashboard volume chart opens Logs for exactly that time slice
+// (and errors only, from the error chart).
+function openDashboardBucket(chart, index, severity) {
+  const bucket = chart.buckets[index];
+  if (!bucket) return;
+  const end = new Date(Date.parse(bucket.t) + chart.bucketMs).toISOString();
+  drillDownFromDashboard('range', bucket.t, severity, end).catch((err) => {
+    showToast(`Could not open these logs: ${err.message}`, { key: 'drilldown' });
+  });
 }
 
 function renderDashboardContent(data) {
   const summary = data.summary || {};
   renderDashboardSummary(summary);
-  renderDashboardList(el('dashboardSeverityChart'), data.severity || [], 'severity');
+  renderDashboardList(el('dashboardSeverityChart'), data.severity || [], 'severity', 'severity');
   renderDashboardList(el('dashboardNamespaceChart'), data.namespaces || [], 'namespace');
-  renderDashboardList(el('dashboardTopErrors'), data.top_errors || [], 'search');
-  renderDashboardList(el('dashboardErrorNamespaces'), data.error_namespaces || [], 'namespace');
-  renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod');
+  renderDashboardList(el('dashboardTopErrors'), data.top_errors || [], 'search', 'error');
+  renderDashboardList(el('dashboardErrorNamespaces'), data.error_namespaces || [], 'namespace', 'error');
+  renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod', 'error');
 
-  const totalTimeline = el('dashboardTotalVolumeChart');
-  if (totalTimeline) {
-    const items = Array.isArray(data.timeline) ? data.timeline : [];
-    if (!items.length) {
-      totalTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
-    } else {
-      const maxCount = Math.max(...items.map((item) => Number(item.total_logs ?? 0)), 1);
-      totalTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, '', 'total_logs')).join('');
-    }
-  }
-
-  const errorTimeline = el('dashboardErrorVolumeChart');
-  if (errorTimeline) {
-    const items = Array.isArray(data.timeline) ? data.timeline : [];
-    if (!items.length) {
-      errorTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
-    } else {
-      const maxCount = Math.max(...items.map((item) => Number(item.error_logs ?? 0)), 1);
-      errorTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, 'error', 'error_logs')).join('');
-    }
-  }
+  dashboardCharts.volume ||= createHistogramChart(el('dashboardVolumeChart'), {
+    keyboard: true,
+    onSelect: (index) => openDashboardBucket(dashboardCharts.volume, index, ''),
+  });
+  dashboardCharts.errors ||= createHistogramChart(el('dashboardErrorChart'), {
+    severities: ['error'],
+    keyboard: true,
+    onSelect: (index) => openDashboardBucket(dashboardCharts.errors, index, 'error'),
+  });
+  const histogram = state.dashboard.histogram;
+  const volume = dashboardCharts.volume.render(histogram);
+  const errors = dashboardCharts.errors.render(histogram);
+  const buckets = dashboardCharts.volume.buckets.length;
+  const size = buckets ? ` · ${formatBucketSize(dashboardCharts.volume.bucketMs)} bars` : '';
+  el('dashboardVolumeSummary').textContent = buckets ? `${formatCount(volume)} entries${size}` : 'No entries';
+  el('dashboardErrorSummary').textContent = buckets ? `${formatCount(errors)} errors${size}` : 'No entries';
 }
 
 function renderDashboard() {
@@ -539,17 +770,18 @@ function renderDashboard() {
   if (ctx) ctx.textContent = dashboardContextText();
 }
 
-async function drillDownFromDashboard(action, value, severity = '') {
+async function drillDownFromDashboard(action, value, severity = '', endValue = '') {
   if (action === 'logs') {
     closeContext({ history: null });
     switchTab('logs');
     return;
   }
-  if (action === 'hour') {
+  if (action === 'range') {
     const start = new Date(value);
-    if (!Number.isFinite(start.getTime())) return;
+    const end = new Date(endValue);
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return;
     forgetHistogramZoom();
-    setExactRange(start.toISOString(), new Date(start.getTime() + HOUR_MS).toISOString());
+    setExactRange(start.toISOString(), end.toISOString());
     if (severity) setSelectValue(el('severity_bucket'), severity);
   } else if (action === 'severity') {
     el('severity_bucket').value = value;
@@ -581,8 +813,13 @@ async function loadDashboard() {
   renderDashboard();
   try {
     const params = new URLSearchParams(queryFromFilters());
-    const data = await fetchJson(`/api/dashboard?${params.toString()}`);
+    // The volume charts use the same buckets as the Logs histogram.
+    const [data, histogram] = await Promise.all([
+      fetchJson(`/api/dashboard?${params.toString()}`),
+      fetchJson(`/api/histogram?${params.toString()}`),
+    ]);
     if (requestId !== state.dashboard.requestId) return;
+    state.dashboard.histogram = histogram;
     state.dashboard.data = data;
     state.dashboard.loaded = true;
   } catch (err) {
@@ -1392,6 +1629,69 @@ function anomalyTypeLabel(type) {
   return map[type] || type;
 }
 
+// Pod and rule key of an anomaly (either may be empty).
+function anomalySourceText(anomaly) {
+  return [anomaly.pod, anomaly.rule_key].filter(Boolean).join(' / ');
+}
+
+// "⋯" menu button (ARIA menu button pattern): click, Enter, Space or
+// ArrowDown opens it on the first item (ArrowUp on the last); arrow keys,
+// Home and End move; Esc closes it and returns focus to the button; Tab or a
+// click outside closes it; choosing an item closes it.
+function attachMenu(trigger, menu) {
+  const items = () => Array.from(menu.querySelectorAll('[role="menuitem"]')).filter((item) => !item.hidden && !item.disabled);
+  const outside = (ev) => {
+    if (!menu.contains(ev.target) && !trigger.contains(ev.target)) close(false);
+  };
+  function close(refocus) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    if (refocus) trigger.focus();
+  }
+  const open = (last = false) => {
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    const list = items();
+    (last ? list[list.length - 1] : list[0])?.focus();
+  };
+  trigger.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (menu.hidden) open();
+    else close(true);
+  });
+  trigger.addEventListener('keydown', (ev) => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      open(ev.key === 'ArrowUp');
+    }
+  });
+  menu.addEventListener('keydown', (ev) => {
+    const list = items();
+    const index = list.indexOf(document.activeElement);
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const step = ev.key === 'ArrowDown' ? 1 : -1;
+      list[(index + step + list.length) % list.length]?.focus();
+    } else if (ev.key === 'Home' || ev.key === 'End') {
+      ev.preventDefault();
+      (ev.key === 'Home' ? list[0] : list[list.length - 1])?.focus();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(true);
+    } else if (ev.key === 'Tab') {
+      close(false);
+    }
+  });
+  // Capture: close before the item's own handler runs (it stops propagation).
+  menu.addEventListener('click', (ev) => {
+    if (ev.target instanceof Element && ev.target.closest('[role="menuitem"]')) close(true);
+  }, true);
+}
+
 function renderAnomalies() {
   const container = el('anomalyRows');
   container.innerHTML = '';
@@ -1411,61 +1711,49 @@ function renderAnomalies() {
     typeBadge.textContent = anomalyTypeLabel(anomaly.type);
     typeBadge.classList.add(`atype-${anomaly.type}`);
 
-    node.querySelector('.anomaly-namespace').textContent = anomaly.namespace || '—';
-    const podText = [anomaly.pod, anomaly.rule_key].filter(Boolean).join(' / ');
-    node.querySelector('.anomaly-pod').textContent = podText || '—';
-
-    // Severity badge — FIX: only add a class when severity is non-empty.
-    // message_frequency anomalies have severity: "" by design; classList.add('')
-    // throws a DOMException and previously crashed the whole render loop,
-    // leaving every anomaly after (or including) the first empty-severity one
-    // unrendered — the root cause of "badge shows a count but the list is blank".
-    const sevBadge = node.querySelector('.badge');
-    sevBadge.textContent = anomaly.severity || '—';
-    if (anomaly.severity) {
-      sevBadge.closest('.anomaly-col-severity').classList.add(anomaly.severity);
-    }
-
-    const summaryEl = node.querySelector('.anomaly-summary-text');
-    const actionEl = node.querySelector('.anomaly-action-text');
-    // Free template summary until (or instead of) an AI summary.
+    // Where it happened; empty pod / severity are left out, not shown as "—".
+    node.querySelector('.anomaly-title').textContent = anomaly.namespace || 'Cluster-wide';
     const templateSummary = anomaly.template_summary || {};
-    const sourceEl = node.querySelector('.anomaly-source');
     const meta = anomaly.ai_meta || null;
+    const sourceText = anomalySourceText(anomaly);
+    const snippet = node.querySelector('.anomaly-snippet');
+    snippet.textContent = anomaly.ai_summary || sourceText || templateSummary.headline || '';
+    snippet.title = snippet.textContent;
+    snippet.classList.toggle('anomaly-snippet-source', !anomaly.ai_summary && Boolean(sourceText));
+    snippet.hidden = !snippet.textContent;
+
+    const sourceEl = node.querySelector('.anomaly-source');
     if (anomaly.ai_summary) {
-      summaryEl.textContent = anomaly.ai_summary;
       const label = meta ? sourceLabel(meta) : 'AI';
-      if (label) {
-        const age = meta ? ageFrom(meta) : null;
-        sourceEl.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
-        sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
-        sourceEl.hidden = false;
-      }
+      const age = meta ? ageFrom(meta) : null;
+      sourceEl.textContent = age === null ? label || 'AI' : `${label} · ${formatAge(age)}`;
+      sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
     } else {
-      summaryEl.textContent = templateSummary.headline || 'No summary yet.';
-      summaryEl.classList.add('muted');
-      sourceEl.textContent = 'Template';
+      sourceEl.textContent = 'Rule-based';
       sourceEl.className = 'anomaly-source source-badge source-template';
       sourceEl.title = 'Computed from the detection counts and log templates (no AI call)';
-      sourceEl.hidden = false;
     }
-    if (anomaly.ai_suggested_action) {
-      actionEl.textContent = `→ ${anomaly.ai_suggested_action}`;
-    } else if (!anomaly.ai_summary && templateSummary.signature) {
-      actionEl.textContent = `Known pattern: ${templateSummary.signature.title}`;
+
+    const sev = node.querySelector('.anomaly-sev');
+    if (anomaly.severity) {
+      sev.classList.add(anomaly.severity);
+      sev.querySelector('.badge').textContent = anomaly.severity;
     } else {
-      actionEl.hidden = true;
+      sev.classList.add('is-empty');
     }
 
-    const statusBadge = node.querySelector('.anomaly-status-badge');
-    statusBadge.textContent = STATUS_LABELS[anomaly.status] || anomaly.status;
-    if (anomaly.status) {
-      statusBadge.classList.add(`astatus-${anomaly.status}`);
-    }
-
-    node.querySelector('.anomaly-time').textContent = anomaly.detected_at
-      ? formatTimestamp(anomaly.detected_at)
-      : '—';
+    const counts = templateSummary.counts || {};
+    const current = counts.current ?? anomaly.evidence?.current_count;
+    const countEl = node.querySelector('.anomaly-count');
+    countEl.textContent = current === null || current === undefined ? '' : `${formatCount(current)} lines`;
+    if (counts.ratio) countEl.textContent += ` · ${counts.ratio}×`;
+    countEl.title = templateSummary.headline || '';
+    const seenAt = anomaly.updated_at || anomaly.detected_at;
+    const timeEl = node.querySelector('.anomaly-time');
+    const statusNote = anomaly.status && anomaly.status !== 'new' ? ` · ${STATUS_LABELS[anomaly.status] || anomaly.status}` : '';
+    timeEl.textContent = seenAt ? `seen ${formatAge((Date.now() - Date.parse(seenAt)) / 1000)}${statusNote}` : statusNote.slice(3);
+    timeEl.title = [anomaly.detected_at && `Detected ${formatTimestamp(anomaly.detected_at)}`,
+      anomaly.updated_at && `last updated ${formatTimestamp(anomaly.updated_at)}`].filter(Boolean).join(' · ');
 
     const btnSummarize = node.querySelector('.anomaly-btn-summarize');
     const btnDeep = node.querySelector('.anomaly-btn-deep');
@@ -1477,12 +1765,12 @@ function renderAnomalies() {
       else if (anomaly.ai_summary) btnSummarize.textContent = '✦ Regenerate';
       btnSummarize.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        summarizeAnomaly(anomaly, btnSummarize, fromSignature ? { skip_signature: true }
+        summarizeAnomaly(anomaly, node, fromSignature ? { skip_signature: true }
           : anomaly.ai_summary ? { regenerate: true, skip_signature: true } : {});
       });
       btnDeep.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        summarizeAnomaly(anomaly, btnDeep, { tier: 'deep', skip_signature: true });
+        summarizeAnomaly(anomaly, node, { tier: 'deep', skip_signature: true });
       });
     }
     const btnTroubleshoot = node.querySelector('.anomaly-btn-troubleshoot');
@@ -1496,12 +1784,10 @@ function renderAnomalies() {
       btnDismissed.disabled = true;
       btnDismissed.textContent = '✕ Dismissed';
     }
-    if (btnTroubleshoot) {
-      btnTroubleshoot.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        openAnomalyInActionable(anomaly);
-      });
-    }
+    btnTroubleshoot.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openAnomalyInActionable(anomaly);
+    });
     if (state.focusAnomalyId === anomaly.id) node.classList.add('anomaly-focused');
     btnReviewed.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -1511,6 +1797,7 @@ function renderAnomalies() {
       ev.stopPropagation();
       patchAnomalyStatus(anomaly.id, 'dismissed', node);
     });
+    attachMenu(node.querySelector('.row-menu-btn'), node.querySelector('.row-menu-list'));
 
     const detail = node.querySelector('.anomaly-detail');
     const expandBtn = node.querySelector('.anomaly-expand-btn');
@@ -1543,7 +1830,7 @@ function renderAnomalies() {
       toggleDetail();
     });
     node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
-      if (ev.target.closest('button')) return;
+      if (ev.target.closest('button, .row-menu')) return;
       toggleDetail();
     });
 
@@ -1554,6 +1841,13 @@ function renderAnomalies() {
 function fillAnomalyDetail(container, anomaly) {
   container.innerHTML = '';
   const evidence = anomaly.evidence || {};
+  const source = [anomaly.namespace && `namespace: ${anomaly.namespace}`, anomaly.pod && `pod: ${anomaly.pod}`,
+    anomaly.rule_key && `rule / pattern: ${anomaly.rule_key}`].filter(Boolean).join('\n');
+  if (source) addDetailBlock(container, 'Source', source);
+  if (anomaly.ai_summary) {
+    const action = anomaly.ai_suggested_action ? `\n\n→ ${anomaly.ai_suggested_action}` : '';
+    addDetailBlock(container, 'AI summary', `${anomaly.ai_summary}${action}`);
+  }
   if (anomaly.evidence_error) addDetailBlock(container, 'Evidence unavailable', anomaly.evidence_error);
   const ts = anomaly.template_summary;
   if (ts) {
@@ -1681,10 +1975,15 @@ async function fetchInsights() {
     if (requestId !== state.insightsRequestId) return;
     state.anomalies = data.items || [];
     state.insightsLoaded = true;
-    const newCount = state.anomalies.filter((a) => a.status === 'new').length;
+    const fresh = state.anomalies.filter((a) => a.status === 'new');
+    const newCount = fresh.length;
     const badge = el('insightsBadge');
     if (newCount > 0) {
+      // Neutral count; red only when a new anomaly is about errors.
+      const errors = fresh.some((a) => a.severity === 'error' || a.type === 'error_rate_spike');
       badge.textContent = String(newCount);
+      badge.classList.toggle('tab-badge-neutral', !errors);
+      badge.title = errors ? `${newCount} new anomalies, including errors` : `${newCount} new anomalies`;
       badge.hidden = false;
     } else {
       badge.hidden = true;
@@ -2552,24 +2851,25 @@ async function loadFacets() {
 
 function updateHealthFromStatus(status) {
   if (status.database_error) {
-    el('health').textContent = `Database error: ${status.database_error}`;
+    setHealth('error', 'Database error', `Database error: ${status.database_error}`);
     return;
   }
-  el('health').textContent = status.total_records
-    ? `Cached ${status.total_records} rows from ${status.total_objects} objects`
-    : 'Waiting for ingestion';
-  if (!status.total_records && status.last_error) {
-    el('health').textContent = `Ingestion error: ${status.last_error}`;
-  }
   const ingest = status.ingest || {};
-  if (ingest.state === 'stale' || ingest.state === 'stalled') {
+  const cached = `Cached ${formatCount(status.total_records || 0)} rows from ${formatCount(status.total_objects || 0)} objects`;
+  if (ingest.state === 'stalled') {
+    setHealth('error', 'Ingest stalled', 'Ingestion stalled: the S3 poll loop has not completed recently');
+  } else if (ingest.state === 'stale') {
     const since = ingest.seconds_since_last_success;
     const age = Number.isFinite(since) ? ` for ${Math.round(since / 60)}m` : '';
-    el('health').textContent = ingest.state === 'stalled'
-      ? 'Ingestion stalled: the S3 poll loop has not completed recently'
-      : `Ingestion stale: no successful S3 poll${age}${status.last_error ? ` (${status.last_error})` : ''}`;
+    setHealth('warn', 'Ingest stale', `Ingestion stale: no successful S3 poll${age}${status.last_error ? ` (${status.last_error})` : ''}`);
+  } else if (!status.total_records && status.last_error) {
+    setHealth('error', 'Ingest error', `Ingestion error: ${status.last_error}`);
+  } else if (!status.total_records) {
+    setHealth('unknown', 'Waiting', 'Waiting for ingestion');
   } else if (ingest.failing_objects) {
-    el('health').textContent += ` · ${ingest.failing_objects} S3 object(s) failing, retrying`;
+    setHealth('warn', `${ingest.failing_objects} failing`, `${cached} · ${ingest.failing_objects} S3 object(s) failing, retrying`);
+  } else {
+    setHealth('ok', 'Ingest OK', cached);
   }
 }
 
@@ -2649,6 +2949,7 @@ async function loadLogs() {
   refreshLiveEnd();
   state.logPanels.rangeTotal = null; // belongs to the previous query
   updateRangeChip();
+  renderFilterChips();
   setLogsLoading(true);
   let data;
   try {
@@ -2676,7 +2977,7 @@ async function loadLogs() {
   resetOlderLogsState();
   el('logListHost').scrollTop = 0;
   renderAll();
-  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+  renderFreshness();
   // Tail from the newest row that existed when this query ran, whether or not
   // Live is on yet and whether or not the page matched anything.
   state.liveCursor = Number.isFinite(data.max_id) ? data.max_id : null;
@@ -2764,7 +3065,7 @@ async function pollTail() {
     else flushPendingTail();
   }
   state.lastUpdatedAt = data.last_updated_at;
-  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+  renderFreshness();
 }
 
 function tailFailed(err) {
@@ -2777,7 +3078,7 @@ function startTailPolling() {
   state.liveTimer = window.setInterval(() => {
     if (document.hidden) return; // no polling in a background browser tab
     pollTail().catch(tailFailed);
-    el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+    renderFreshness();
   }, 10000);
 }
 
@@ -2785,7 +3086,7 @@ function startTailPolling() {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden || !state.liveTimer) return;
   pollTail().catch(tailFailed);
-  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+  renderFreshness();
 });
 
 function stopTailPolling() {
@@ -2918,85 +3219,166 @@ function applyFieldValue(field, value, exclude) {
   reloadLogs();
 }
 
+// ─── Histogram chart ─────────────────────────────────────────────────────────
+// Vertical bars of /api/histogram buckets stacked by severity, with a
+// local-time axis and a hover tooltip. The Logs histogram selects a range by
+// dragging (a click zooms to one bar); the Dashboard volume charts open a
+// bar's logs on click, or with the arrow keys and Enter (keyboard: true).
+// `severities` limits the stack (the error chart shows errors only).
+function createHistogramChart(root, { severities = null, drag = false, keyboard = false, onSelect }) {
+  const bars = root.querySelector('.histogram-bars');
+  const tip = root.querySelector('.histogram-tooltip');
+  const shown = severities || HISTOGRAM_SEVERITIES;
+  const countOf = (b) => (severities
+    ? severities.reduce((sum, sev) => sum + (Number(b[sev]) || 0), 0)
+    : Number(b.total) || 0);
+  const chart = { buckets: [], bucketMs: 60000, drag: null, active: -1 };
+
+  const hideTip = () => { tip.hidden = true; };
+  const mark = (lo, hi) => {
+    for (const col of bars.children) {
+      const index = Number(col.dataset.i);
+      col.classList.toggle('selected', index >= lo && index <= hi);
+    }
+  };
+  const indexAt = (clientX) => {
+    if (!chart.buckets.length) return null;
+    const rect = bars.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const index = Math.floor(((clientX - rect.left) / rect.width) * chart.buckets.length);
+    return Math.min(chart.buckets.length - 1, Math.max(0, index));
+  };
+  const showTip = (index, clientX = null) => {
+    const bucket = chart.buckets[index];
+    if (!bucket) return;
+    const end = new Date(Date.parse(bucket.t) + chart.bucketMs).toISOString();
+    const lines = severities ? '' : shown
+      .filter((sev) => Number(bucket[sev]) > 0)
+      .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
+      .join('');
+    tip.innerHTML = `
+      <div class="hist-tip-time">${escapeHtml(formatTimestamp(bucket.t))} – ${escapeHtml(formatTimestamp(end))}</div>
+      <div class="hist-tip-row"><b>${formatCount(countOf(bucket))}</b> ${severities ? `${escapeHtml(severities.join(' + '))} lines` : 'entries'}</div>${lines}`;
+    tip.hidden = false;
+    const box = root.getBoundingClientRect();
+    const col = bars.children[index];
+    const x = clientX ?? (col ? col.getBoundingClientRect().left : box.left);
+    tip.style.left = `${Math.min(Math.max(x - box.left + 12, 0), Math.max(0, box.width - tip.offsetWidth))}px`;
+  };
+
+  chart.render = (data) => {
+    const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
+    chart.buckets = buckets;
+    chart.bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
+    chart.drag = null;
+    chart.active = -1;
+    hideTip();
+    const max = buckets.reduce((m, b) => Math.max(m, countOf(b)), 0);
+    bars.innerHTML = buckets.map((b, index) => {
+      const count = countOf(b);
+      const height = max > 0 && count > 0 ? Math.max(3, Math.round((count / max) * 100)) : 0;
+      const parts = shown.map((sev) => [sev, Number(b[sev]) || 0]);
+      if (!severities) parts.push(['other', Math.max(0, count - parts.reduce((sum, [, n]) => sum + n, 0))]);
+      const segments = parts
+        .filter(([, n]) => n > 0)
+        .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
+        .join('');
+      return `<div class="hist-col" data-i="${index}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
+    }).join('');
+    root.querySelector('.histogram-from').textContent = buckets.length ? formatTimestamp(buckets[0].t) : '';
+    root.querySelector('.histogram-to').textContent = buckets.length
+      ? formatTimestamp(new Date(Date.parse(buckets[buckets.length - 1].t) + chart.bucketMs).toISOString())
+      : '';
+    return buckets.reduce((sum, b) => sum + countOf(b), 0);
+  };
+
+  bars.addEventListener('pointerdown', (event) => {
+    if (!drag || event.button !== 0) return;
+    const index = indexAt(event.clientX);
+    if (index === null) return;
+    event.preventDefault();
+    bars.setPointerCapture(event.pointerId);
+    chart.drag = { from: index, to: index };
+    mark(index, index);
+  });
+  bars.addEventListener('pointermove', (event) => {
+    const index = indexAt(event.clientX);
+    if (index === null) return;
+    if (chart.drag && chart.drag.to !== index) {
+      chart.drag.to = index;
+      mark(Math.min(chart.drag.from, index), Math.max(chart.drag.from, index));
+    }
+    showTip(index, event.clientX);
+  });
+  bars.addEventListener('pointerup', () => {
+    if (!chart.drag) return;
+    const { from, to } = chart.drag;
+    chart.drag = null;
+    mark(-1, -1);
+    onSelect(Math.min(from, to), Math.max(from, to));
+  });
+  bars.addEventListener('pointercancel', () => {
+    chart.drag = null;
+    mark(-1, -1);
+  });
+  bars.addEventListener('pointerleave', () => {
+    if (!chart.drag && chart.active === -1) hideTip();
+  });
+  if (!drag) {
+    bars.addEventListener('click', (event) => {
+      const index = indexAt(event.clientX);
+      if (index !== null && countOf(chart.buckets[index]) > 0) onSelect(index, index);
+    });
+  }
+  if (keyboard) {
+    root.tabIndex = 0;
+    root.addEventListener('keydown', (event) => {
+      const n = chart.buckets.length;
+      if (!n) return;
+      let next = null;
+      if (event.key === 'ArrowRight') next = chart.active === -1 ? 0 : Math.min(n - 1, chart.active + 1);
+      else if (event.key === 'ArrowLeft') next = chart.active === -1 ? n - 1 : Math.max(0, chart.active - 1);
+      else if (event.key === 'Home') next = 0;
+      else if (event.key === 'End') next = n - 1;
+      else if (event.key === 'Enter' && chart.active !== -1) {
+        event.preventDefault();
+        onSelect(chart.active, chart.active);
+        return;
+      }
+      if (next === null) return;
+      event.preventDefault();
+      chart.active = next;
+      mark(next, next);
+      showTip(next);
+    });
+    root.addEventListener('blur', () => {
+      chart.active = -1;
+      mark(-1, -1);
+      hideTip();
+    });
+  }
+  return chart;
+}
+
+let logsHistogramChart = null;
+
 function renderHistogram(data) {
   const panels = state.logPanels;
-  const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
-  const bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
-  panels.histogram = { buckets, bucketMs };
-  panels.drag = null;
-  hideHistogramTooltip();
-  const total = buckets.reduce((sum, b) => sum + (Number(b.total) || 0), 0);
-  const max = buckets.reduce((m, b) => Math.max(m, Number(b.total) || 0), 0);
+  logsHistogramChart ||= createHistogramChart(el('histogram'), { drag: true, onSelect: applyHistogramSelection });
+  const total = logsHistogramChart.render(data);
+  panels.histogram = { buckets: logsHistogramChart.buckets, bucketMs: logsHistogramChart.bucketMs };
   panels.rangeTotal = total;
   panels.rangeTruncated = Boolean(data?.truncated);
   updateResultSummary();
-  el('histogramSummary').textContent = buckets.length
-    ? `${formatCount(total)} entries · ${formatBucketSize(bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
+  el('histogramSummary').textContent = panels.histogram.buckets.length
+    ? `${formatCount(total)} entries · ${formatBucketSize(panels.histogram.bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
     : 'No entries in this range';
-  el('histogramBars').innerHTML = buckets.map((b, index) => {
-    const count = Number(b.total) || 0;
-    const height = max > 0 && count > 0 ? Math.max(3, Math.round((count / max) * 100)) : 0;
-    const known = HISTOGRAM_SEVERITIES.reduce((sum, sev) => sum + (Number(b[sev]) || 0), 0);
-    const segments = HISTOGRAM_SEVERITIES
-      .concat('other')
-      .map((sev) => [sev, sev === 'other' ? Math.max(0, count - known) : Number(b[sev]) || 0])
-      .filter(([, n]) => n > 0)
-      .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
-      .join('');
-    return `<div class="hist-col" data-i="${index}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
-  }).join('');
-  el('histogramFrom').textContent = buckets.length ? formatTimestamp(buckets[0].t) : '';
-  el('histogramTo').textContent = buckets.length
-    ? formatTimestamp(new Date(Date.parse(buckets[buckets.length - 1].t) + bucketMs).toISOString())
-    : '';
   updateHistogramReset();
 }
 
 function formatBucketSize(ms) {
   const minutes = Math.round(ms / 60000);
   return minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`;
-}
-
-function histogramIndexAt(clientX) {
-  const hist = state.logPanels.histogram;
-  if (!hist || !hist.buckets.length) return null;
-  const rect = el('histogramBars').getBoundingClientRect();
-  if (rect.width <= 0) return null;
-  const index = Math.floor(((clientX - rect.left) / rect.width) * hist.buckets.length);
-  return Math.min(hist.buckets.length - 1, Math.max(0, index));
-}
-
-function markHistogramSelection() {
-  const drag = state.logPanels.drag;
-  const lo = drag ? Math.min(drag.from, drag.to) : -1;
-  const hi = drag ? Math.max(drag.from, drag.to) : -1;
-  for (const col of el('histogramBars').children) {
-    const index = Number(col.dataset.i);
-    col.classList.toggle('selected', index >= lo && index <= hi);
-  }
-}
-
-function showHistogramTooltip(index, clientX) {
-  const hist = state.logPanels.histogram;
-  const bucket = hist?.buckets[index];
-  if (!bucket) return;
-  const tip = el('histogramTooltip');
-  const end = new Date(Date.parse(bucket.t) + hist.bucketMs).toISOString();
-  const lines = HISTOGRAM_SEVERITIES
-    .filter((sev) => Number(bucket[sev]) > 0)
-    .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
-    .join('');
-  tip.innerHTML = `
-    <div class="hist-tip-time">${escapeHtml(formatTimestamp(bucket.t))} – ${escapeHtml(formatTimestamp(end))}</div>
-    <div class="hist-tip-row"><b>${formatCount(bucket.total)}</b> entries</div>${lines}`;
-  tip.hidden = false;
-  const box = el('histogram').getBoundingClientRect();
-  const x = Math.min(Math.max(clientX - box.left + 12, 0), Math.max(0, box.width - tip.offsetWidth));
-  tip.style.left = `${x}px`;
-}
-
-function hideHistogramTooltip() {
-  el('histogramTooltip').hidden = true;
 }
 
 // A drag selects [first bucket, last bucket + size); a click zooms to one bucket.
@@ -3179,8 +3561,8 @@ function renderIngestCard(status) {
     ? describeAge(status.last_successful_ingest_at) : 'never', status.last_successful_ingest_at ? '' : 'warn');
   kvRow(body, 'Last poll finished', Number.isFinite(ingest.seconds_since_last_poll)
     ? `${formatDuration(ingest.seconds_since_last_poll)} ago` : 'not yet');
-  kvRow(body, 'Poll interval / stale after', ingest.poll_interval_secs
-    ? `${ingest.poll_interval_secs}s / ${formatDuration(ingest.stale_after_secs)}` : '—');
+  kvRow(body, 'S3 ingest every', ingest.poll_interval_secs
+    ? `${ingest.poll_interval_secs}s · stale after ${formatDuration(ingest.stale_after_secs)}` : '—');
   // Ingestion lag: how far the newest cached data trails the clock.
   const eventAge = secondsSince(status.latest_record_timestamp);
   const lagTone = eventAge === null ? 'unknown'
@@ -4823,20 +5205,23 @@ function applyAiStatus(status) {
   if (state.insightsLoaded) renderAnomalies();
 }
 
-async function summarizeAnomaly(anomaly, btn, options = {}) {
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = options.tier === 'deep' ? 'Analyzing…' : '✦ Summarizing…';
+// Summarize / Deep from the row menu: progress and failures are shown on the
+// row (the menu has closed by then), and the list reloads on success.
+async function summarizeAnomaly(anomaly, rowNode, options = {}) {
+  const note = rowNode.querySelector('.anomaly-row-note');
+  const errorBox = rowNode.querySelector('.anomaly-row-error');
+  note.textContent = options.tier === 'deep' ? '✦ Deep analysis running…' : '✦ Summarizing…';
+  note.hidden = false;
+  errorBox.hidden = true;
   try {
     const result = await postJson(`/api/anomalies/${encodeURIComponent(anomaly.id)}/summarize`,
       explainOptionsQuery(options));
     if (result.degraded) throw new Error(result.error || 'The daily AI budget is used up');
     await fetchInsights();
   } catch (err) {
-    btn.disabled = false;
-    btn.textContent = original;
-    btn.title = `Failed: ${err.message}`;
-    showInsightsError(`AI summary failed: ${err.message}`);
+    note.hidden = true;
+    errorBox.textContent = `AI summary failed: ${err.message}`;
+    errorBox.hidden = false;
   }
 }
 
@@ -5304,6 +5689,13 @@ el('settingsRefresh').addEventListener('click', () => {
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
+  state.filtersCollapsed = readFlag(FILTERS_COLLAPSED_KEY);
+  applyFiltersLayout();
+  // At 1280px and below the Fields panel stacks above the rows, so it starts
+  // hidden there unless the reader opened it before.
+  const stacked = Boolean(window.matchMedia && window.matchMedia('(max-width: 1280px)').matches);
+  setFieldsCollapsed(readFlag(FIELDS_COLLAPSED_KEY, stacked));
+  updateTabFades();
   setDefaultDateRange();
   buildCombobox('pod', 'pod');
   buildCombobox('container', 'container');
@@ -5313,16 +5705,12 @@ async function init() {
     status = await refreshStatus();
   } catch (err) {
     // The logs still load; the Pipeline tab shows the status as unavailable.
-    el('health').textContent = `Status unavailable: ${err.message}`;
+    setHealth('unknown', 'Status unavailable', `Status unavailable: ${err.message}`);
   }
   if (status) {
     applyAiStatus(status);
     state.actionsEnabled = status.actions_enabled === true;
-    if (status.last_successful_ingest_at) {
-      el('freshness').textContent = fmtFreshness(status.last_successful_ingest_at);
-    } else if (status.latest_record_timestamp) {
-      el('freshness').textContent = `Cached through ${formatTimestamp(status.latest_record_timestamp)}`;
-    }
+    renderFreshness();
   }
   updateExplainButton();
   await loadFacets();
@@ -5348,6 +5736,7 @@ function reloadLogs() {
 el('filtersForm').addEventListener('submit', (event) => {
   event.preventDefault();
   reloadLogs();
+  closeFiltersDrawer(); // in the drawer, Apply also shows the results
 });
 for (const id of ['scope', 'namespace', 'severity_bucket']) {
   el(id).addEventListener('change', () => reloadLogs());
@@ -5471,14 +5860,21 @@ document.addEventListener('click', async (event) => {
     reloadLogs();
   }
 });
-el('fieldSidebarToggle').addEventListener('click', () => {
-  const collapsed = el('logsBody').classList.toggle('fields-collapsed');
+// The Fields panel can be hidden (remembered), which also shortens the
+// keyboard path to the rows.
+function setFieldsCollapsed(collapsed) {
+  el('logsBody').classList.toggle('fields-collapsed', collapsed);
   const toggle = el('fieldSidebarToggle');
   toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   toggle.textContent = collapsed ? '›' : '‹';
   toggle.title = collapsed ? 'Show fields' : 'Hide fields';
   toggle.setAttribute('aria-label', toggle.title);
   el('fieldSidebarBody').hidden = collapsed;
+}
+el('fieldSidebarToggle').addEventListener('click', () => {
+  const collapsed = !el('logsBody').classList.contains('fields-collapsed');
+  setFieldsCollapsed(collapsed);
+  writeFlag(FIELDS_COLLAPSED_KEY, collapsed);
 });
 el('fieldList').addEventListener('mousedown', (event) => {
   if (event.shiftKey) event.preventDefault(); // no text selection on Shift-click
@@ -5498,39 +5894,6 @@ el('fieldList').addEventListener('click', (event) => {
   event.preventDefault();
   applyFieldValue(button.dataset.field, button.dataset.value ?? '', event.altKey || event.shiftKey);
 });
-el('histogramBars').addEventListener('pointerdown', (event) => {
-  if (event.button !== 0) return;
-  const index = histogramIndexAt(event.clientX);
-  if (index === null) return;
-  event.preventDefault();
-  el('histogramBars').setPointerCapture(event.pointerId);
-  state.logPanels.drag = { from: index, to: index };
-  markHistogramSelection();
-});
-el('histogramBars').addEventListener('pointermove', (event) => {
-  const index = histogramIndexAt(event.clientX);
-  if (index === null) return;
-  const drag = state.logPanels.drag;
-  if (drag && drag.to !== index) {
-    drag.to = index;
-    markHistogramSelection();
-  }
-  showHistogramTooltip(index, event.clientX);
-});
-el('histogramBars').addEventListener('pointerup', () => {
-  const drag = state.logPanels.drag;
-  if (!drag) return;
-  state.logPanels.drag = null;
-  markHistogramSelection();
-  applyHistogramSelection(drag.from, drag.to);
-});
-el('histogramBars').addEventListener('pointercancel', () => {
-  state.logPanels.drag = null;
-  markHistogramSelection();
-});
-el('histogramBars').addEventListener('pointerleave', () => {
-  if (!state.logPanels.drag) hideHistogramTooltip();
-});
 el('histogramReset').addEventListener('click', () => resetHistogramRange());
 // Show the held-back rows: insert them and go back to the top of the list
 // (rows that are open stay open).
@@ -5539,7 +5902,9 @@ el('newRowsBanner').addEventListener('click', () => {
   el('logListHost').scrollTop = 0;
   if (el('logListHost').getBoundingClientRect().top < 0) el('logListHost').scrollIntoView({ block: 'start' });
 });
+el('healthStatus').addEventListener('click', () => switchTab('pipeline'));
 el('live').addEventListener('change', () => {
+  renderFreshness();
   if (el('live').checked) startTailPolling(); else stopTailPolling();
 });
 el('openInActionableBtn').addEventListener('click', () => {

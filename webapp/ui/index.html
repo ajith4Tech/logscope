@@ -9,117 +9,134 @@
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
+  <a id="skipToResults" class="skip-link" href="#logListHost">Skip to results</a>
   <div class="shell">
-    <header class="hero">
-      <div>
-        <div class="eyebrow">LOGSCOPE</div>
-        <h1>Log viewer.</h1>
-<p class="lede">
-  Browse historical logs, monitor new events, and investigate anomalies across your cluster.
-</p>
-        <div class="hero-chips">
-          <span class="chip chip-accent" id="defaultWindowChip">Today</span>
-          <span class="chip">Polling every 10s</span>
-        </div>
+    <!-- Top bar: brand, live data status, ingest health, applied range, Copy link -->
+    <header class="topbar">
+      <div class="brand">
+        <svg class="brand-logo" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7"/><circle cx="14" cy="14" r="7"/><path d="M19 19l6 6"/></svg>
+        <span class="brand-name">LogScope</span>
       </div>
-      <div class="status-card">
-        <div class="status-label">Last updated</div>
-        <div id="freshness" class="status-value">Loading…</div>
-        <div id="health" class="status-meta"></div>
+      <div class="topbar-status">
+        <span id="liveStatus" class="live-status" data-tone="unknown">
+          <span class="status-dot" aria-hidden="true"></span><span id="freshness">Loading…</span>
+        </span>
+        <button id="healthStatus" type="button" class="health-status" data-tone="unknown" title="Ingest health: open the Pipeline tab for details">
+          <span class="status-dot" aria-hidden="true"></span><span id="health">Checking…</span>
+        </button>
+        <span class="chip chip-accent range-chip" id="defaultWindowChip">Today</span>
+        <span class="chip topbar-refresh" title="With Live tail on, the page checks for new log lines every 10 seconds">UI refresh 10s</span>
+        <button id="copyLinkBtn" type="button" class="ghost" title="Copy a link that reopens this view: tab, filters, time range and selected entry or anomaly (no log content)">Copy link</button>
       </div>
     </header>
 
-    <main class="layout">
-      <aside class="filters panel">
-        <div class="panel-head">
-          <h2>Filters</h2>
-          <button id="securityShortcut" class="ghost">Security</button>
-        </div>
-        <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
-        <div id="viewBar" class="view-bar" hidden>
-          <span class="view-bar-label">View</span>
-          <span id="viewBarName" class="view-bar-name"></span>
-          <span id="viewModifiedDot" class="view-modified-dot" title="The filters differ from this saved view" hidden></span>
-          <span class="view-bar-actions">
-            <button id="viewRevertBtn" type="button" class="link-btn" title="Restore the saved filters" hidden>Revert</button>
-            <button id="viewUpdateBtn" type="button" class="link-btn" title="Save the current filters into this view" hidden>Update</button>
-            <button id="viewCloseBtn" type="button" class="link-btn" title="Stop following this view (filters stay as they are)" aria-label="Close view">✕</button>
-          </span>
-        </div>
-        <div id="askBox" class="ask-box" hidden>
-          <form id="askForm" class="ask-form" autocomplete="off">
-            <label for="askInput" class="ask-label">Ask</label>
-            <div class="ask-row">
-              <input id="askInput" type="search" maxlength="500" placeholder="e.g. errors in payments since 9am" title="Describe the logs you want; the proposed filters are shown before anything is applied" />
-              <button id="askSubmit" type="submit" class="ghost">Ask</button>
+    <!-- Tabs: one Tab stop; arrow keys move between tabs, Enter or Space opens one -->
+    <div id="tabScroller" class="tab-scroller">
+      <nav class="tab-bar" role="tablist" aria-label="Main views">
+          <button id="tabDashboard" class="tab" role="tab" aria-selected="false" aria-controls="panelDashboard" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h7v7H4zM13 4h7v4h-7zM13 10h7v10h-7zM4 13h7v7H4z"/></svg><span class="tab-label">Dashboard</span><span class="tab-label-short" aria-hidden="true">Dash</span>
+          </button>
+          <button id="tabLogs" class="tab active" role="tab" aria-selected="true" aria-controls="panelLogs" tabindex="0">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span class="tab-label">Logs</span><span class="tab-label-short" aria-hidden="true">Logs</span>
+          </button>
+          <button id="tabInsights" class="tab" role="tab" aria-selected="false" aria-controls="panelInsights" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></svg><span class="tab-label">Insights</span><span class="tab-label-short" aria-hidden="true">Insights</span>
+            <span id="insightsBadge" class="tab-badge" hidden></span>
+          </button>
+          <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17"/></svg><span class="tab-label">Actionable</span><span class="tab-label-short" aria-hidden="true">Actions</span>
+            <span id="actionableBadge" class="tab-badge" hidden></span>
+          </button>
+          <button id="tabAlerts" class="tab" role="tab" aria-selected="false" aria-controls="panelAlerts" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 16v-5a6 6 0 0 1 12 0v5l2 2H4zM10 21h4"/></svg><span class="tab-label">Alerts</span><span class="tab-label-short" aria-hidden="true">Alerts</span>
+            <span id="alertsBadge" class="tab-badge" title="Alert rules firing" hidden></span>
+          </button>
+          <button id="tabPipeline" class="tab" role="tab" aria-selected="false" aria-controls="panelPipeline" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h11M11 3l4 4-4 4M20 17H9M13 13l-4 4 4 4"/></svg><span class="tab-label">Pipeline</span><span class="tab-label-short" aria-hidden="true">Pipeline</span>
+            <span id="pipelineBadge" class="tab-badge" hidden></span>
+          </button>
+          <button id="tabSettings" class="tab" role="tab" aria-selected="false" aria-controls="panelSettings" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg><span class="tab-label">Settings</span><span class="tab-label-short" aria-hidden="true">Settings</span>
+            <span id="settingsBadge" class="tab-badge" hidden></span>
+          </button>
+      </nav>
+    </div>
+
+    <main id="layout" class="layout">
+      <div id="filtersBackdrop" class="drawer-backdrop" hidden></div>
+      <aside id="filtersPanel" class="filters panel" aria-labelledby="filtersTitle">
+        <div class="filters-body">
+          <div class="panel-head">
+            <h2 id="filtersTitle">Filters</h2>
+            <div class="filters-head-actions">
+              <button id="securityShortcut" type="button" class="ghost">Security</button>
+              <button id="filtersCollapse" type="button" class="ghost icon-btn" aria-controls="filtersPanel" title="Hide filters" aria-label="Hide filters">‹</button>
             </div>
+          </div>
+          <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
+          <div id="viewBar" class="view-bar" hidden>
+            <span class="view-bar-label">View</span>
+            <span id="viewBarName" class="view-bar-name"></span>
+            <span id="viewModifiedDot" class="view-modified-dot" title="The filters differ from this saved view" hidden></span>
+            <span class="view-bar-actions">
+              <button id="viewRevertBtn" type="button" class="link-btn" title="Restore the saved filters" hidden>Revert</button>
+              <button id="viewUpdateBtn" type="button" class="link-btn" title="Save the current filters into this view" hidden>Update</button>
+              <button id="viewCloseBtn" type="button" class="link-btn" title="Stop following this view (filters stay as they are)" aria-label="Close view">✕</button>
+            </span>
+          </div>
+          <div id="askBox" class="ask-box" hidden>
+            <form id="askForm" class="ask-form" autocomplete="off">
+              <label for="askInput" class="ask-label">Ask</label>
+              <div class="ask-row">
+                <input id="askInput" type="search" maxlength="500" placeholder="e.g. errors in payments since 9am" title="Describe the logs you want; the proposed filters are shown before anything is applied" />
+                <button id="askSubmit" type="submit" class="ghost">Ask</button>
+              </div>
+            </form>
+            <div id="askStatus" class="ask-status" role="status" hidden></div>
+            <div id="askPreview" class="ask-preview" hidden></div>
+          </div>
+          <!-- Dropdowns and toggles apply on change; Search and dates on Enter or Apply. -->
+          <form id="filtersForm" class="filters-form" autocomplete="off" novalidate>
+          <label>Scope <select id="scope"></select></label>
+          <label>Namespace <select id="namespace"></select></label>
+          <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
+          <label>Container <input id="container" type="text" placeholder="All — type to search" autocomplete="off" /></label>
+          <label>Severity <select id="severity_bucket"></select></label>
+          <label>Search <input id="q" type="search" placeholder="error, trace, rule name, etc." /></label>
+          <label class="toggle qmode-toggle" title="Raw full-text syntax: AND, OR, NOT, &quot;quoted phrases&quot;, prefix*"><input id="qmodeRaw" type="checkbox" /> Raw query syntax</label>
+          <div class="time-grid">
+            <label>Start <input id="start" type="datetime-local" title="Entries at or after this time" /></label>
+            <label>End <input id="end" type="datetime-local" title="Entries before this time (the end is exclusive)" /></label>
+          </div>
           </form>
-          <div id="askStatus" class="ask-status" role="status" hidden></div>
-          <div id="askPreview" class="ask-preview" hidden></div>
         </div>
-        <!-- Dropdowns and toggles apply on change; Search and dates on Enter or Apply. -->
-        <form id="filtersForm" class="filters-form" autocomplete="off" novalidate>
-        <label>Scope <select id="scope"></select></label>
-        <label>Namespace <select id="namespace"></select></label>
-        <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
-        <label>Container <input id="container" type="text" placeholder="All — type to search" autocomplete="off" /></label>
-        <label>Severity <select id="severity_bucket"></select></label>
-        <label>Search <input id="q" type="search" placeholder="error, trace, rule name, etc." /></label>
-        <label class="toggle qmode-toggle" title="Raw full-text syntax: AND, OR, NOT, &quot;quoted phrases&quot;, prefix*"><input id="qmodeRaw" type="checkbox" /> Raw query syntax</label>
-        <div class="time-grid">
-          <label>Start <input id="start" type="datetime-local" title="Entries at or after this time" /></label>
-          <label>End <input id="end" type="datetime-local" title="Entries before this time (the end is exclusive)" /></label>
-        </div>
-        <div class="actions">
-          <button id="apply" type="submit">Apply</button>
-          <label class="toggle"><input id="live" type="checkbox" checked /> Live tail</label>
-        </div>
-        </form>
-        <div class="views-actions">
-          <button id="saveViewBtn" type="button" class="ghost" title="Save the current filters and time range as a named view">Save view</button>
-          <button id="viewsMenuBtn" type="button" class="ghost" aria-haspopup="true" aria-expanded="false" aria-controls="viewsMenu">Views <span id="viewsCount" class="views-count"></span> ▾</button>
-        </div>
-        <div id="viewsMenu" class="views-menu" hidden>
-          <input id="viewsSearch" type="search" placeholder="Search views" autocomplete="off" aria-label="Search saved views" />
-          <div id="viewsError" class="views-error" role="alert" hidden></div>
-          <div id="viewsList" class="views-list"></div>
+        <!-- Sticky footer: always visible at the bottom of the panel (and of the drawer) -->
+        <div class="filters-footer">
+          <div class="filters-footer-row">
+            <button id="apply" type="submit" form="filtersForm">Apply</button>
+            <label class="toggle"><input id="live" type="checkbox" checked /> Live tail</label>
+          </div>
+          <div class="views-actions">
+            <button id="saveViewBtn" type="button" class="ghost" title="Save the current filters and time range as a named view">Save view</button>
+            <button id="viewsMenuBtn" type="button" class="ghost" aria-haspopup="true" aria-expanded="false" aria-controls="viewsMenu">Views <span id="viewsCount" class="views-count"></span> ▾</button>
+          </div>
+          <div id="viewsMenu" class="views-menu" hidden>
+            <input id="viewsSearch" type="search" placeholder="Search views" autocomplete="off" aria-label="Search saved views" />
+            <div id="viewsError" class="views-error" role="alert" hidden></div>
+            <div id="viewsList" class="views-list"></div>
+          </div>
         </div>
       </aside>
 
       <section class="main-content">
-        <!-- Tab bar -->
-        <nav class="tab-bar" role="tablist" aria-label="Main views">
-          <button id="tabDashboard" class="tab" role="tab" aria-selected="false" aria-controls="panelDashboard">
-            <span class="tab-icon"></span> Dashboard
-          </button>
-          <button id="tabLogs" class="tab active" role="tab" aria-selected="true" aria-controls="panelLogs">
-            <span class="tab-icon"></span> Logs
-          </button>
-          <button id="tabInsights" class="tab" role="tab" aria-selected="false" aria-controls="panelInsights">
-            <span class="tab-icon"></span> Insights
-            <span id="insightsBadge" class="tab-badge" hidden></span>
-          </button>
-          <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable">
-            <span class="tab-icon"></span> Actionable
-            <span id="actionableBadge" class="tab-badge" hidden></span>
-          </button>
-          <button id="tabAlerts" class="tab" role="tab" aria-selected="false" aria-controls="panelAlerts">
-            <span class="tab-icon"></span> Alerts
-            <span id="alertsBadge" class="tab-badge" title="Alert rules firing" hidden></span>
-          </button>
-          <button id="tabPipeline" class="tab" role="tab" aria-selected="false" aria-controls="panelPipeline">
-            <span class="tab-icon"></span> Pipeline
-            <span id="pipelineBadge" class="tab-badge" hidden></span>
-          </button>
-          <button id="tabSettings" class="tab" role="tab" aria-selected="false" aria-controls="panelSettings">
-            <span class="tab-icon"></span> Settings
-            <span id="settingsBadge" class="tab-badge" hidden></span>
-          </button>
-          <button id="copyLinkBtn" type="button" class="ghost tab-bar-action" title="Copy a link that reopens this view: tab, filters, time range and selected entry or anomaly (no log content)">Copy link</button>
-        </nav>
+        <!-- Active filters above the results; "Filters (n)" shows the panel (a drawer on narrow screens) -->
+        <div id="filterBar" class="filter-bar">
+          <button id="filtersToggle" type="button" class="ghost filters-toggle" aria-controls="filtersPanel" aria-expanded="true">Filters<span id="filtersCount" class="filters-count"></span></button>
+          <div id="filterChips" class="filter-chips" role="list" aria-label="Active filters"></div>
+        </div>
 
         <!-- Dashboard panel -->
-        <div id="panelDashboard" class="panel dashboard-panel" role="tabpanel" hidden>
+        <div id="panelDashboard" aria-labelledby="tabDashboard" class="panel dashboard-panel" role="tabpanel" hidden>
           <div class="panel-head dashboard-head">
             <div>
               <h2>Kubernetes dashboard</h2>
@@ -158,18 +175,30 @@
               <div id="dashboardNamespaceChart" class="dashboard-bars"></div>
             </section>
 
+            <!-- Volume charts reuse the Logs histogram: stacked by severity, local-time axis.
+                 Click a bar (or pick one with the arrow keys and press Enter) to open its logs. -->
             <section class="dashboard-section dashboard-span-6">
               <div class="section-head">
-                <h3>Error volume over time</h3>
+                <h3>Log volume over time</h3>
+                <span id="dashboardVolumeSummary" class="subtle"></span>
               </div>
-              <div id="dashboardErrorVolumeChart" class="dashboard-timeline"></div>
+              <div id="dashboardVolumeChart" class="histogram dash-chart" role="group" aria-label="Log volume over time by severity. Arrow keys pick a time slice, Enter opens its logs.">
+                <div class="histogram-bars"></div>
+                <div class="histogram-axis"><span class="histogram-from"></span><span class="histogram-to"></span></div>
+                <div class="histogram-tooltip" role="status" hidden></div>
+              </div>
             </section>
 
             <section class="dashboard-section dashboard-span-6">
               <div class="section-head">
-                <h3>Total log volume over time</h3>
+                <h3>Error volume over time</h3>
+                <span id="dashboardErrorSummary" class="subtle"></span>
               </div>
-              <div id="dashboardTotalVolumeChart" class="dashboard-timeline"></div>
+              <div id="dashboardErrorChart" class="histogram dash-chart" role="group" aria-label="Error lines over time. Arrow keys pick a time slice, Enter opens its error logs.">
+                <div class="histogram-bars"></div>
+                <div class="histogram-axis"><span class="histogram-from"></span><span class="histogram-to"></span></div>
+                <div class="histogram-tooltip" role="status" hidden></div>
+              </div>
             </section>
 
             <section class="dashboard-section dashboard-span-6">
@@ -198,7 +227,7 @@
         </div>
 
         <!-- Logs panel -->
-        <div id="panelLogs" class="panel logs" role="tabpanel">
+        <div id="panelLogs" aria-labelledby="tabLogs" class="panel logs" role="tabpanel">
           <div class="panel-head">
             <h2>Log lines</h2>
             <div class="subtle" id="resultSummary">Ready</div>
@@ -294,11 +323,11 @@
               <button id="histogramReset" type="button" class="link-btn" hidden>Reset range</button>
             </div>
             <div id="histogramBars" class="histogram-bars" title="Drag across bars to select a range; click a bar to zoom to it"></div>
-            <div class="histogram-axis"><span id="histogramFrom"></span><span id="histogramTo"></span></div>
+            <div class="histogram-axis"><span id="histogramFrom" class="histogram-from"></span><span id="histogramTo" class="histogram-to"></span></div>
             <div id="histogramTooltip" class="histogram-tooltip" role="status" hidden></div>
           </section>
           <!-- Scrolling log list: sticky column header, rows, then the next page -->
-          <div id="logListHost" class="log-list-host">
+          <div id="logListHost" class="log-list-host" tabindex="-1" aria-label="Log lines">
             <div class="table-head" aria-hidden="true">
               <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
             </div>
@@ -314,7 +343,7 @@
         </div>
 
         <!-- Insights panel -->
-        <div id="panelInsights" class="panel insights" role="tabpanel" hidden>
+        <div id="panelInsights" aria-labelledby="tabInsights" class="panel insights" role="tabpanel" hidden>
           <div class="panel-head">
             <h2>Anomaly Insights</h2>
             <div class="insights-toolbar">
@@ -334,7 +363,7 @@
         </div>
 
         <!-- Actionable panel (Troubleshooting Workspace) -->
-        <div id="panelActionable" class="panel actionable-panel" role="tabpanel" hidden>
+        <div id="panelActionable" aria-labelledby="tabActionable" class="panel actionable-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>
               <h2>Troubleshooting Workspace</h2>
@@ -420,7 +449,7 @@
         </div>
 
         <!-- Pipeline health panel -->
-        <div id="panelPipeline" class="panel pipeline-panel" role="tabpanel" hidden>
+        <div id="panelPipeline" aria-labelledby="tabPipeline" class="panel pipeline-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>
               <h2>Pipeline health</h2>
@@ -433,7 +462,7 @@
         </div>
 
         <!-- Alerts panel: rules on saved views (writes need the admin token; muting does not) -->
-        <div id="panelAlerts" class="panel alerts-panel" role="tabpanel" hidden>
+        <div id="panelAlerts" aria-labelledby="tabAlerts" class="panel alerts-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>
               <h2>Alerts</h2>
@@ -450,7 +479,7 @@
         </div>
 
         <!-- Settings panel (admin token required) -->
-        <div id="panelSettings" class="panel settings-panel" role="tabpanel" hidden>
+        <div id="panelSettings" aria-labelledby="tabSettings" class="panel settings-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>
               <h2>AI settings</h2>
@@ -610,38 +639,40 @@
     </article>
   </template>
 
+  <!-- Compact anomaly row: what, where, how much, when, and the two common actions;
+       the rest is in the "⋯" menu and the expanded detail. -->
   <template id="anomalyRowTemplate">
     <article class="anomaly-row">
       <div class="anomaly-main">
-        <div class="anomaly-col anomaly-col-type">
-          <span class="anomaly-type-badge"></span>
+        <span class="anomaly-type-badge"></span>
+        <div class="anomaly-body">
+          <div class="anomaly-title-line">
+            <span class="anomaly-title"></span>
+            <span class="anomaly-source"></span>
+          </div>
+          <div class="anomaly-snippet"></div>
         </div>
-        <div class="anomaly-col anomaly-col-source">
-          <div class="anomaly-namespace"></div>
-          <div class="anomaly-pod"></div>
+        <span class="anomaly-sev"><span class="badge"></span></span>
+        <div class="anomaly-stats">
+          <span class="anomaly-count"></span>
+          <span class="anomaly-time"></span>
         </div>
-        <div class="anomaly-col anomaly-col-severity">
-          <span class="badge"></span>
-        </div>
-        <div class="anomaly-col anomaly-col-summary">
-          <span class="anomaly-source" hidden></span>
-          <div class="anomaly-summary-text"></div>
-          <div class="anomaly-action-text"></div>
-        </div>
-        <div class="anomaly-col anomaly-col-meta">
-          <span class="anomaly-status-badge"></span>
-          <div class="anomaly-time"></div>
-        </div>
-        <div class="anomaly-col anomaly-col-actions">
-          <button type="button" class="anomaly-btn-summarize ghost" title="Summarize this anomaly with AI (fast model)" hidden>✦ Summarize</button>
-          <button type="button" class="anomaly-btn-deep ghost" title="Deep analysis with the deep model (separate budget)" hidden>Deep</button>
-          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab"> Troubleshoot</button>
+        <div class="anomaly-actions">
+          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in the Actionable tab">Troubleshoot</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
-          <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
-          <div class="anomaly-row-error" role="alert" hidden></div>
+          <div class="row-menu">
+            <button type="button" class="row-menu-btn ghost" aria-haspopup="menu" aria-expanded="false" aria-label="More actions">⋯</button>
+            <div class="row-menu-list" role="menu" hidden>
+              <button type="button" role="menuitem" tabindex="-1" class="anomaly-btn-summarize" title="Summarize this anomaly with AI (fast model)" hidden>✦ Summarize</button>
+              <button type="button" role="menuitem" tabindex="-1" class="anomaly-btn-deep" title="Deep analysis with the deep model (separate budget)" hidden>✦ Deep analysis</button>
+              <button type="button" role="menuitem" tabindex="-1" class="anomaly-btn-dismissed">✕ Dismiss</button>
+            </div>
+          </div>
         </div>
         <button type="button" class="anomaly-expand-btn" aria-label="Expand evidence" aria-expanded="false">▾</button>
       </div>
+      <div class="anomaly-row-note" role="status" hidden></div>
+      <div class="anomaly-row-error" role="alert" hidden></div>
       <div class="anomaly-detail" hidden>
         <div class="anomaly-detail-inner"></div>
       </div>
