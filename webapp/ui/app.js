@@ -1,7 +1,8 @@
 const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 minutes
 const EXPLAIN_COOLDOWN_MS = 12000; // client-side cooldown after clicking Explain
-const CURRENT_LOG_LIMIT = 7;
-const OLDER_LOG_LIMIT = 50;
+const LOG_PAGE_SIZE = 200; // rows per /api/logs page (first page and each "Load older")
+const LOG_ROWS_MAX = 2000; // loaded rows kept in the list; live tail trims the oldest beyond this
+const SCROLLED_AWAY_PX = 40; // list scrolled further than this holds new tail rows back
 const COUNT_FORMATTER = new Intl.NumberFormat();
 const HOUR_MS = 60 * 60 * 1000;
 const CONTEXT_LINE_CHOICES = [10, 25, 50];
@@ -35,7 +36,7 @@ const state = {
     rangeTotal: null, // entries in the applied range (histogram sum), null until loaded
     rangeTruncated: false, // the histogram left out its oldest buckets
   },
-  resultCounts: null, // { lines, rows } on screen, for the result summary
+  resultCounts: null, // { lines, rows } in the list, for the result summary
   dashboard: {
     data: null,
     loading: false,
@@ -43,15 +44,15 @@ const state = {
     loaded: false,
     requestId: 0,
   },
-  items: [],
-  nextCursor: null,
+  items: [], // loaded rows, newest first: the first page plus every older page
+  nextCursor: null, // cursor of the next older page; null at the end
   hasMore: false,
-  olderItems: [],
-  olderCursor: null,
-  olderHasMore: false,
   olderLoading: false,
   olderRequestId: 0,
-  olderOverlayOpen: false,
+  olderTrimmed: false, // live tail dropped the oldest rows; older pages need a reload
+  scrolledSincePage: false, // the reader scrolled since the last page (gates infinite scroll)
+  pendingTail: [], // live tail rows held back behind the "N new rows" banner
+  pendingTruncated: false, // a tail poll hit its limit, so more rows may be waiting
   // Row id (ingest order) the live tail continues from; set by every reload.
   liveCursor: null,
   liveTimer: null,
@@ -61,9 +62,10 @@ const state = {
   endIsLive: true,
   lastUpdatedAt: null,
   lastStatus: null,
+  // Open rows by row id; a merged row is open when any of its lines is.
   expandedRows: new Set(),
-  expandedGroups: new Set(),
-  groupByRule: false,
+  rowGroups: new Map(), // row id of each rendered row -> its group (for one-row re-renders)
+  collapseDuplicates: true,
   aiConfigured: false,
   // Feature flags from /api/status (ai_features); a feature turned off in
   // Settings hides its buttons.
@@ -374,6 +376,39 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+// Error toast for actions that have no panel of their own to show it in.
+// A toast with the same key is updated in place instead of stacking (e.g.
+// live tail failing on every poll); dismissToast(key) clears it on recovery.
+const TOAST_MS = 10000;
+function showToast(message, { key = message } = {}) {
+  const region = el('toastRegion');
+  let toast = Array.from(region.children).find((node) => node.dataset.key === key);
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.setAttribute('role', 'alert');
+    toast.dataset.key = key;
+    const text = document.createElement('span');
+    text.className = 'toast-text';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ghost toast-close';
+    close.textContent = '✕';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.addEventListener('click', () => toast.remove());
+    toast.append(text, close);
+    region.appendChild(toast);
+  }
+  toast.querySelector('.toast-text').textContent = message;
+  window.clearTimeout(Number(toast.dataset.timer));
+  toast.dataset.timer = String(window.setTimeout(() => toast.remove(), TOAST_MS));
+}
+
+function dismissToast(key) {
+  const toast = Array.from(el('toastRegion').children).find((node) => node.dataset.key === key);
+  if (toast) toast.remove();
+}
+
 function dashboardStateEls() {
   return {
     loading: el('dashboardLoading'),
@@ -533,7 +568,7 @@ async function drillDownFromDashboard(action, value, severity = '') {
   // One history entry for the whole drilldown (tab + filters + range).
   switchTab('logs', { history: null });
   updateUrl('push');
-  await loadLogs(true);
+  await loadLogs();
 }
 
 async function loadDashboard() {
@@ -593,6 +628,10 @@ function toDatetimeLocal(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+// Pod / container picker: an ARIA 1.2 editable combobox with a listbox popup.
+// Focus stays in the input; arrow keys move the active option
+// (aria-activedescendant), Enter picks it, or the typed text when none is
+// active, and applies; Esc closes the list. Options are not Tab stops.
 function buildCombobox(inputId, facetKey) {
   const input = el(inputId);
   const wrapper = document.createElement('div');
@@ -602,47 +641,93 @@ function buildCombobox(inputId, facetKey) {
   const list = document.createElement('div');
   list.className = 'combobox-list';
   list.id = `${inputId}-list`;
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', `${facetKey} values`);
   wrapper.appendChild(list);
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-controls', list.id);
+  input.setAttribute('aria-expanded', 'false');
 
-  const close = () => { list.classList.remove('open'); };
+  let options = [];
+  let active = -1;
+
+  const setActive = (index) => {
+    if (options[active]) options[active].classList.remove('active');
+    active = index;
+    const option = options[active];
+    if (option) {
+      option.classList.add('active');
+      input.setAttribute('aria-activedescendant', option.id);
+      option.scrollIntoView({ block: 'nearest' });
+    } else {
+      input.removeAttribute('aria-activedescendant');
+    }
+  };
+
+  const isOpen = () => list.classList.contains('open');
+
+  const close = () => {
+    setActive(-1);
+    list.classList.remove('open');
+    input.setAttribute('aria-expanded', 'false');
+  };
 
   const renderList = () => {
     const needle = input.value.trim().toLowerCase();
     const values = (state.facets[facetKey] || [])
       .filter((item) => !needle || String(item.value).toLowerCase().includes(needle))
       .slice(0, 200);
-    const parts = ['<button type="button" class="combobox-option" data-value="">All</button>'];
-    for (const item of values) {
-      const selected = item.value === input.value ? ' selected' : '';
-      const value = escapeHtml(item.value ?? '');
-      const count = Number(item.count ?? 0);
-      const safeCount = Number.isFinite(count) ? String(count) : '0';
-      parts.push(`<button type="button" class="combobox-option${selected}" data-value="${value}">${value} <span class="combobox-count">${safeCount}</span></button>`);
-    }
-    if (!values.length) parts.push('<div class="combobox-empty">No matches</div>');
+    const parts = [{ value: '', label: 'All', count: null }]
+      .concat(values.map((item) => ({ value: String(item.value ?? ''), label: String(item.value ?? ''), count: Number(item.count ?? 0) })))
+      .map((item, index) => {
+        const selected = item.value === input.value;
+        const count = item.count === null ? '' : ` <span class="combobox-count">${Number.isFinite(item.count) ? item.count : 0}</span>`;
+        return `<div role="option" id="${inputId}-opt-${index}" tabindex="-1" class="combobox-option${selected ? ' selected' : ''}" aria-selected="${selected}" data-value="${escapeHtml(item.value)}">${escapeHtml(item.label)}${count}</div>`;
+      });
+    if (!values.length) parts.push('<div class="combobox-empty" role="presentation">No matches</div>');
     list.innerHTML = parts.join('');
+    options = Array.from(list.querySelectorAll('[role="option"]'));
+    active = -1;
+    input.removeAttribute('aria-activedescendant');
   };
 
   const open = () => {
     renderList();
     list.classList.add('open');
+    input.setAttribute('aria-expanded', 'true');
+  };
+
+  const choose = (value) => {
+    input.value = value;
+    close();
+    reloadLogs();
   };
 
   input.addEventListener('focus', open);
   input.addEventListener('input', open);
   input.addEventListener('blur', () => window.setTimeout(close, 150));
   list.addEventListener('mousedown', (event) => {
-    const option = event.target.closest('.combobox-option');
+    const option = event.target.closest('[role="option"]');
     if (!option) return;
-    event.preventDefault();
-    input.value = option.dataset.value || '';
-    close();
-    reloadLogs();
+    event.preventDefault(); // keep focus in the input
+    choose(option.dataset.value || '');
   });
   input.addEventListener('keydown', (event) => {
-    // Enter applies the typed value (and keeps the form from submitting twice).
-    if (event.key === 'Enter') { event.preventDefault(); close(); reloadLogs(); }
-    else if (event.key === 'Escape') { close(); }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!isOpen()) open();
+      if (!options.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      const start = active === -1 ? (step === 1 ? -1 : options.length) : active;
+      setActive((start + step + options.length) % options.length);
+    } else if (event.key === 'Enter') {
+      event.preventDefault(); // the filters form would apply a second time
+      choose(isOpen() && options[active] ? options[active].dataset.value || '' : input.value.trim());
+    } else if (event.key === 'Escape' && isOpen()) {
+      event.preventDefault();
+      close();
+    }
   });
 }
 
@@ -666,23 +751,25 @@ function groupKeyOf(item) {
   return [item.severity_bucket, item.namespace, item.pod, item.container, message].join('|');
 }
 
+// Rows of the list: with "Collapse duplicates" on, identical lines (same
+// source and normalised message) less than 5 minutes apart share one row;
+// off, every line is its own row.
 function buildGroups(items) {
+  if (!state.collapseDuplicates) return items.map((item) => ({ items: [item] }));
   const groups = [];
   const byKey = new Map();
   for (const item of items) {
     const key = groupKeyOf(item);
     const ts = Date.parse(item.timestamp) || 0;
     let group = byKey.get(key);
-    if (group && !state.groupByRule && Math.abs(ts - group.lastTs) > GROUP_WINDOW_MS) {
-      group = null;
-    }
+    if (group && Math.abs(ts - group.lastTs) > GROUP_WINDOW_MS) group = null;
     if (!group) {
       group = { items: [], lastTs: ts };
       byKey.set(key, group);
       groups.push(group);
     }
     group.items.push(item);
-    if (!state.groupByRule) group.lastTs = ts;
+    group.lastTs = ts;
   }
   return groups;
 }
@@ -701,11 +788,7 @@ function rowMarkup(item) {
   node.querySelector('.source').textContent = `${item.namespace} · ${item.pod}/${item.container}`;
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
-  messageButton.title = 'Click row to expand full details';
-  if (aiFeatureOn('explain_line')) {
-    const explainBlock = lineExplainMarkup(String(item.id), item);
-    node.appendChild(explainBlock);
-  }
+  messageButton.title = 'Show the full message and details';
   return node;
 }
 
@@ -848,9 +931,11 @@ function lineExplainMarkup(rowId, item) {
 
   const btn = document.createElement('button');
   btn.type = 'button';
-  btn.className = 'ghost line-explain-btn';
+  btn.className = 'ghost line-explain-btn ai-action';
   btn.textContent = lineState.status === 'loading' ? '✦ Explaining…' : '✦ Explain this line';
-  btn.disabled = lineState.status === 'loading';
+  btn.title = 'AI action: sends this line to the configured AI provider';
+  // aria-disabled, not disabled: the re-render while loading can keep focus here.
+  btn.setAttribute('aria-disabled', String(lineState.status === 'loading'));
   btn.addEventListener('click', (ev) => {
     ev.stopPropagation();
     if (lineState.status === 'loading') return;
@@ -899,7 +984,7 @@ function lineExplainMarkup(rowId, item) {
 async function explainLine(rowId, item, options = {}) {
   if (!aiFeatureOn('explain_line')) return;
   state.lineExplainState.set(rowId, { status: 'loading' });
-  renderAll();
+  rerenderRow(rowId);
   try {
     const result = await fetchJson('/api/explain-line', {
       method: 'POST',
@@ -920,7 +1005,7 @@ async function explainLine(rowId, item, options = {}) {
   } catch (err) {
     state.lineExplainState.set(rowId, { status: 'error', error: err.message });
   }
-  renderAll();
+  rerenderRow(rowId);
   if (state.context.recordId !== null) renderContext();
 }
 
@@ -961,30 +1046,59 @@ function detailMarkup(item, rowId, { inContext = false } = {}) {
   if (item.output_fields && Object.keys(item.output_fields).length) {
     addDetailBlock(wrap, 'output_fields', JSON.stringify(item.output_fields, null, 2));
   }
+  if (aiFeatureOn('explain_line')) wrap.appendChild(lineExplainMarkup(rowId, item));
   return wrap;
 }
 
+// The lines a merged row stands for; each time opens that line's context.
 function timestampsMarkup(group) {
   const wrap = document.createElement('div');
-  wrap.className = 'row-detail group-timestamps';
+  wrap.className = 'group-timestamps';
   const label = document.createElement('div');
   label.className = 'detail-label';
-  label.textContent = `${group.items.length} occurrences`;
+  label.textContent = `${group.items.length} occurrences · open one to see its context`;
   wrap.appendChild(label);
+  const list = document.createElement('div');
+  list.className = 'timestamp-list';
   for (const item of group.items) {
-    const line = document.createElement('div');
+    const line = document.createElement('button');
+    line.type = 'button';
     line.className = 'timestamp-line';
     line.textContent = formatTimestamp(item.timestamp);
-    line.title = item.timestamp;
-    wrap.appendChild(line);
+    line.title = `${item.timestamp} · show the lines around this one`;
+    line.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openContext(Number(item.id));
+    });
+    list.appendChild(line);
   }
+  wrap.appendChild(list);
   return wrap;
 }
 
-function renderRows(items, append = false) {
+// Which control inside which row has focus (by its position among the row's
+// buttons), so a re-render can put focus back on the same control.
+const ROW_FOCUSABLE = 'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function focusedRowControl() {
+  const active = document.activeElement;
+  const row = active instanceof Element ? active.closest('#rows .row') : null;
+  if (!row) return null;
+  return { rowId: row.dataset.rowId, index: Array.from(row.querySelectorAll(ROW_FOCUSABLE)).indexOf(active) };
+}
+
+function restoreRowFocus(saved) {
+  if (!saved) return;
+  const row = Array.from(el('rows').children).find((node) => node.dataset.rowId === saved.rowId);
+  if (!row) return;
+  const target = row.querySelectorAll(ROW_FOCUSABLE)[saved.index] || row.querySelector('.message-button');
+  if (target) target.focus({ preventScroll: true });
+}
+
+function renderRows(items) {
   const rows = el('rows');
-  if (!append) rows.innerHTML = '';
-  if (!append && !items.length) {
+  const focus = focusedRowControl();
+  rows.innerHTML = '';
+  if (!items.length) {
     const latestCached = state.lastStatus?.latest_record_timestamp;
     const latestHint = latestCached
       ? ` Latest cached logs reach ${formatTimestamp(latestCached)}.`
@@ -994,81 +1108,97 @@ function renderRows(items, append = false) {
     el('resultSummary').textContent = 'No rows match';
     return;
   }
-  let collapsed = 0;
-  const visible = items.slice(0, CURRENT_LOG_LIMIT);
-  for (const group of buildGroups(visible)) {
-    const representative = group.items[0];
-    collapsed += group.items.length - 1;
-    const node = rowMarkup(representative);
-    const rowId = String(representative.id);
-    node.dataset.rowId = rowId;
-    if (group.items.length > 1) {
-      const badge = node.querySelector('.badge');
-      const count = document.createElement('span');
-      count.className = 'count-badge';
-      count.textContent = `×${group.items.length}`;
-      count.title = `${group.items.length} identical alerts — click row to show individual timestamps`;
-      badge.after(count);
-      node.classList.add('grouped');
-      node.dataset.groupKey = groupKeyOf(representative);
-      if (state.expandedGroups.has(node.dataset.groupKey)) {
-        node.classList.add('expanded');
-        node.appendChild(timestampsMarkup(group));
-      }
-    }
-    if (state.expandedRows.has(rowId)) {
-      node.classList.add('expanded');
-      node.appendChild(detailMarkup(representative, rowId));
-    }
-    node.addEventListener('click', () => {
-      if (group.items.length > 1) {
-        const key = node.dataset.groupKey;
-        if (state.expandedRows.has(rowId)) {
-          state.expandedRows.delete(rowId);
-        }
-        if (state.expandedGroups.has(key)) {
-          state.expandedGroups.delete(key);
-        } else {
-          state.expandedGroups.add(key);
-        }
-      } else if (state.expandedRows.has(rowId)) {
-        state.expandedRows.delete(rowId);
-      } else {
-        state.expandedRows.add(rowId);
-      }
-      renderAll();
-    });
-    rows.appendChild(node);
-  }
-  const lines = append ? state.items.length : visible.length;
-  state.resultCounts = { lines, rows: lines - collapsed };
+  const groups = buildGroups(items);
+  state.rowGroups = new Map(groups.map((group) => [String(group.items[0].id), group]));
+  const fragment = document.createDocumentFragment();
+  for (const group of groups) fragment.appendChild(rowNode(group));
+  rows.appendChild(fragment);
+  state.resultCounts = { lines: items.length, rows: groups.length };
   updateResultSummary();
+  restoreRowFocus(focus);
 }
 
-// "Showing 7 newest lines in 1 row · 77 in range": what is on screen, how it
-// was collapsed, and the range total once the histogram for it has loaded.
+// One row of the list: a line, or a merged group shown by its newest line.
+function rowNode(group) {
+  const representative = group.items[0];
+  const node = rowMarkup(representative);
+  const rowId = String(representative.id);
+  node.dataset.rowId = rowId;
+  const merged = group.items.length > 1;
+  if (merged) {
+    const badge = node.querySelector('.badge');
+    const count = document.createElement('span');
+    count.className = 'count-badge';
+    count.textContent = `×${group.items.length}`;
+    count.title = `${group.items.length} identical lines within 5 minutes — open the row to list them`;
+    badge.after(count);
+    node.classList.add('grouped');
+  }
+  const expanded = group.items.some((item) => state.expandedRows.has(String(item.id)));
+  node.querySelector('.message-button').setAttribute('aria-expanded', String(expanded));
+  if (expanded) {
+    node.classList.add('expanded');
+    const detail = detailMarkup(representative, rowId);
+    if (merged) detail.appendChild(timestampsMarkup(group));
+    node.appendChild(detail);
+  }
+  node.addEventListener('click', (ev) => {
+    // Clicks on the detail (text selection, its own buttons) keep the row open.
+    if (ev.target instanceof Element && ev.target.closest('.row-detail')) return;
+    if (expanded) {
+      for (const item of group.items) state.expandedRows.delete(String(item.id));
+    } else {
+      state.expandedRows.add(rowId);
+    }
+    rerenderRow(rowId);
+  });
+  return node;
+}
+
+// Re-renders one row in place (open / close, explain state), keeping focus
+// on the same control; a full render of a long list is far slower.
+function rerenderRow(rowId) {
+  const group = state.rowGroups.get(rowId);
+  const current = Array.from(el('rows').children).find((node) => node.dataset.rowId === rowId);
+  if (!group || !current) {
+    renderAll();
+    return;
+  }
+  const focus = focusedRowControl();
+  current.replaceWith(rowNode(group));
+  restoreRowFocus(focus);
+}
+
+// "200 of 374 lines · 38 groups": lines loaded into the list, the range total
+// once the histogram for the same filters has loaded, and how many rows
+// ("groups") they collapse into.
 function updateResultSummary() {
   const counts = state.resultCounts;
   if (!counts) return;
-  const plural = (n, word) => `${formatCount(n)} ${word}${n === 1 ? '' : 's'}`;
-  let text = `Showing ${plural(counts.lines, 'newest line')}`;
-  if (counts.rows !== counts.lines) text += ` in ${plural(counts.rows, 'row')}`;
   const panels = state.logPanels;
-  if (panels.rangeTotal !== null) {
-    text += ` · ${formatCount(panels.rangeTotal)}${panels.rangeTruncated ? '+' : ''} in range`;
-  }
+  const total = panels.rangeTotal !== null
+    ? ` of ${formatCount(panels.rangeTotal)}${panels.rangeTruncated ? '+' : ''}`
+    : '';
+  let text = `${formatCount(counts.lines)}${total} line${counts.lines === 1 && !total ? '' : 's'}`;
+  if (counts.rows !== counts.lines) text += ` · ${formatCount(counts.rows)} group${counts.rows === 1 ? '' : 's'}`;
   el('resultSummary').textContent = text;
 }
 
 function renderAll() {
-  renderRows(state.items, false);
+  renderRows(state.items);
+}
+
+// Whether the list has been scrolled away from its newest rows, either inside
+// the list itself or by scrolling the page past its top.
+function listScrolledAway() {
+  const host = el('logListHost');
+  return host.scrollTop > SCROLLED_AWAY_PX || el('rows').getBoundingClientRect().top < -SCROLLED_AWAY_PX;
 }
 
 // ─── Log context (entries around one selected entry) ─────────────────────────
 
 async function openContext(recordId, { history = 'push' } = {}) {
   if (!Number.isSafeInteger(recordId) || recordId < 0) return;
-  closeOlderLogsOverlay();
   const ctx = state.context;
   ctx.recordId = recordId;
   ctx.data = null;
@@ -1495,10 +1625,17 @@ function openAnomalyLogs(anomaly) {
   closeContext({ history: null });
   switchTab('logs', { history: null });
   updateUrl('push');
-  loadLogs(true);
+  loadLogs();
 }
 
+// Reviewed / Dismiss. The two buttons are disabled while the request runs; a
+// failure is shown on the row itself and the buttons are enabled again.
 async function patchAnomalyStatus(id, status, rowNode) {
+  const buttons = rowNode.querySelectorAll('.anomaly-btn-reviewed, .anomaly-btn-dismissed');
+  const errorBox = rowNode.querySelector('.anomaly-row-error');
+  const wasDisabled = Array.from(buttons, (button) => button.disabled);
+  buttons.forEach((button) => { button.disabled = true; });
+  errorBox.hidden = true;
   try {
     await fetchJson(`/api/anomalies/${id}`, {
       method: 'PATCH',
@@ -1509,7 +1646,9 @@ async function patchAnomalyStatus(id, status, rowNode) {
     if (anomaly) anomaly.status = status;
     renderAnomalies();
   } catch (err) {
-    el('health').textContent = `Failed to update anomaly: ${err.message}`;
+    buttons.forEach((button, index) => { button.disabled = wasDisabled[index]; });
+    errorBox.textContent = `Could not mark as ${status}: ${err.message}`;
+    errorBox.hidden = false;
   }
 }
 
@@ -1674,7 +1813,7 @@ async function runExplain(options = {}) {
 }
 
 el('explainBtn').addEventListener('click', () => {
-  runExplain().catch((err) => { el('health').textContent = err.message; });
+  runExplain().catch((err) => showToast(`Explain failed: ${err.message}`, { key: 'explain' }));
 });
 
 el('explainDismiss').addEventListener('click', () => {
@@ -2434,135 +2573,59 @@ function updateHealthFromStatus(status) {
   }
 }
 
+// "Load older" below the list: appends the next page to the same list (the
+// button, or scrolling near it, loads one page at a time).
 function resetOlderLogsState() {
-  state.olderItems = [];
-  state.olderCursor = null;
-  state.olderHasMore = false;
   state.olderLoading = false;
   state.olderRequestId += 1;
-  closeOlderLogsOverlay();
-  const loadMore = el('loadMore');
-  if (loadMore) {
-    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
-    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
-  }
+  state.olderTrimmed = false;
+  state.scrolledSincePage = false;
+  el('loadMoreError').hidden = true;
+  renderPager();
 }
 
-function openOlderLogsOverlay(explicitUserAction = false) {
-  if (!explicitUserAction) {
-    closeOlderLogsOverlay();
-    return;
-  }
-  const hasOlder = Boolean(state.nextCursor || state.olderCursor || state.olderItems.length);
-  if (!hasOlder) {
-    closeOlderLogsOverlay();
-    return;
-  }
-  state.olderOverlayOpen = true;
-  const overlay = el('olderLogsOverlay');
-  if (overlay) {
-    overlay.hidden = false;
-    overlay.style.display = 'flex';
-  }
-  if (!state.olderItems.length) {
-    loadOlderLogsPage().catch((err) => {
-      el('health').textContent = err.message;
-    });
+function renderPager() {
+  const button = el('loadMore');
+  button.hidden = !state.items.length;
+  if (state.olderTrimmed) {
+    button.disabled = false;
+    button.textContent = 'Reload to see older lines';
   } else {
-    renderOlderLogs();
-  }
-}
-
-function closeOlderLogsOverlay() {
-  state.olderOverlayOpen = false;
-  const overlay = el('olderLogsOverlay');
-  if (overlay) {
-    overlay.hidden = true;
-    overlay.style.display = 'none';
-  }
-}
-
-function ensureOlderLogsClosed() {
-  closeOlderLogsOverlay();
-  const olderLoadMore = el('olderLogsLoadMore');
-  if (olderLoadMore) {
-    olderLoadMore.disabled = true;
-  }
-}
-
-function handleOlderOverlayOutsideClick(event) {
-  const overlay = el('olderLogsOverlay');
-  if (!overlay || overlay.hidden) return;
-  if (event.target === overlay) {
-    closeOlderLogsOverlay();
+    button.disabled = state.olderLoading || !state.nextCursor;
+    button.textContent = state.olderLoading ? 'Loading…' : state.nextCursor ? 'Load older' : 'No older lines in this range';
   }
 }
 
 async function loadOlderLogsPage() {
-  if (state.olderLoading) return;
-  const cursor = state.olderCursor || state.nextCursor;
-  if (!cursor && !state.olderItems.length) {
-    closeOlderLogsOverlay();
+  if (state.olderTrimmed) {
+    reloadLogs();
     return;
   }
-
+  if (state.olderLoading || !state.nextCursor) return;
   const requestId = ++state.olderRequestId;
   state.olderLoading = true;
-  renderOlderLogs();
-
+  el('loadMoreError').hidden = true;
+  renderPager();
   try {
-    const params = new URLSearchParams(queryFromFilters({ limit: String(OLDER_LOG_LIMIT), cursor }));
+    const params = new URLSearchParams(queryFromFilters({ limit: String(LOG_PAGE_SIZE), cursor: state.nextCursor }));
     const data = await fetchJson(`/api/logs?${params.toString()}`);
     if (requestId !== state.olderRequestId) return;
-
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (items.length) {
-      state.olderItems = state.olderItems.concat(items);
-    }
-    state.olderCursor = data.next_cursor || null;
-    state.olderHasMore = Boolean(data.has_more);
-    if (!state.olderCursor && !state.olderHasMore && state.olderItems.length) {
-      state.nextCursor = null;
-    }
+    const known = new Set(state.items.map((item) => item.id));
+    const older = (Array.isArray(data.items) ? data.items : []).filter((item) => !known.has(item.id));
+    state.items = state.items.concat(older);
+    state.nextCursor = data.next_cursor || null;
+    state.hasMore = Boolean(data.has_more);
+    state.scrolledSincePage = false;
+    renderAll();
   } catch (err) {
-    if (requestId === state.olderRequestId) {
-      closeOlderLogsOverlay();
-      el('health').textContent = err.message;
-    }
-    return;
+    if (requestId !== state.olderRequestId) return;
+    el('loadMoreError').textContent = `Could not load older lines: ${err.message}`;
+    el('loadMoreError').hidden = false;
   } finally {
     if (requestId === state.olderRequestId) {
       state.olderLoading = false;
-      renderOlderLogs();
+      renderPager();
     }
-  }
-}
-
-function renderOlderLogs() {
-  const container = el('olderLogsList');
-  if (!container) return;
-  container.innerHTML = '';
-
-  if (!state.olderItems.length) {
-    container.innerHTML = '<div class="empty-state">No older logs available for this filter.</div>';
-  } else {
-    for (const item of state.olderItems) {
-      const node = rowMarkup(item);
-      node.classList.add('older-log-row');
-      if (state.expandedRows.has(String(item.id))) {
-        node.classList.add('expanded');
-        node.appendChild(detailMarkup(item, String(item.id)));
-      }
-      container.appendChild(node);
-    }
-  }
-
-  const olderLoadMore = el('olderLogsLoadMore');
-  if (olderLoadMore) {
-    const hasMore = state.olderHasMore || Boolean(state.nextCursor && !state.olderItems.length);
-    olderLoadMore.disabled = state.olderLoading || !hasMore;
-    olderLoadMore.hidden = !hasMore && !state.olderItems.length;
-    olderLoadMore.textContent = state.olderLoading ? 'Loading…' : (hasMore ? 'Load older' : 'No more older logs');
   }
 }
 
@@ -2577,28 +2640,27 @@ function setLogsLoading(loading) {
   if (loading) el('resultSummary').textContent = 'Loading…';
 }
 
-// Never rejects: a failed load is shown above the rows (the previous rows stay,
-// labelled as such), so callers need no error handling of their own.
-async function loadLogs(reset = true) {
+// Loads the first page of the applied filters. Never rejects: a failed load
+// is shown above the rows (the previous rows stay, labelled as such), so
+// callers need no error handling of their own.
+async function loadLogs() {
   const requestId = ++state.logsRequestId;
   state.tailRequestId += 1; // a tail response for the previous query must not land on this one
   refreshLiveEnd();
-  if (reset) {
-    state.logPanels.rangeTotal = null; // belongs to the previous query
-    updateRangeChip();
-  }
+  state.logPanels.rangeTotal = null; // belongs to the previous query
+  updateRangeChip();
   setLogsLoading(true);
   let data;
   try {
-    const params = new URLSearchParams(queryFromFilters({ limit: String(CURRENT_LOG_LIMIT) }));
-    if (!reset && state.nextCursor) params.set('cursor', state.nextCursor);
+    const params = new URLSearchParams(queryFromFilters({ limit: String(LOG_PAGE_SIZE) }));
     data = await fetchJson(`/api/logs?${params.toString()}`);
   } catch (err) {
     if (requestId === state.logsRequestId) {
       setLogsLoading(false);
       state.resultCounts = null; // so a late histogram does not overwrite this
       el('resultSummary').textContent = 'Load failed';
-      showLogsError(`Could not load logs: ${err.message}. The rows below are from the previous query.`);
+      const previous = state.items.length ? ' The rows below are from the previous query.' : '';
+      showLogsError(`Could not load logs: ${err.message}.${previous}`);
     }
     return false;
   }
@@ -2608,43 +2670,24 @@ async function loadLogs(reset = true) {
   state.nextCursor = data.next_cursor || null;
   state.hasMore = Boolean(data.has_more);
   state.lastUpdatedAt = data.last_updated_at;
-  if (reset) {
-    state.items = Array.isArray(data.items) ? data.items.slice(0, CURRENT_LOG_LIMIT) : [];
-    state.olderItems = [];
-    state.olderCursor = null;
-    state.olderHasMore = false;
-    closeOlderLogsOverlay();
-  } else {
-    state.items = (Array.isArray(data.items) ? data.items : []).slice(0, CURRENT_LOG_LIMIT);
-  }
+  state.items = Array.isArray(data.items) ? data.items : [];
   state.expandedRows.clear();
-  state.expandedGroups.clear();
+  clearPendingTail();
+  resetOlderLogsState();
+  el('logListHost').scrollTop = 0;
   renderAll();
-  renderOlderLogs();
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
-  const loadMore = el('loadMore');
-  if (loadMore) {
-    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
-    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
-  }
-  if (!el('health').textContent || !el('health').textContent.startsWith('Ingestion')) {
-    el('health').textContent = state.hasMore ? 'More older rows available' : 'End of current page';
-  }
   // Tail from the newest row that existed when this query ran, whether or not
   // Live is on yet and whether or not the page matched anything.
-  if (reset) state.liveCursor = Number.isFinite(data.max_id) ? data.max_id : null;
-  if (reset) {
-    // Filters may have changed: refresh the dashboard now only if it is on
-    // screen; otherwise mark it out of date so it reloads when opened.
-    if (state.activeTab === 'dashboard') {
-      loadDashboard().catch((err) => {
-        el('health').textContent = err.message;
-      });
-    } else {
-      state.dashboard.loaded = false;
-    }
-    scheduleLogPanels();
+  state.liveCursor = Number.isFinite(data.max_id) ? data.max_id : null;
+  // Filters may have changed: refresh the dashboard now only if it is on
+  // screen; otherwise mark it out of date so it reloads when opened.
+  if (state.activeTab === 'dashboard') {
+    loadDashboard().catch((err) => showToast(`Dashboard: ${err.message}`, { key: 'dashboard' }));
+  } else {
+    state.dashboard.loaded = false;
   }
+  scheduleLogPanels();
   return true;
 }
 
@@ -2653,27 +2696,52 @@ function compareNewestFirst(a, b) {
   return Number(b.id) - Number(a.id);
 }
 
-// New tail rows merged into the visible rows: newest first by event time,
-// each row once, capped to the view size (older rows drop off the bottom).
-function mergeNewestItems(incoming, current, limit) {
+// Rows merged newest first by event time, each row once.
+function mergeNewestItems(incoming, current) {
   const byId = new Map();
   for (const item of incoming.concat(current)) {
     if (!byId.has(item.id)) byId.set(item.id, item);
   }
-  return Array.from(byId.values()).sort(compareNewestFirst).slice(0, limit);
+  return Array.from(byId.values()).sort(compareNewestFirst);
 }
 
-function flashNewRows(count, truncated = false) {
-  const banner = el('newRowsBanner');
-  el('newRowsCount').textContent = truncated ? `${count}+` : String(count);
-  banner.classList.add('show');
-  window.clearTimeout(flashNewRows.timer);
-  flashNewRows.timer = window.setTimeout(() => banner.classList.remove('show'), 6000);
+// New tail rows wait behind the banner while the reader is busy: a row is
+// open, or the list is scrolled away from its newest rows. Otherwise they
+// go straight into the list.
+function tailHeldBack() {
+  return state.expandedRows.size > 0 || listScrolledAway();
+}
+
+function clearPendingTail() {
+  state.pendingTail = [];
+  state.pendingTruncated = false;
+  el('newRowsBanner').classList.remove('show');
+}
+
+function showPendingBanner() {
+  const count = state.pendingTail.length;
+  el('newRowsCount').textContent = `${formatCount(count)}${state.pendingTruncated ? '+' : ''}`;
+  el('newRowsBanner').classList.add('show');
+}
+
+// Moves the held-back rows into the list. Past LOG_ROWS_MAX the oldest rows
+// drop off the bottom, and "Load older" then reloads instead of paging on.
+function flushPendingTail() {
+  if (!state.pendingTail.length) return;
+  state.items = mergeNewestItems(state.pendingTail, state.items);
+  if (state.items.length > LOG_ROWS_MAX) {
+    state.items = state.items.slice(0, LOG_ROWS_MAX);
+    state.olderTrimmed = true;
+    renderPager();
+  }
+  clearPendingTail();
+  refreshLiveEnd();
+  renderAll();
 }
 
 // Rows ingested since the last poll (by row id, so objects that arrive late
 // with older timestamps are not skipped). The server returns the newest
-// matches first; they are merged into the view in event-time order.
+// matches first; they are merged into the list in event-time order.
 async function pollTail() {
   if (!el('live').checked) return;
   const requestId = ++state.tailRequestId;
@@ -2682,20 +2750,25 @@ async function pollTail() {
   const params = new URLSearchParams(queryFromFilters(extra));
   const data = await fetchJson(`/api/tail?${params.toString()}`);
   if (requestId !== state.tailRequestId || !el('live').checked) return;
+  dismissToast('tail');
   const hadCursor = state.liveCursor !== null;
   state.liveCursor = Number.isFinite(data.last_id) ? data.last_id : state.liveCursor;
   const items = Array.isArray(data.items) ? data.items : [];
   if (hadCursor && items.length) {
-    state.items = mergeNewestItems(items, state.items, CURRENT_LOG_LIMIT);
-    state.expandedRows.clear();
-    state.expandedGroups.clear();
-    refreshLiveEnd();
-    renderAll();
-    flashNewRows(items.length, Boolean(data.truncated));
+    state.pendingTail = mergeNewestItems(items, state.pendingTail);
+    state.pendingTruncated = state.pendingTruncated || Boolean(data.truncated);
     scheduleLogPanels();
+  }
+  if (state.pendingTail.length) {
+    if (tailHeldBack()) showPendingBanner();
+    else flushPendingTail();
   }
   state.lastUpdatedAt = data.last_updated_at;
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+}
+
+function tailFailed(err) {
+  showToast(`Live tail failed: ${err.message}. Retrying every 10 s.`, { key: 'tail' });
 }
 
 function startTailPolling() {
@@ -2703,9 +2776,7 @@ function startTailPolling() {
   state.tailRequestId += 1;
   state.liveTimer = window.setInterval(() => {
     if (document.hidden) return; // no polling in a background browser tab
-    pollTail().catch((err) => {
-      el('health').textContent = err.message;
-    });
+    pollTail().catch(tailFailed);
     el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
   }, 10000);
 }
@@ -2713,9 +2784,7 @@ function startTailPolling() {
 // Catch up at once when the tab is shown again instead of waiting up to 10s.
 document.addEventListener('visibilitychange', () => {
   if (document.hidden || !state.liveTimer) return;
-  pollTail().catch((err) => {
-    el('health').textContent = err.message;
-  });
+  pollTail().catch(tailFailed);
   el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
 });
 
@@ -3584,7 +3653,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });
-    await loadLogs(true);
+    await loadLogs();
     if (parsed.tab === 'logs' && parsed.rec !== null) openContext(parsed.rec, { history: null });
     if (parsed.anomaly !== null && (parsed.tab === 'insights' || parsed.tab === 'actionable')) {
       await focusAnomaly(parsed.anomaly, { openInActionable: parsed.tab === 'actionable' });
@@ -3605,7 +3674,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
 
 window.addEventListener('popstate', () => {
   applyUrlState(parseUrlState(window.location.search)).catch((err) => {
-    el('health').textContent = err.message;
+    showToast(`Could not open this link: ${err.message}`, { key: 'url' });
   });
 });
 
@@ -4017,7 +4086,7 @@ el('pinnedViewsCards').addEventListener('click', (event) => {
   const view = state.views.list.find((item) => item.id === Number(card.dataset.pinnedViewId));
   if (view) {
     openView(view, { tab: 'logs' }).catch((err) => {
-      el('health').textContent = err.message;
+      showToast(`Could not open the view: ${err.message}`, { key: 'view' });
     });
   }
 });
@@ -5235,7 +5304,6 @@ el('settingsRefresh').addEventListener('click', () => {
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
-  ensureOlderLogsClosed();
   setDefaultDateRange();
   buildCombobox('pod', 'pod');
   buildCombobox('container', 'container');
@@ -5273,7 +5341,7 @@ function reloadLogs() {
   resetOlderLogsState();
   closeContext({ history: null });
   updateUrl('push');
-  return loadLogs(true).catch((err) => showLogsError(`Could not load logs: ${err.message}`));
+  return loadLogs().catch((err) => showLogsError(`Could not load logs: ${err.message}`));
 }
 
 // Search and dates apply on Enter (form submit) or Apply; dropdowns at once.
@@ -5301,40 +5369,26 @@ el('start').addEventListener('change', () => {
   el('rangePreset').value = 'custom';
 });
 el('loadMore').addEventListener('click', () => {
-  openOlderLogsOverlay(true);
+  loadOlderLogsPage();
 });
-
-const olderLogsLoadMore = el('olderLogsLoadMore');
-if (olderLogsLoadMore) {
-  olderLogsLoadMore.addEventListener('click', () => {
-    loadOlderLogsPage().catch((err) => {
-      el('health').textContent = err.message;
-    });
-  });
-}
-
-const olderLogsClose = el('olderLogsClose');
-if (olderLogsClose) {
-  olderLogsClose.addEventListener('click', (event) => {
-    event.stopPropagation();
-    closeOlderLogsOverlay();
-  });
-}
-
-const olderLogsOverlay = el('olderLogsOverlay');
-if (olderLogsOverlay) {
-  olderLogsOverlay.addEventListener('click', (event) => {
-    if (event.target === olderLogsOverlay) {
-      handleOlderOverlayOutsideClick(event);
-    }
-  });
+// Infinite scroll: the next page loads when "Load older" scrolls into view,
+// but only after the reader has scrolled since the last page, so a list that
+// collapses to a few rows does not page through the whole range by itself.
+const markScrolled = () => { state.scrolledSincePage = true; };
+el('logListHost').addEventListener('scroll', markScrolled, { passive: true });
+window.addEventListener('scroll', markScrolled, { passive: true });
+if (typeof IntersectionObserver === 'function') { // without it the button still works
+  new IntersectionObserver((entries) => {
+    if (!entries.some((entry) => entry.isIntersecting) || !state.scrolledSincePage) return;
+    if (state.olderTrimmed || state.olderLoading || !state.nextCursor) return;
+    state.scrolledSincePage = false;
+    loadOlderLogsPage();
+  }, { rootMargin: '0px 0px 300px 0px' }).observe(el('loadMore'));
 }
 
 window.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
-  if (state.olderOverlayOpen) {
-    closeOlderLogsOverlay();
-  } else if (state.context.recordId !== null && state.activeTab === 'logs'
+  if (state.context.recordId !== null && state.activeTab === 'logs'
     && !el('actionConfirmModal').open && !(event.target instanceof HTMLInputElement)) {
     closeContext();
   }
@@ -5375,9 +5429,8 @@ el('rangePreset').addEventListener('change', () => {
   preset.apply();
   reloadLogs();
 });
-el('groupByRule').addEventListener('change', async () => {
-  state.groupByRule = el('groupByRule').checked;
-  state.expandedGroups.clear();
+el('collapseDuplicates').addEventListener('change', () => {
+  state.collapseDuplicates = el('collapseDuplicates').checked;
   renderAll();
 });
 el('refreshInsights').addEventListener('click', () => {
@@ -5387,9 +5440,7 @@ el('insightsStatusFilter').addEventListener('change', () => {
   loadInsights().catch((err) => showInsightsError(err.message));
 });
 el('refreshDashboard').addEventListener('click', () => {
-  loadDashboard().catch((err) => {
-    el('health').textContent = err.message;
-  });
+  loadDashboard().catch((err) => showToast(`Dashboard: ${err.message}`, { key: 'dashboard' }));
   loadPinnedCounts({ force: true });
 });
 document.addEventListener('click', async (event) => {
@@ -5402,7 +5453,7 @@ document.addEventListener('click', async (event) => {
     const value = dashboardAction.dataset.dashboardValue || '';
     const severity = dashboardAction.dataset.dashboardSeverity || '';
     drillDownFromDashboard(action, value, severity).catch((err) => {
-      el('health').textContent = err.message;
+      showToast(`Could not open these logs: ${err.message}`, { key: 'drilldown' });
     });
     return;
   }
@@ -5481,8 +5532,12 @@ el('histogramBars').addEventListener('pointerleave', () => {
   if (!state.logPanels.drag) hideHistogramTooltip();
 });
 el('histogramReset').addEventListener('click', () => resetHistogramRange());
+// Show the held-back rows: insert them and go back to the top of the list
+// (rows that are open stay open).
 el('newRowsBanner').addEventListener('click', () => {
-  el('newRowsBanner').classList.remove('show');
+  flushPendingTail();
+  el('logListHost').scrollTop = 0;
+  if (el('logListHost').getBoundingClientRect().top < 0) el('logListHost').scrollIntoView({ block: 'start' });
 });
 el('live').addEventListener('change', () => {
   if (el('live').checked) startTailPolling(); else stopTailPolling();
@@ -5504,7 +5559,7 @@ el('actionableRefreshBtn').addEventListener('click', async () => {
 });
 
 init().catch((err) => {
-  el('health').textContent = err.message;
+  showToast(`Logscope did not start correctly: ${err.message}`, { key: 'init' });
 });
 
 el('actionableSourceSelect').addEventListener('change', () => {

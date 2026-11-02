@@ -218,8 +218,8 @@
               </label>
               <button id="todayShortcut" class="ghost">Today</button>
               <button id="clearFilters" class="ghost">Clear filters</button>
-              <label class="toggle" title="Collapse repeated Falco rule hits into one row per rule">
-                <input id="groupByRule" type="checkbox" /> Group by rule
+              <label class="toggle" title="Show identical lines from the same source within 5 minutes as one row">
+                <input id="collapseDuplicates" type="checkbox" checked /> Collapse duplicates
               </label>
             </div>
             <div class="toolbar-right">
@@ -248,7 +248,8 @@
 
           <div class="toolbar-note">Newest rows first. Click a row for the full message and source details.</div>
           <div id="logsError" class="dashboard-state dashboard-state-error" role="alert" hidden></div>
-          <button id="newRowsBanner" type="button" class="new-rows-banner">▲ <span id="newRowsCount">0</span> new rows — click to dismiss</button>
+          <!-- Live tail rows held back while a row is open or the list is scrolled -->
+          <button id="newRowsBanner" type="button" class="new-rows-banner" aria-live="polite">▲ <span id="newRowsCount">0</span> new rows — show them</button>
           <!-- Log context: entries around one selected entry (replaces the results while open) -->
           <section id="contextView" class="context-view" hidden aria-label="Log context">
             <div class="context-head">
@@ -296,26 +297,16 @@
             <div class="histogram-axis"><span id="histogramFrom"></span><span id="histogramTo"></span></div>
             <div id="histogramTooltip" class="histogram-tooltip" role="status" hidden></div>
           </section>
-          <div class="table-head">
-            <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
-          </div>
+          <!-- Scrolling log list: sticky column header, rows, then the next page -->
           <div id="logListHost" class="log-list-host">
-            <div id="rows" class="rows"></div>
-            <div id="olderLogsOverlay" class="older-log-overlay" hidden aria-label="Older logs" role="dialog" aria-modal="false">
-              <div class="older-log-panel" role="document">
-                <div class="older-log-head">
-                  <h3>Older logs</h3>
-                  <button id="olderLogsClose" type="button" class="ghost older-log-close" aria-label="Close older logs">✕</button>
-                </div>
-                <div id="olderLogsList" class="older-log-list" aria-live="polite"></div>
-                <div class="older-log-footer">
-                  <button id="olderLogsLoadMore" type="button" class="ghost">Load older</button>
-                </div>
-              </div>
+            <div class="table-head" aria-hidden="true">
+              <span>Time</span><span>Severity</span><span>Scope</span><span>Source</span><span>Message</span>
             </div>
-          </div>
-          <div class="pager">
-            <button id="loadMore">Load older</button>
+            <div id="rows" class="rows"></div>
+            <div class="pager">
+              <button id="loadMore" type="button" class="ghost">Load older</button>
+              <span id="loadMoreError" class="pager-error" role="alert" hidden></span>
+            </div>
           </div>
           </div>
           </div>
@@ -647,6 +638,7 @@
           <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in Actionable tab"> Troubleshoot</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
+          <div class="anomaly-row-error" role="alert" hidden></div>
         </div>
         <button type="button" class="anomaly-expand-btn" aria-label="Expand evidence" aria-expanded="false">▾</button>
       </div>
@@ -655,6 +647,9 @@
       </div>
     </article>
   </template>
+
+  <!-- Errors from actions that have no panel of their own -->
+  <div id="toastRegion" class="toast-region"></div>
 
   <script src="/app.js"></script>
 </body>

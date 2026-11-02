@@ -237,8 +237,12 @@ h1 {
 
 .status-meta {
   margin-top: 1px;
+  min-width: 0;
   color: var(--muted);
   font-size: 11px;
+  /* ingest health text can be long (errors); wrap rather than widen the page */
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* ── Layout ──────────────────────────────────────────────────────────── */
@@ -373,7 +377,8 @@ button:hover {
   border-color: var(--text-dim);
 }
 
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   opacity: 0.4;
   cursor: not-allowed;
 }
@@ -1186,29 +1191,36 @@ button.ghost:hover {
   gap: 12px;
 }
 
+/* The column header sticks to the top of the scrolling list. */
 .table-head {
-  padding: 0 10px 8px;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 8px 10px;
+  background: var(--panel);
   color: var(--muted-2);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   font-size: 10px;
   font-weight: 600;
   border-bottom: 1px solid var(--border);
-  margin-bottom: 2px;
 }
 
+/* The list scrolls on its own: header, rows, then "Load older". */
 .log-list-host {
   position: relative;
+  max-height: max(420px, calc(100vh - 220px));
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
 }
 
 .rows {
   display: grid;
   gap: 1px;
   background: var(--border);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-  max-height: calc(100vh - 360px);
 }
 
 .row {
@@ -1222,76 +1234,6 @@ button.ghost:hover {
 }
 
 .row.grouped.expanded {
-  background: var(--panel-alt);
-}
-
-.older-log-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 25;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  padding: 16px;
-  background: rgba(9, 11, 15, 0.7);
-  border-radius: var(--radius-sm);
-}
-
-.older-log-overlay[hidden] {
-  display: none !important;
-}
-
-.older-log-panel {
-  width: min(100%, 560px);
-  max-height: min(72vh, 760px);
-  display: flex;
-  flex-direction: column;
-  background: var(--panel);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius-md);
-  overflow: hidden;
-}
-
-.older-log-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel-alt);
-}
-
-.older-log-head h3 {
-  margin: 0;
-  font-size: 13px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-dim);
-}
-
-.older-log-close {
-  padding: 4px 8px;
-}
-
-.older-log-list {
-  flex: 1;
-  overflow-y: auto;
-  padding: 10px;
-  display: grid;
-  gap: 6px;
-  background: var(--panel);
-}
-
-.older-log-row {
-  margin: 0;
-}
-
-.older-log-footer {
-  display: flex;
-  justify-content: flex-end;
-  padding: 10px 12px;
-  border-top: 1px solid var(--border);
   background: var(--panel-alt);
 }
 
@@ -1447,8 +1389,16 @@ button.ghost:hover {
 
 .pager {
   display: flex;
-  justify-content: center;
-  padding-top: 12px;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.pager-error {
+  color: var(--error);
+  font-size: 12px;
 }
 
 .pager button:disabled {
@@ -1475,9 +1425,9 @@ button.ghost:hover {
   margin: 0 0 8px;
   padding: 7px 12px;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-strong);
-  background: var(--surface-active);
-  color: var(--text-dim);
+  border: 1px solid var(--accent);
+  background: var(--accent-dim);
+  color: var(--text);
   font-weight: 600;
   font-size: 12px;
   text-align: center;
@@ -1534,9 +1484,19 @@ button.ghost:hover {
   overflow-wrap: anywhere;
 }
 
-.combobox-option:hover {
+.combobox-option {
+  cursor: pointer;
+}
+
+.combobox-option:hover,
+.combobox-option.active {
   background: var(--surface-hover);
   color: var(--text);
+}
+
+.combobox-option.active {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
 }
 
 .combobox-option.selected {
@@ -1602,12 +1562,27 @@ button.ghost:hover {
   color: var(--text-dim);
 }
 
+.timestamp-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 4px;
+}
+
 .group-timestamps .timestamp-line {
+  justify-self: start;
+  padding: 3px 6px;
+  border: 1px solid transparent;
+  background: transparent;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
-  color: var(--muted);
-  padding: 1px 0;
+  color: var(--text-dim);
   font-size: 11.5px;
+  text-align: left;
+}
+
+.group-timestamps .timestamp-line:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
 }
 
 /* ── Anomaly Insights tab ────────────────────────────────────────────── */
@@ -1941,6 +1916,11 @@ button.ghost:hover {
 
   .table-head {
     display: none;
+  }
+
+  .log-list-host {
+    max-height: none;
+    overflow: visible;
   }
 
   .filters {
@@ -3624,3 +3604,50 @@ button.explain-meta-btn[aria-pressed="true"] {
 .alert-delivery-failed, .alert-delivery-failed_final { color: var(--error); }
 .alert-delivery-superseded { color: var(--muted); }
 .alert-retry { padding: 1px 6px; font-size: 11px; }
+
+/* ── Toasts: errors from actions without a panel of their own ─────────── */
+.toast-region {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 40;
+  display: grid;
+  gap: 8px;
+  width: min(420px, calc(100vw - 32px));
+}
+
+.toast {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(225, 82, 82, 0.45);
+  border-left: 3px solid var(--error);
+  border-radius: var(--radius-sm);
+  background: var(--surface-active);
+  color: var(--text);
+  font-size: 12.5px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+
+.toast-text {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.toast-close {
+  padding: 0 6px;
+}
+
+/* Reviewed / Dismiss failure, shown on the anomaly row */
+.anomaly-row-error {
+  color: var(--error);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+/* ✦ marks an action that calls the AI provider */
+.line-explain-btn.ai-action {
+  color: var(--ai);
+  border-color: rgba(165, 184, 108, 0.35);
+}
