@@ -19,6 +19,7 @@ REQUIRED = (
     "webapp/ui/index.html",
     "webapp/ui/app.js",
     "webapp/ui/styles.css",
+    "webapp/ui/favicon.svg",
     "config.example.yaml",
     "botocore/data/endpoints.json",
     "webapp/api/signatures.yaml",

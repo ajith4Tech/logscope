@@ -691,6 +691,9 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json(app.status())
             return
         if parsed.path == "/api/facets":
+        if parsed.path == "/favicon.svg":
+            self._serve_asset("favicon.svg", "image/svg+xml")
+            return
             self._send_json(app.storage.query_facets(_query_params(params)))
             return
         if parsed.path == "/api/fields":

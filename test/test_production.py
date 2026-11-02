@@ -253,6 +253,8 @@ def test_security_headers_and_head_without_filesystem_fallback():
                 assert "script-src 'self';" in headers["content-security-policy"]
             status, headers, data = _raw(server, "HEAD", "/")
             assert status == 200 and data == b"" and int(headers["content-length"]) > 0
+            status, headers, data = _raw(server, "GET", "/favicon.svg")
+            assert status == 200 and headers["content-type"] == "image/svg+xml" and data.startswith(b"<svg")
             assert _raw(server, "HEAD", "/readyz")[0] == 200
             # Files under the working directory are no longer reachable via HEAD.
             assert _raw(server, "HEAD", "/webapp/api/config.py")[0] == 404

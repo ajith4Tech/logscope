@@ -24,7 +24,7 @@ logscope = "logscope.cli:main"
 packages = ["logscope", "webapp", "webapp.api"]
 
 [tool.setuptools.package-data]
-webapp = ["ui/index.html", "ui/app.js", "ui/styles.css"]
+webapp = ["ui/index.html", "ui/app.js", "ui/styles.css", "ui/favicon.svg"]
 "webapp.api" = ["signatures.yaml"]
 
 [tool.setuptools.dynamic]
