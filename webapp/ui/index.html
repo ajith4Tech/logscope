@@ -56,6 +56,8 @@
           <div id="askStatus" class="ask-status" role="status" hidden></div>
           <div id="askPreview" class="ask-preview" hidden></div>
         </div>
+        <!-- Dropdowns and toggles apply on change; Search and dates on Enter or Apply. -->
+        <form id="filtersForm" class="filters-form" autocomplete="off" novalidate>
         <label>Scope <select id="scope"></select></label>
         <label>Namespace <select id="namespace"></select></label>
         <label>Pod <input id="pod" type="text" placeholder="All — type to search" autocomplete="off" /></label>
@@ -68,9 +70,10 @@
           <label>End <input id="end" type="datetime-local" title="Entries before this time (the end is exclusive)" /></label>
         </div>
         <div class="actions">
-          <button id="apply">Apply</button>
+          <button id="apply" type="submit">Apply</button>
           <label class="toggle"><input id="live" type="checkbox" checked /> Live tail</label>
         </div>
+        </form>
         <div class="views-actions">
           <button id="saveViewBtn" type="button" class="ghost" title="Save the current filters and time range as a named view">Save view</button>
           <button id="viewsMenuBtn" type="button" class="ghost" aria-haspopup="true" aria-expanded="false" aria-controls="viewsMenu">Views <span id="viewsCount" class="views-count"></span> ▾</button>
@@ -530,7 +533,7 @@
     <form id="alertForm" method="dialog" class="confirm-modal-box alert-modal-box" novalidate autocomplete="off">
       <div class="confirm-modal-head"><h3 id="alertFormTitle">Create alert</h3></div>
       <div class="alert-form-grid">
-        <label class="view-field alert-span">Name <input id="alertName" type="text" maxlength="80" required /></label>
+        <label class="view-field alert-span">Name <input id="alertName" type="text" maxlength="80" required autocomplete="off" /></label>
         <label class="view-field alert-span">Saved view <select id="alertView"></select></label>
         <label class="view-field">Measure
           <select id="alertMetric">
@@ -576,12 +579,12 @@
       <p class="confirm-modal-text">URLs and secrets are write-only: only the last six characters of a URL are shown. Changes need the admin token.</p>
       <div id="channelsList" class="channels-list"></div>
       <div class="alert-form-grid">
-        <label class="view-field">Name <input id="channelName" type="text" maxlength="80" /></label>
+        <label class="view-field">Name <input id="channelName" type="text" maxlength="80" autocomplete="off" /></label>
         <label class="view-field">Type
           <select id="channelType"><option value="mattermost">Mattermost</option><option value="slack">Slack</option><option value="webhook">Webhook (JSON)</option></select>
         </label>
-        <label class="view-field alert-span">Webhook URL (https) <input id="channelUrl" type="password" maxlength="2000" /></label>
-        <label class="view-field alert-span">Signing secret <span class="muted">(webhook only, optional: X-Logscope-Signature)</span> <input id="channelSecret" type="password" maxlength="256" /></label>
+        <label class="view-field alert-span">Webhook URL (https) <input id="channelUrl" type="password" maxlength="2000" autocomplete="new-password" /></label>
+        <label class="view-field alert-span">Signing secret <span class="muted">(webhook only, optional: X-Logscope-Signature)</span> <input id="channelSecret" type="password" maxlength="256" autocomplete="new-password" /></label>
         <label class="view-field alert-span" id="channelTokenField" hidden>Admin token <input id="channelToken" type="password" autocomplete="off" /></label>
       </div>
       <div id="channelError" class="views-error" role="alert" hidden></div>
@@ -644,7 +647,7 @@
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <button type="button" class="anomaly-btn-dismissed ghost">✕ Dismiss</button>
         </div>
-        <button type="button" class="anomaly-expand-btn" aria-label="Expand evidence">▾</button>
+        <button type="button" class="anomaly-expand-btn" aria-label="Expand evidence" aria-expanded="false">▾</button>
       </div>
       <div class="anomaly-detail" hidden>
         <div class="anomaly-detail-inner"></div>

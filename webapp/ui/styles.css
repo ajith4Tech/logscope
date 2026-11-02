@@ -31,17 +31,20 @@
   --text: #e5e7e8;
   --text-dim: #b1b6ba;
 
-  --muted: #858b90;
-  --muted-2: #646a6f;
+  /* both stay >= 4.5:1 on every surface up to --surface-active */
+  --muted: #959ba1;
+  --muted-2: #878d93;
 
 
   /* =========================================================
      PRIMARY ACTION
      ========================================================= */
 
-  --accent: #f0b429;
-  --accent-hover: #f5c451;
-  --accent-dim: rgba(240, 180, 41, 0.10);
+  /* blue, so it never reads as the warning amber */
+  --accent: #5b9cf5;
+  --accent-hover: #7db1f8;
+  --accent-dim: rgba(91, 156, 245, 0.12);
+  --focus-ring: #7db1f8;
 
 
   /* =========================================================
@@ -57,8 +60,8 @@
   --info: #8b939a;
   --info-dim: rgba(139, 147, 154, 0.09);
 
-  --debug: #666d73;
-  --debug-dim: rgba(102, 109, 115, 0.09);
+  --debug: #8a9197;
+  --debug-dim: rgba(138, 145, 151, 0.09);
 
 
   /* =========================================================
@@ -101,13 +104,17 @@
      TYPE
      ========================================================= */
 
-  --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+  /* system stacks: no web-font download, works on offline clusters */
+  --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", "Liberation Mono", Menlo, Consolas, monospace;
 
   font-family:
-    "IBM Plex Sans",
+    system-ui,
     -apple-system,
     BlinkMacSystemFont,
     "Segoe UI",
+    Roboto,
+    "Helvetica Neue",
+    Arial,
     sans-serif;
 }
 
@@ -321,10 +328,37 @@ select {
   min-width: 0;
 }
 
-input:focus,
-select:focus {
-  outline: none;
-  border-color: var(--border-strong);
+/* Checkboxes keep their native size instead of the full-width field box. */
+input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent);
+}
+
+input::placeholder,
+textarea::placeholder {
+  color: var(--muted-2);
+  opacity: 1;
+}
+
+input:not([type="checkbox"]):focus,
+select:focus,
+textarea:focus {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
+  border-color: var(--accent);
+}
+
+/* Keyboard focus ring for everything else (buttons, tabs, rows, links). */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+input[type="checkbox"]:focus-visible {
+  outline-offset: 2px;
 }
 
 button {
@@ -390,6 +424,13 @@ button.ghost:hover {
   gap: 6px;
   color: var(--muted);
   font-size: 12px;
+  white-space: nowrap;
+}
+
+/* .filters label is a stacked grid; toggles stay a checkbox + text row. */
+.filters label.toggle {
+  display: flex;
+  gap: 8px;
 }
 
 .logs {
@@ -616,11 +657,11 @@ button.ghost:hover {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--accent), var(--warn));
+  background: var(--accent);
 }
 
 .dashboard-bar-fill-alt {
-  background: linear-gradient(90deg, var(--error), var(--accent));
+  background: var(--accent);
 }
 
 .dashboard-bar-count {
@@ -980,7 +1021,7 @@ button.ghost:hover {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--accent), var(--warn));
+  background: var(--accent);
 }
 
 .field-fill-error { background: var(--error); }

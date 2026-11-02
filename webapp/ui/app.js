@@ -32,7 +32,10 @@ const state = {
     histogram: null, // last /api/histogram response
     prevRange: null, // range before the first histogram zoom (for "Reset range")
     drag: null, // { from, to } bucket indexes while selecting
+    rangeTotal: null, // entries in the applied range (histogram sum), null until loaded
+    rangeTruncated: false, // the histogram left out its oldest buckets
   },
+  resultCounts: null, // { lines, rows } on screen, for the result summary
   dashboard: {
     data: null,
     loading: false,
@@ -213,7 +216,6 @@ function setDefaultDateRange() {
   const endParts = localDateParts(now);
   el('start').value = `${startParts.year}-${startParts.month}-${startParts.day}T00:00`;
   el('end').value = `${endParts.year}-${endParts.month}-${endParts.day}T${endParts.hour}:${endParts.minute}`;
-  el('defaultWindowChip').textContent = `Today · ${start.toLocaleDateString()}`;
   state.endIsLive = true;
   state.rangeExact = null;
 }
@@ -235,6 +237,36 @@ function currentRange() {
     start: localValueToIso(el('start').value),
     before: state.endIsLive ? '' : localValueToIso(el('end').value),
   };
+}
+
+// The header chip names the applied range and, once for the whole page, the
+// browser time zone that every displayed time is in.
+function updateRangeChip() {
+  const preset = el('rangePreset').value;
+  const { start, before } = currentRange();
+  const fmt = (iso) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
+  let label;
+  if (preset === 'today') {
+    label = `Today · ${new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date())}`;
+  } else if (RANGE_PRESETS[preset]) {
+    label = RANGE_PRESETS[preset].label;
+  } else if (!start && !before) {
+    label = 'All time';
+  } else {
+    label = start ? `${fmt(start)} – ${before ? fmt(before) : 'now'}` : `Until ${fmt(before)}`;
+  }
+  const zone = timeZoneLabel();
+  const chip = el('defaultWindowChip');
+  chip.textContent = `${label} · ${zone}`;
+  chip.title = `All times on this page are in ${zone}`;
+}
+
+function timeZoneLabel() {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local time';
+  const offset = -new Date().getTimezoneOffset();
+  const abs = Math.abs(offset);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${zone} (UTC${offset < 0 ? '−' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)})`;
 }
 
 // For an open-ended range the End field shows the current time; refresh it
@@ -354,7 +386,7 @@ function dashboardStateEls() {
 function dashboardChartRow(item, kind, maxCount) {
   const value = item.value ?? '';
   const count = Number(item.count ?? 0);
-  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
+  const width = maxCount > 0 && count > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0; // no bar for 0
   const clickable = value !== '' || kind === 'severity' || kind === 'security';
   const action = kind === 'severity' ? 'severity' : kind === 'namespace' ? 'namespace' : kind === 'search' ? 'search' : kind;
   const actionValue = kind === 'security' ? 'security' : value;
@@ -376,7 +408,7 @@ function dashboardTimelineRow(item, maxCount, severity, metricKey = 'total_logs'
   const valid = Boolean(bucketStart) && Number.isFinite(bucketStart.getTime());
   const label = valid ? formatTimestamp(item.timestamp) : '—';
   const count = Number(item[metricKey] ?? 0);
-  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
+  const width = maxCount > 0 && count > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0; // no bar for 0
   const startIso = valid ? bucketStart.toISOString() : '';
   const endIso = valid ? new Date(bucketStart.getTime() + HOUR_MS).toISOString() : '';
   const clickable = valid && count > 0;
@@ -608,7 +640,8 @@ function buildCombobox(inputId, facetKey) {
     reloadLogs();
   });
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); close(); input.blur(); }
+    // Enter applies the typed value (and keeps the form from submitting twice).
+    if (event.key === 'Enter') { event.preventDefault(); close(); reloadLogs(); }
     else if (event.key === 'Escape') { close(); }
   });
 }
@@ -957,6 +990,7 @@ function renderRows(items, append = false) {
       ? ` Latest cached logs reach ${formatTimestamp(latestCached)}.`
       : '';
     rows.innerHTML = `<div class="empty-state">No logs found for the current filters.${latestHint} <button id="loadLatestCached" class="ghost empty-action">Load latest cached day</button></div>`;
+    state.resultCounts = null;
     el('resultSummary').textContent = 'No rows match';
     return;
   }
@@ -1006,9 +1040,24 @@ function renderRows(items, append = false) {
     });
     rows.appendChild(node);
   }
-  const total = append ? state.items.length : visible.length;
-  const groupedNote = collapsed > 0 ? ` · ${collapsed} collapsed` : '';
-  el('resultSummary').textContent = `${total} visible lines${groupedNote}`;
+  const lines = append ? state.items.length : visible.length;
+  state.resultCounts = { lines, rows: lines - collapsed };
+  updateResultSummary();
+}
+
+// "Showing 7 newest lines in 1 row · 77 in range": what is on screen, how it
+// was collapsed, and the range total once the histogram for it has loaded.
+function updateResultSummary() {
+  const counts = state.resultCounts;
+  if (!counts) return;
+  const plural = (n, word) => `${formatCount(n)} ${word}${n === 1 ? '' : 's'}`;
+  let text = `Showing ${plural(counts.lines, 'newest line')}`;
+  if (counts.rows !== counts.lines) text += ` in ${plural(counts.rows, 'row')}`;
+  const panels = state.logPanels;
+  if (panels.rangeTotal !== null) {
+    text += ` · ${formatCount(panels.rangeTotal)}${panels.rangeTruncated ? '+' : ''} in range`;
+  }
+  el('resultSummary').textContent = text;
 }
 
 function renderAll() {
@@ -1336,26 +1385,36 @@ function renderAnomalies() {
     const detail = node.querySelector('.anomaly-detail');
     const expandBtn = node.querySelector('.anomaly-expand-btn');
     const anomalyId = String(anomaly.id);
-    if (state.expandedAnomalies.has(anomalyId)) {
-      detail.hidden = false;
-      expandBtn.textContent = '▴';
-      fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
-    }
-    node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
-      if (ev.target.closest('button')) return;
+    detail.id = `anomaly-detail-${anomalyId}`;
+    expandBtn.setAttribute('aria-controls', detail.id);
+    const showExpanded = (expanded) => {
+      detail.hidden = !expanded;
+      expandBtn.textContent = expanded ? '▴' : '▾';
+      expandBtn.setAttribute('aria-expanded', String(expanded));
+      expandBtn.setAttribute('aria-label', expanded ? 'Collapse evidence' : 'Expand evidence');
+      if (expanded) fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+    };
+    if (state.expandedAnomalies.has(anomalyId)) showExpanded(true);
+    // The chevron and a click on the row background (not its other buttons) toggle.
+    const toggleDetail = () => {
       if (state.expandedAnomalies.has(anomalyId)) {
         state.expandedAnomalies.delete(anomalyId);
-        detail.hidden = true;
-        expandBtn.textContent = '▾';
+        showExpanded(false);
         if (state.focusAnomalyId === anomaly.id) state.focusAnomalyId = null;
       } else {
         state.expandedAnomalies.add(anomalyId);
-        detail.hidden = false;
-        expandBtn.textContent = '▴';
-        fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+        showExpanded(true);
         state.focusAnomalyId = anomaly.id;
       }
       updateUrl('replace');
+    };
+    expandBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      toggleDetail();
+    });
+    node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
+      if (ev.target.closest('button')) return;
+      toggleDetail();
     });
 
     container.appendChild(node);
@@ -2524,6 +2583,10 @@ async function loadLogs(reset = true) {
   const requestId = ++state.logsRequestId;
   state.tailRequestId += 1; // a tail response for the previous query must not land on this one
   refreshLiveEnd();
+  if (reset) {
+    state.logPanels.rangeTotal = null; // belongs to the previous query
+    updateRangeChip();
+  }
   setLogsLoading(true);
   let data;
   try {
@@ -2533,6 +2596,7 @@ async function loadLogs(reset = true) {
   } catch (err) {
     if (requestId === state.logsRequestId) {
       setLogsLoading(false);
+      state.resultCounts = null; // so a late histogram does not overwrite this
       el('resultSummary').textContent = 'Load failed';
       showLogsError(`Could not load logs: ${err.message}. The rows below are from the previous query.`);
     }
@@ -2638,12 +2702,22 @@ function startTailPolling() {
   stopTailPolling();
   state.tailRequestId += 1;
   state.liveTimer = window.setInterval(() => {
+    if (document.hidden) return; // no polling in a background browser tab
     pollTail().catch((err) => {
       el('health').textContent = err.message;
     });
     el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
   }, 10000);
 }
+
+// Catch up at once when the tab is shown again instead of waiting up to 10s.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.liveTimer) return;
+  pollTail().catch((err) => {
+    el('health').textContent = err.message;
+  });
+  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+});
 
 function stopTailPolling() {
   if (state.liveTimer) window.clearInterval(state.liveTimer);
@@ -2684,6 +2758,7 @@ async function loadLogPanels() {
   if (panels.abort) panels.abort.abort();
   const controller = new AbortController();
   panels.abort = controller;
+  panels.rangeTotal = null; // the total below is for the filters being loaded
   refreshLiveEnd();
   const qs = new URLSearchParams(queryFromFilters()).toString();
   const [fields, histogram] = await Promise.allSettled([
@@ -2783,6 +2858,9 @@ function renderHistogram(data) {
   hideHistogramTooltip();
   const total = buckets.reduce((sum, b) => sum + (Number(b.total) || 0), 0);
   const max = buckets.reduce((m, b) => Math.max(m, Number(b.total) || 0), 0);
+  panels.rangeTotal = total;
+  panels.rangeTruncated = Boolean(data?.truncated);
+  updateResultSummary();
   el('histogramSummary').textContent = buckets.length
     ? `${formatCount(total)} entries · ${formatBucketSize(bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
     : 'No entries in this range';
@@ -4061,9 +4139,11 @@ function renderAlerts() {
   errorBox.textContent = alertsState.error;
   const list = el('alertsList');
   if (!alertsState.rules.length) {
-    list.innerHTML = `<div class="empty-state">${escapeHtml(alertsState.loaded
+    // Before the first successful load, a failure shows only the error box.
+    const message = alertsState.loaded
       ? 'No alert rules yet. Save a view, then “Create alert” here or from the Views menu (🔔).'
-      : 'Loading…')}</div>`;
+      : alertsState.error ? '' : 'Loading…';
+    list.innerHTML = message ? `<div class="empty-state">${escapeHtml(message)}</div>` : '';
     return;
   }
   const viewNames = new Map(state.views.list.map((view) => [view.id, view.name]));
@@ -5196,7 +5276,14 @@ function reloadLogs() {
   return loadLogs(true).catch((err) => showLogsError(`Could not load logs: ${err.message}`));
 }
 
-el('apply').addEventListener('click', () => reloadLogs());
+// Search and dates apply on Enter (form submit) or Apply; dropdowns at once.
+el('filtersForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  reloadLogs();
+});
+for (const id of ['scope', 'namespace', 'severity_bucket']) {
+  el(id).addEventListener('change', () => reloadLogs());
+}
 // Typing an End time makes the range end there (no longer "now"). Editing
 // either bound drops exact bounds from a link or drilldown.
 el('end').addEventListener('change', () => {
