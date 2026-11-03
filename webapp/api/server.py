@@ -704,7 +704,7 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json(app.storage.query_fields(_query_params(params)))
             return
         if parsed.path == "/api/histogram":
-            self._send_json(app.storage.query_histogram(_query_params(params)))
+            self._send_json(app.storage.query_histogram(_query_params(params), **_histogram_options(params)))
             return
         if parsed.path == "/api/dashboard":
             self._send_json(app.api_dashboard(params))
@@ -902,6 +902,25 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if self._handle_alerts("DELETE", urlparse(self.path).path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
+
+
+def _histogram_options(params: dict[str, list[str]]) -> dict[str, int]:
+    """Optional /api/histogram parameters: target_buckets (10-200 bars) and
+    tz_offset_min (the browser's UTC offset in minutes, -840..840) for
+    buckets aligned to local time."""
+    out: dict[str, int] = {}
+    for key, low, high in (("target_buckets", 10, 200), ("tz_offset_min", -840, 840)):
+        raw = _first(params, key)
+        if raw is None or raw == "":
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError(f"'{key}' must be an integer") from None
+        if not low <= value <= high:
+            raise ValueError(f"'{key}' must be between {low} and {high}")
+        out[key] = value
+    return out
 
 
 def _query_params(params: dict[str, list[str]]) -> dict[str, Any]:

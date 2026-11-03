@@ -149,6 +149,10 @@ _PROGRESS_OPS = 1000
 HISTOGRAM_BUCKET_SECS = (60, 300, 900, 3600, 21600)
 HISTOGRAM_TARGET_BUCKETS = 60
 HISTOGRAM_MAX_BUCKETS = 1000
+# Sizes for a caller-chosen bar count (target_buckets): each at most twice the
+# previous one, so the count lands between half the target and the target.
+HISTOGRAM_FINE_BUCKET_SECS = (60, 120, 180, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400,
+                              21600, 43200, 86400)
 _HISTOGRAM_SEVERITIES = ("error", "warning", "info", "debug")
 
 _RECORD_COLUMNS = (
@@ -1642,13 +1646,20 @@ class LogStorage:
         return {"fields": fields, "partial": any_partial}
 
     @_reading
-    def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None,
+                        target_buckets: int | None = None, tz_offset_min: int | None = None) -> dict[str, Any]:
         """Entry counts per time bucket (total and per severity) over the
         filtered range, every bucket present. Buckets are aligned to the
         bucket size in UTC epoch seconds (ts_epoch), so offsets and
         fractional seconds land in the right bucket. Without a start the
         range begins at the oldest matching entry; without an end it stops
-        at now."""
+        at now.
+
+        target_buckets picks the bucket size from HISTOGRAM_FINE_BUCKET_SECS
+        (at most that many buckets) instead of the default sizes, and
+        tz_offset_min (minutes east of UTC) aligns buckets to that local
+        time instead of UTC. Both are optional; without them the result is
+        unchanged."""
         end_bound = _param_epoch(params.get("before"))
         if end_bound is None and params.get("end"):
             end_bound = _param_epoch(params.get("end")) + 1
@@ -1667,11 +1678,13 @@ class LogStorage:
                 return {"bucket_secs": HISTOGRAM_BUCKET_SECS[0], "buckets": [], "truncated": False}
             start_epoch = math.floor(row[0])
         span = max(1, end_epoch - start_epoch)
-        bucket_secs = next(
-            (size for size in HISTOGRAM_BUCKET_SECS if span / size <= HISTOGRAM_TARGET_BUCKETS),
-            HISTOGRAM_BUCKET_SECS[-1],
+        sizes, target = (
+            (HISTOGRAM_FINE_BUCKET_SECS, target_buckets) if target_buckets
+            else (HISTOGRAM_BUCKET_SECS, HISTOGRAM_TARGET_BUCKETS)
         )
-        origin = start_epoch - start_epoch % bucket_secs
+        bucket_secs = next((size for size in sizes if span / size <= target), sizes[-1])
+        shift = (tz_offset_min or 0) * 60
+        origin = start_epoch - (start_epoch + shift) % bucket_secs
         count = max(1, -(-(end_epoch - origin) // bucket_secs))
         truncated = count > HISTOGRAM_MAX_BUCKETS
         if truncated:  # keep the newest buckets
@@ -1679,8 +1692,10 @@ class LogStorage:
             count = HISTOGRAM_MAX_BUCKETS
         lo, hi = max(origin, start_epoch), min(origin + count * bucket_secs, end_epoch)
         filters = {key: value for key, value in params.items() if key not in ("start", "end", "before")}
-        grouped = self._grouped_counts({**filters, "start": lo, "before": hi}, ["severity_bucket"],
-                                       bucket=(origin, bucket_secs))
+        # The rollup has whole UTC hours: usable only when buckets start on one
+        # (a half-hour time zone offset moves them off it).
+        grouped = None if origin % ROLLUP_SECS else self._grouped_counts(
+            {**filters, "start": lo, "before": hi}, ["severity_bucket"], bucket=(origin, bucket_secs))
         if grouped is not None:  # buckets of whole hours: from the rollup
             pivot: dict[int, list[int]] = {}
             for index, severity, n in grouped:

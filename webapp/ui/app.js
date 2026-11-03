@@ -455,10 +455,10 @@ function currentRange() {
 function rangeLabel() {
   const preset = el('rangePreset').value;
   const { start, before } = currentRange();
-  const fmt = (iso) => new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(iso));
+  const fmt = (iso) => formatDateTime(iso, { seconds: false });
   let label;
   if (preset === 'today') {
-    label = `Today · ${new Intl.DateTimeFormat(undefined, { dateStyle: 'medium' }).format(new Date())}`;
+    label = `Today · ${formatDateTime(new Date(), { time: false })}`;
   } else if (RANGE_PRESETS[preset]) {
     label = RANGE_PRESETS[preset].label;
   } else if (!start && !before) {
@@ -477,6 +477,7 @@ function updateRangeChip() {
   const chip = el('defaultWindowChip');
   chip.innerHTML = `<span class="range-label">${escapeHtml(rangeLabel())}</span><span class="range-zone"> · ${escapeHtml(zone)}</span>`;
   chip.title = `Applied range: ${rangeLabel()} · all times on this page are in ${zone}`;
+  el('filtersZone').textContent = `Times are in ${zone}.`;
 }
 
 function timeZoneLabel() {
@@ -499,11 +500,31 @@ function localValueToIso(value) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : '';
 }
 
-function formatTimestamp(value) {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'medium',
-  }).format(new Date(value));
+// One date/time format for the whole page, in the browser's time zone
+// (named once, in the range chip): "2 Nov 2026, 15:22:45". `seconds: false`
+// drops the seconds, `time: false` gives the date alone, `date: false` the
+// time alone.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function formatDateTime(value, { seconds = true, time = true, date = true } = {}) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return '—';
+  const pad = (n) => String(n).padStart(2, '0');
+  const day = `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+  const clock = `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ''}`;
+  if (!time) return day;
+  if (!date) return clock;
+  return `${day}, ${clock}`;
+}
+
+// A span such as a histogram bar: "2 Nov 2026, 15:00–16:00" (both ends
+// dated when it crosses midnight).
+function formatSpan(from, to) {
+  const a = new Date(from);
+  const b = new Date(to);
+  const sameDay = formatDateTime(a, { time: false }) === formatDateTime(new Date(b.getTime() - 1), { time: false });
+  return sameDay
+    ? `${formatDateTime(a, { seconds: false })}–${formatDateTime(b, { seconds: false, date: false })}`
+    : `${formatDateTime(a, { seconds: false })} – ${formatDateTime(b, { seconds: false })}`;
 }
 
 function fmtFreshness(value) {
@@ -527,14 +548,16 @@ function renderFreshness() {
   el('freshness').textContent = text;
   const box = el('liveStatus');
   box.dataset.tone = tone;
-  box.title = `${text}${value ? ` (${formatTimestamp(value)})` : ''} · Live tail ${live ? 'on' : 'off'}${tone === 'stale' ? ' · data is stale' : ''}`;
+  box.title = `${text}${value ? ` (${formatDateTime(value)})` : ''} · Live tail ${live ? 'on' : 'off'}${tone === 'stale' ? ' · data is stale' : ''}`;
 }
 
 // Top bar ingest health: a dot and a few words; the full text is in the
 // tooltip and accessible name, and the Pipeline tab has the details.
 function setHealth(tone, short, full) {
-  el('health').textContent = short;
   const pill = el('healthStatus');
+  if (pill.dataset.announced && pill.dataset.announced !== `${tone}|${short}`) announce(`Ingest health: ${short}`);
+  pill.dataset.announced = `${tone}|${short}`;
+  el('health').textContent = short;
   pill.dataset.tone = tone;
   pill.title = `${full} · open the Pipeline tab for details`;
   pill.setAttribute('aria-label', `Ingest health: ${full}. Open the Pipeline tab.`);
@@ -651,6 +674,53 @@ function dismissToast(key) {
   if (toast) toast.remove();
 }
 
+// ─── Panel states ────────────────────────────────────────────────────────────
+// One pattern for every panel: Loading (a skeleton of the content),
+// Empty (icon + one line + an optional action) and Error (message + Retry).
+// An action is { label, onClick } or { label, id } for a delegated handler.
+const PANEL_STATE_ICONS = {
+  empty: '<svg class="panel-state-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5M8.5 11h5"/></svg>',
+  error: '<svg class="panel-state-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/></svg>',
+};
+
+function panelStateNode(kind, { message = '', action = null, layout = 'rows', lines = 6 } = {}) {
+  const node = document.createElement('div');
+  if (kind === 'loading') {
+    node.className = `skeleton skeleton-${layout}`;
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-label', 'Loading');
+    node.innerHTML = Array.from({ length: lines }, () => '<span class="skeleton-block"></span>').join('');
+    return node;
+  }
+  node.className = `panel-state panel-state-${kind}`;
+  if (kind === 'error') node.setAttribute('role', 'alert');
+  node.innerHTML = `${PANEL_STATE_ICONS[kind] || ''}<p class="panel-state-text"></p>`;
+  node.querySelector('.panel-state-text').textContent = message;
+  if (action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ghost panel-state-action';
+    button.textContent = action.label;
+    if (action.id) button.id = action.id;
+    if (action.onClick) button.addEventListener('click', () => action.onClick());
+    node.appendChild(button);
+  }
+  return node;
+}
+
+function setPanelState(container, kind, options = {}) {
+  container.replaceChildren(panelStateNode(kind, options));
+  container.hidden = false;
+}
+
+// Screen-reader announcements for changes that happen without user action
+// (polite; the callers only announce real changes, never every poll).
+function announce(message) {
+  const region = el('liveAnnouncer');
+  region.textContent = '';
+  window.setTimeout(() => { region.textContent = message; }, 50);
+}
+
 function dashboardStateEls() {
   return {
     loading: el('dashboardLoading'),
@@ -721,7 +791,7 @@ const dashboardCharts = { volume: null, errors: null };
 function openDashboardBucket(chart, index, severity) {
   const bucket = chart.buckets[index];
   if (!bucket) return;
-  const end = new Date(Date.parse(bucket.t) + chart.bucketMs).toISOString();
+  const end = new Date(Math.min(Date.parse(bucket.t) + chart.bucketMs, Date.now())).toISOString();
   drillDownFromDashboard('range', bucket.t, severity, end).catch((err) => {
     showToast(`Could not open these logs: ${err.message}`, { key: 'drilldown' });
   });
@@ -737,12 +807,10 @@ function renderDashboardContent(data) {
   renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod', 'error');
 
   dashboardCharts.volume ||= createHistogramChart(el('dashboardVolumeChart'), {
-    keyboard: true,
     onSelect: (index) => openDashboardBucket(dashboardCharts.volume, index, ''),
   });
   dashboardCharts.errors ||= createHistogramChart(el('dashboardErrorChart'), {
     severities: ['error'],
-    keyboard: true,
     onSelect: (index) => openDashboardBucket(dashboardCharts.errors, index, 'error'),
   });
   const histogram = state.dashboard.histogram;
@@ -758,12 +826,24 @@ function renderDashboard() {
   const { loading, error, empty, content } = dashboardStateEls();
   const hasData = Boolean(state.dashboard.data);
   const totalLogs = Number(state.dashboard.data?.summary?.total_logs ?? 0);
-  if (loading) loading.hidden = !state.dashboard.loading;
-  if (error) {
-    error.hidden = !state.dashboard.error;
-    error.textContent = state.dashboard.error || '';
+  loading.hidden = !state.dashboard.loading;
+  if (state.dashboard.loading && !loading.firstChild) {
+    loading.replaceChildren(panelStateNode('loading', { layout: 'dashboard', lines: 9 }));
   }
-  if (empty) empty.hidden = !(hasData && !state.dashboard.loading && !state.dashboard.error && totalLogs === 0);
+  if (state.dashboard.error) {
+    setPanelState(error, 'error', { message: state.dashboard.error, action: { label: 'Retry', onClick: () => loadDashboard().catch(() => {}) } });
+  } else {
+    error.hidden = true;
+  }
+  const isEmpty = hasData && !state.dashboard.loading && !state.dashboard.error && totalLogs === 0;
+  if (isEmpty) {
+    setPanelState(empty, 'empty', {
+      message: 'No log lines match these filters in this range.',
+      action: activeFilterChips().length ? { label: 'Clear filters', onClick: () => el('clearFilters').click() } : null,
+    });
+  } else {
+    empty.hidden = true;
+  }
   if (content) content.hidden = !hasData || state.dashboard.loading || totalLogs === 0;
   if (hasData) renderDashboardContent(state.dashboard.data);
   const ctx = el('dashboardContext');
@@ -816,7 +896,7 @@ async function loadDashboard() {
     // The volume charts use the same buckets as the Logs histogram.
     const [data, histogram] = await Promise.all([
       fetchJson(`/api/dashboard?${params.toString()}`),
-      fetchJson(`/api/histogram?${params.toString()}`),
+      fetchJson(`/api/histogram?${histogramQuery()}`),
     ]);
     if (requestId !== state.dashboard.requestId) return;
     state.dashboard.histogram = histogram;
@@ -1014,15 +1094,19 @@ function buildGroups(items) {
 function rowMarkup(item) {
   const tpl = el('rowTemplate');
   const node = tpl.content.firstElementChild.cloneNode(true);
-  node.querySelector('.time').textContent = formatTimestamp(item.timestamp);
-  node.title = item.timestamp;
+  node.querySelector('.time').textContent = formatDateTime(item.timestamp);
   const sev = node.querySelector('.severity');
   sev.classList.add(item.severity_bucket);
+  node.classList.add(`row-sev-${item.severity_bucket}`);
   const badge = node.querySelector('.badge');
   badge.textContent = item.severity_bucket;
   badge.dataset.scope = item.scope;
-  node.querySelector('.scope').textContent = item.scope;
-  node.querySelector('.source').textContent = `${item.namespace} · ${item.pod}/${item.container}`;
+  const scope = node.querySelector('.scope');
+  scope.textContent = item.scope;
+  scope.title = item.scope;
+  const source = node.querySelector('.source');
+  source.textContent = `${item.namespace} · ${item.pod}/${item.container}`;
+  source.title = source.textContent;
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
   messageButton.title = 'Show the full message and details';
@@ -1092,13 +1176,13 @@ function explainMetaNode(meta, rerun) {
     return b;
   };
   if (meta.source === 'signature') {
-    button('Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
+    button('✦ Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
       () => rerun({ skip_signature: true }));
   } else {
-    button('Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
+    button('✦ Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
   }
   if (meta.tier !== 'deep') {
-    button('Deep analysis', 'Ask the deep model (separate cache and daily budget)',
+    button('✦ Deep analysis', 'Ask the deep model (separate cache and daily budget)',
       () => rerun({ tier: 'deep', skip_signature: true }));
   }
   if (meta.cache_key && meta.source !== 'signature') {
@@ -1198,8 +1282,8 @@ function lineExplainMarkup(rowId, item) {
       const tBtn = document.createElement('button');
       tBtn.type = 'button';
       tBtn.className = 'ghost line-explain-btn';
-      tBtn.style.marginTop = '6px';
-      tBtn.textContent = '⚡ Troubleshoot in Actionable';
+      tBtn.style.marginTop = 'var(--sp-2)';
+      tBtn.textContent = 'Investigate';
       tBtn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         setPlanFromExplainResult(lineState.rawResult, 'line', null, item);
@@ -1268,8 +1352,8 @@ function detailMarkup(item, rowId, { inContext = false } = {}) {
   const investigateBtn = document.createElement('button');
   investigateBtn.type = 'button';
   investigateBtn.className = 'ghost row-detail-btn';
-  investigateBtn.textContent = 'Investigate in Actionable';
-  investigateBtn.title = 'Open the troubleshooting workspace for this pod (logs, describe, events)';
+  investigateBtn.textContent = 'Investigate';
+  investigateBtn.title = 'Open this pod in the Investigate tab (logs, describe, events)';
   investigateBtn.addEventListener('click', (ev) => {
     ev.stopPropagation();
     openLineInActionable(item);
@@ -1301,8 +1385,8 @@ function timestampsMarkup(group) {
     const line = document.createElement('button');
     line.type = 'button';
     line.className = 'timestamp-line';
-    line.textContent = formatTimestamp(item.timestamp);
-    line.title = `${item.timestamp} · show the lines around this one`;
+    line.textContent = formatDateTime(item.timestamp);
+    line.title = 'Show the lines around this one';
     line.addEventListener('click', (ev) => {
       ev.stopPropagation();
       openContext(Number(item.id));
@@ -1338,9 +1422,12 @@ function renderRows(items) {
   if (!items.length) {
     const latestCached = state.lastStatus?.latest_record_timestamp;
     const latestHint = latestCached
-      ? ` Latest cached logs reach ${formatTimestamp(latestCached)}.`
+      ? ` Newest cached line: ${formatDateTime(latestCached)}.`
       : '';
-    rows.innerHTML = `<div class="empty-state">No logs found for the current filters.${latestHint} <button id="loadLatestCached" class="ghost empty-action">Load latest cached day</button></div>`;
+    rows.replaceChildren(panelStateNode('empty', {
+      message: `No log lines match these filters.${latestHint}`,
+      action: { label: 'Load latest cached day', id: 'loadLatestCached' },
+    }));
     state.resultCounts = null;
     el('resultSummary').textContent = 'No rows match';
     return;
@@ -1487,8 +1574,8 @@ function contextBoundText(side, bounds, anchor) {
   if (!value) return '';
   if (fromRange) {
     return side === 'before'
-      ? `the active time range starts at ${formatTimestamp(value)}`
-      : `the active time range ends at ${formatTimestamp(value)}`;
+      ? `the active time range starts at ${formatDateTime(value)}`
+      : `the active time range ends at ${formatDateTime(value)}`;
   }
   if (bounds.window_secs) {
     const hours = Math.round(bounds.window_secs / 3600);
@@ -1697,9 +1784,18 @@ function renderAnomalies() {
   container.innerHTML = '';
   const { anomalies } = state;
   const emptyEl = el('insightsEmpty');
-  emptyEl.textContent = 'No anomalies found for the selected filter.';
   emptyEl.hidden = anomalies.length > 0;
-  if (!anomalies.length) return;
+  if (!anomalies.length) {
+    const filtered = el('insightsStatusFilter').value !== '';
+    setPanelState(emptyEl, 'empty', {
+      message: filtered ? 'No anomalies with this status.' : 'No anomalies detected yet.',
+      action: filtered ? { label: 'Show all statuses', onClick: () => {
+        el('insightsStatusFilter').value = '';
+        loadInsights().catch(() => {});
+      } } : null,
+    });
+    return;
+  }
 
   for (const anomaly of anomalies) {
     const tpl = el('anomalyRowTemplate');
@@ -1735,9 +1831,12 @@ function renderAnomalies() {
     }
 
     const sev = node.querySelector('.anomaly-sev');
+    const sevInline = node.querySelector('.anomaly-sev-inline'); // phones: in the title line
     if (anomaly.severity) {
       sev.classList.add(anomaly.severity);
       sev.querySelector('.badge').textContent = anomaly.severity;
+      sevInline.classList.add('has-sev', anomaly.severity);
+      sevInline.textContent = anomaly.severity;
     } else {
       sev.classList.add('is-empty');
     }
@@ -1746,14 +1845,26 @@ function renderAnomalies() {
     const current = counts.current ?? anomaly.evidence?.current_count;
     const countEl = node.querySelector('.anomaly-count');
     countEl.textContent = current === null || current === undefined ? '' : `${formatCount(current)} lines`;
-    if (counts.ratio) countEl.textContent += ` · ${counts.ratio}×`;
+    if (counts.ratio) {
+      const ratio = document.createElement('span');
+      ratio.className = 'anomaly-ratio'; // hidden on phones
+      ratio.textContent = ` · ${counts.ratio}×`;
+      countEl.appendChild(ratio);
+    }
     countEl.title = templateSummary.headline || '';
     const seenAt = anomaly.updated_at || anomaly.detected_at;
     const timeEl = node.querySelector('.anomaly-time');
     const statusNote = anomaly.status && anomaly.status !== 'new' ? ` · ${STATUS_LABELS[anomaly.status] || anomaly.status}` : '';
-    timeEl.textContent = seenAt ? `seen ${formatAge((Date.now() - Date.parse(seenAt)) / 1000)}${statusNote}` : statusNote.slice(3);
-    timeEl.title = [anomaly.detected_at && `Detected ${formatTimestamp(anomaly.detected_at)}`,
-      anomaly.updated_at && `last updated ${formatTimestamp(anomaly.updated_at)}`].filter(Boolean).join(' · ');
+    if (seenAt) {
+      const word = document.createElement('span');
+      word.className = 'anomaly-seen-word'; // hidden on phones
+      word.textContent = 'seen ';
+      timeEl.replaceChildren(word, `${formatAge((Date.now() - Date.parse(seenAt)) / 1000)}${statusNote}`);
+    } else {
+      timeEl.textContent = statusNote.slice(3);
+    }
+    timeEl.title = [anomaly.detected_at && `Detected ${formatDateTime(anomaly.detected_at)}`,
+      anomaly.updated_at && `last updated ${formatDateTime(anomaly.updated_at)}`].filter(Boolean).join(' · ');
 
     const btnSummarize = node.querySelector('.anomaly-btn-summarize');
     const btnDeep = node.querySelector('.anomaly-btn-deep');
@@ -1882,7 +1993,7 @@ function fillAnomalyDetail(container, anomaly) {
     btn.type = 'button';
     btn.className = 'ghost row-detail-btn';
     btn.textContent = 'View logs for this window';
-    btn.title = `${windowRange.start} – ${windowRange.before} UTC (end exclusive)`;
+    btn.title = `${formatSpan(windowRange.start, windowRange.before)} (end exclusive)`;
     btn.addEventListener('click', (ev) => {
       ev.stopPropagation();
       openAnomalyLogs(anomaly);
@@ -1947,11 +2058,8 @@ async function patchAnomalyStatus(id, status, rowNode) {
 }
 
 function showInsightsError(message) {
-  const emptyEl = el('insightsEmpty');
-  const container = el('anomalyRows');
-  container.innerHTML = '';
-  emptyEl.textContent = message;
-  emptyEl.hidden = false;
+  el('anomalyRows').innerHTML = '';
+  setPanelState(el('insightsEmpty'), 'error', { message, action: { label: 'Retry', onClick: () => loadInsights().catch(() => {}) } });
 }
 
 // Returns the in-flight load when one is running, so callers can await it.
@@ -1965,6 +2073,10 @@ async function fetchInsights() {
   const requestId = ++state.insightsRequestId;
   state.insightsLoading = true;
   state.insightsLoaded = false;
+  if (!state.anomalies.length) {
+    el('insightsEmpty').hidden = true;
+    el('anomalyRows').replaceChildren(panelStateNode('loading', { layout: 'list', lines: 6 }));
+  }
   const statusValue = el('insightsStatusFilter').value;
   const params = new URLSearchParams();
   if (statusValue) params.set('status', statusValue);
@@ -2124,7 +2236,7 @@ el('explainDismiss').addEventListener('click', () => {
   el('explainMeta').replaceChildren();
 });
 
-// ─── Actionable Troubleshooting Workspace ────────────────────────────────────
+// ─── Investigate (the "actionable" tab; ids and URLs keep that name) ─────────
 
 // Names as the server's validator accepts them; anything else (e.g. "-" for
 // a missing pod) is left out instead of producing a doomed command.
@@ -2254,7 +2366,7 @@ function openLineInActionable(item, { history = 'push' } = {}) {
   state.focusAnomalyId = null;
   const where = `${item.namespace} · ${item.pod}/${item.container}`;
   resetInvestigation({
-    summary: `Log entry from ${where} at ${formatTimestamp(item.timestamp)} (${item.severity_bucket}). `
+    summary: `Log entry from ${where} at ${formatDateTime(item.timestamp)} (${item.severity_bucket}). `
       + 'Use the evidence checks below, or "Explain this line" in Logs for AI-suggested steps.',
     steps: [],
     suggested_action: '',
@@ -2478,7 +2590,7 @@ function stepOutputMarkup(step, stepState) {
   outMeta.className = 'step-output-meta';
   if (stepState.ran_at) {
     const at = document.createElement('span');
-    at.textContent = new Date(stepState.ran_at).toLocaleTimeString();
+    at.textContent = formatDateTime(stepState.ran_at, { date: false });
     outMeta.appendChild(at);
   }
   if (stepState.duration_ms !== undefined) {
@@ -2560,7 +2672,7 @@ function renderEvidenceLog(plan) {
     });
     const time = document.createElement('span');
     time.className = 'evidence-log-time';
-    time.textContent = new Date(st.ran_at).toLocaleTimeString();
+    time.textContent = formatDateTime(st.ran_at, { date: false });
     const origin = document.createElement('span');
     origin.className = 'evidence-log-origin';
     origin.textContent = String(key).startsWith('check:') ? 'Check' : `Step ${Number(String(key).split(':')[1]) + 1}`;
@@ -2587,14 +2699,14 @@ function renderActionableWorkspace() {
   if (!plan || !plan.summary) {
     emptyEl.hidden = false;
     wsEl.hidden = true;
-    el('actionableRefreshLabel').textContent = 'Generate Plan';
-    descEl.textContent = 'Ready to investigate';
+    el('actionableRefreshLabel').textContent = 'Generate plan';
+    descEl.textContent = 'Nothing under investigation yet';
     return;
   }
 
   emptyEl.hidden = true;
   wsEl.hidden = false;
-  el('actionableRefreshLabel').textContent = 'Refresh Plan';
+  el('actionableRefreshLabel').textContent = 'Refresh plan';
   const steps = plan.steps || [];
 
   // Context description and the investigation's origin
@@ -2929,15 +3041,21 @@ async function loadOlderLogsPage() {
   }
 }
 
+// A failed load replaces the list with the error and a Retry.
 function showLogsError(message) {
-  const box = el('logsError');
-  box.textContent = message || '';
-  box.hidden = !message;
+  if (!message) return;
+  state.items = [];
+  state.resultCounts = null;
+  el('resultSummary').textContent = 'Load failed';
+  setPanelState(el('rows'), 'error', { message, action: { label: 'Retry', onClick: () => reloadLogs() } });
+  renderPager();
 }
 
 function setLogsLoading(loading) {
   el('rows').setAttribute('aria-busy', loading ? 'true' : 'false');
-  if (loading) el('resultSummary').textContent = 'Loading…';
+  if (!loading) return;
+  el('resultSummary').textContent = '';
+  el('rows').replaceChildren(panelStateNode('loading', { layout: 'rows', lines: 10 }));
 }
 
 // Loads the first page of the applied filters. Never rejects: a failed load
@@ -2958,16 +3076,12 @@ async function loadLogs() {
   } catch (err) {
     if (requestId === state.logsRequestId) {
       setLogsLoading(false);
-      state.resultCounts = null; // so a late histogram does not overwrite this
-      el('resultSummary').textContent = 'Load failed';
-      const previous = state.items.length ? ' The rows below are from the previous query.' : '';
-      showLogsError(`Could not load logs: ${err.message}.${previous}`);
+      showLogsError(`Could not load logs: ${err.message}.`);
     }
     return false;
   }
   if (requestId !== state.logsRequestId) return false;
   setLogsLoading(false);
-  showLogsError('');
   state.nextCursor = data.next_cursor || null;
   state.hasMore = Boolean(data.has_more);
   state.lastUpdatedAt = data.last_updated_at;
@@ -3021,6 +3135,8 @@ function clearPendingTail() {
 
 function showPendingBanner() {
   const count = state.pendingTail.length;
+  // Announced once when rows start waiting, not on every poll after that.
+  if (!el('newRowsBanner').classList.contains('show')) announce('New log lines are waiting above the list.');
   el('newRowsCount').textContent = `${formatCount(count)}${state.pendingTruncated ? '+' : ''}`;
   el('newRowsBanner').classList.add('show');
 }
@@ -3133,7 +3249,7 @@ async function loadLogPanels() {
   const qs = new URLSearchParams(queryFromFilters()).toString();
   const [fields, histogram] = await Promise.allSettled([
     fetchJson(`/api/fields?${qs}`, { signal: controller.signal }),
-    fetchJson(`/api/histogram?${qs}`, { signal: controller.signal }),
+    fetchJson(`/api/histogram?${histogramQuery()}`, { signal: controller.signal }),
   ]);
   if (controller.signal.aborted) return; // superseded by a newer refresh
   panels.abort = null;
@@ -3180,16 +3296,23 @@ function renderFieldSidebar(data) {
           <span class="field-value-track"><span class="field-value-fill${sevClass}" style="width:${width}%"></span></span>
         </button>`;
     }).join('');
-    const empty = !rows && !info.partial ? '<div class="field-empty">No values</div>' : '';
+    // A field without values (and nothing excluded) is left out.
+    if (!rows && !chips && !info.partial) return '';
     const partial = info.partial ? '<div class="field-empty">Took too long; narrow the filters to see values.</div>' : '';
     return `
       <section class="field-group">
         <div class="field-group-head"><span class="field-name">${escapeHtml(label)}</span><span class="field-meta">${escapeHtml(meta)}</span></div>
         ${chips ? `<div class="field-chips">${chips}</div>` : ''}
-        ${rows}${empty}${partial}
+        ${rows ? `<div class="field-values" role="group" aria-label="${escapeHtml(label)} values · arrow keys move">${rows}</div>` : ''}${partial}
       </section>`;
   }).join('');
-  el('fieldList').innerHTML = html;
+  el('fieldList').innerHTML = html || '<div class="field-empty">No field values for these filters.</div>';
+  // Each value list is one Tab stop (its selected value, else the first).
+  for (const list of el('fieldList').querySelectorAll('.field-values')) {
+    const buttons = Array.from(list.querySelectorAll('.field-value'));
+    const current = buttons.find((button) => button.classList.contains('active')) || buttons[0];
+    for (const button of buttons) button.tabIndex = button === current ? 0 : -1;
+  }
   updateExcludedCount();
 }
 
@@ -3220,12 +3343,25 @@ function applyFieldValue(field, value, exclude) {
 }
 
 // ─── Histogram chart ─────────────────────────────────────────────────────────
+
+// Histogram query for the applied filters: about 40-60 bars for the range,
+// aligned to the browser's local time (whole local hours and days).
+const HISTOGRAM_TARGET_BARS = 60;
+function histogramQuery() {
+  return new URLSearchParams(queryFromFilters({
+    target_buckets: String(HISTOGRAM_TARGET_BARS),
+    tz_offset_min: String(-new Date().getTimezoneOffset()),
+  })).toString();
+}
+
 // Vertical bars of /api/histogram buckets stacked by severity, with a
-// local-time axis and a hover tooltip. The Logs histogram selects a range by
-// dragging (a click zooms to one bar); the Dashboard volume charts open a
-// bar's logs on click, or with the arrow keys and Enter (keyboard: true).
+// local-time axis (never past now) and a hover tooltip. The Logs histogram
+// selects a range by dragging (a click zooms to one bar); the Dashboard
+// volume charts open a bar's logs on click. Keyboard: the bars are one Tab
+// stop; arrow keys, Home and End move between them (each is labelled with
+// its time span and count) and Enter opens the focused bar.
 // `severities` limits the stack (the error chart shows errors only).
-function createHistogramChart(root, { severities = null, drag = false, keyboard = false, onSelect }) {
+function createHistogramChart(root, { severities = null, drag = false, onSelect }) {
   const bars = root.querySelector('.histogram-bars');
   const tip = root.querySelector('.histogram-tooltip');
   const shown = severities || HISTOGRAM_SEVERITIES;
@@ -3234,6 +3370,8 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
     : Number(b.total) || 0);
   const chart = { buckets: [], bucketMs: 60000, drag: null, active: -1 };
 
+  const noun = severities ? `${severities.join(' + ')} lines` : 'entries';
+  const bucketEnd = (bucket) => Math.min(Date.parse(bucket.t) + chart.bucketMs, Date.now());
   const hideTip = () => { tip.hidden = true; };
   const mark = (lo, hi) => {
     for (const col of bars.children) {
@@ -3251,14 +3389,13 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
   const showTip = (index, clientX = null) => {
     const bucket = chart.buckets[index];
     if (!bucket) return;
-    const end = new Date(Date.parse(bucket.t) + chart.bucketMs).toISOString();
     const lines = severities ? '' : shown
       .filter((sev) => Number(bucket[sev]) > 0)
       .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
       .join('');
     tip.innerHTML = `
-      <div class="hist-tip-time">${escapeHtml(formatTimestamp(bucket.t))} – ${escapeHtml(formatTimestamp(end))}</div>
-      <div class="hist-tip-row"><b>${formatCount(countOf(bucket))}</b> ${severities ? `${escapeHtml(severities.join(' + '))} lines` : 'entries'}</div>${lines}`;
+      <div class="hist-tip-time">${escapeHtml(formatSpan(bucket.t, bucketEnd(bucket)))}</div>
+      <div class="hist-tip-row"><b>${formatCount(countOf(bucket))}</b> ${escapeHtml(noun)}</div>${lines}`;
     tip.hidden = false;
     const box = root.getBoundingClientRect();
     const col = bars.children[index];
@@ -3271,8 +3408,9 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
     chart.buckets = buckets;
     chart.bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
     chart.drag = null;
-    chart.active = -1;
     hideTip();
+    // One Tab stop: the newest bar, or the one the reader moved to.
+    chart.active = buckets.length ? Math.min(chart.active === -1 ? buckets.length - 1 : chart.active, buckets.length - 1) : -1;
     const max = buckets.reduce((m, b) => Math.max(m, countOf(b)), 0);
     bars.innerHTML = buckets.map((b, index) => {
       const count = countOf(b);
@@ -3283,11 +3421,12 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
         .filter(([, n]) => n > 0)
         .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
         .join('');
-      return `<div class="hist-col" data-i="${index}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
+      const label = `${formatSpan(b.t, bucketEnd(b))}, ${formatCount(count)} ${noun}`;
+      return `<div class="hist-col" data-i="${index}" role="button" tabindex="${index === chart.active ? 0 : -1}" aria-label="${escapeHtml(label)}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
     }).join('');
-    root.querySelector('.histogram-from').textContent = buckets.length ? formatTimestamp(buckets[0].t) : '';
+    root.querySelector('.histogram-from').textContent = buckets.length ? formatDateTime(buckets[0].t) : '';
     root.querySelector('.histogram-to').textContent = buckets.length
-      ? formatTimestamp(new Date(Date.parse(buckets[buckets.length - 1].t) + chart.bucketMs).toISOString())
+      ? formatDateTime(new Date(bucketEnd(buckets[buckets.length - 1])))
       : '';
     return buckets.reduce((sum, b) => sum + countOf(b), 0);
   };
@@ -3322,7 +3461,7 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
     mark(-1, -1);
   });
   bars.addEventListener('pointerleave', () => {
-    if (!chart.drag && chart.active === -1) hideTip();
+    if (!chart.drag && !bars.contains(document.activeElement)) hideTip();
   });
   if (!drag) {
     bars.addEventListener('click', (event) => {
@@ -3330,33 +3469,43 @@ function createHistogramChart(root, { severities = null, drag = false, keyboard 
       if (index !== null && countOf(chart.buckets[index]) > 0) onSelect(index, index);
     });
   }
-  if (keyboard) {
-    root.tabIndex = 0;
-    root.addEventListener('keydown', (event) => {
-      const n = chart.buckets.length;
-      if (!n) return;
-      let next = null;
-      if (event.key === 'ArrowRight') next = chart.active === -1 ? 0 : Math.min(n - 1, chart.active + 1);
-      else if (event.key === 'ArrowLeft') next = chart.active === -1 ? n - 1 : Math.max(0, chart.active - 1);
-      else if (event.key === 'Home') next = 0;
-      else if (event.key === 'End') next = n - 1;
-      else if (event.key === 'Enter' && chart.active !== -1) {
-        event.preventDefault();
-        onSelect(chart.active, chart.active);
-        return;
-      }
-      if (next === null) return;
+  const focusBar = (index) => {
+    const col = bars.children[index];
+    if (!col) return;
+    if (bars.children[chart.active]) bars.children[chart.active].tabIndex = -1;
+    chart.active = index;
+    col.tabIndex = 0;
+    col.focus();
+  };
+  bars.addEventListener('keydown', (event) => {
+    const n = chart.buckets.length;
+    const index = Number(event.target.dataset?.i);
+    if (!n || !Number.isInteger(index)) return;
+    let next = null;
+    if (event.key === 'ArrowRight') next = Math.min(n - 1, index + 1);
+    else if (event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = n - 1;
+    else if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      chart.active = next;
-      mark(next, next);
-      showTip(next);
-    });
-    root.addEventListener('blur', () => {
-      chart.active = -1;
-      mark(-1, -1);
-      hideTip();
-    });
-  }
+      if (drag || countOf(chart.buckets[index]) > 0) onSelect(index, index);
+      return;
+    }
+    if (next === null) return;
+    event.preventDefault();
+    focusBar(next);
+  });
+  bars.addEventListener('focusin', (event) => {
+    const index = Number(event.target.dataset?.i);
+    if (!Number.isInteger(index)) return;
+    mark(index, index);
+    showTip(index);
+  });
+  bars.addEventListener('focusout', () => {
+    if (chart.drag) return;
+    mark(-1, -1);
+    hideTip();
+  });
   return chart;
 }
 
@@ -3568,7 +3717,7 @@ function renderIngestCard(status) {
   const lagTone = eventAge === null ? 'unknown'
     : eventAge > (ingest.stale_after_secs || 300) * 2 ? 'warn' : '';
   kvRow(body, 'Newest cached event', status.latest_record_timestamp
-    ? `${describeAge(status.latest_record_timestamp)} (${formatTimestamp(status.latest_record_timestamp)})` : 'no records', lagTone);
+    ? `${describeAge(status.latest_record_timestamp)} (${formatDateTime(status.latest_record_timestamp)})` : 'no records', lagTone);
   kvRow(body, 'Newest S3 object ingested', status.last_object_last_modified
     ? describeAge(status.last_object_last_modified) : 'unknown');
   kvRow(body, 'Cached', status.total_records !== undefined
@@ -3589,7 +3738,7 @@ function renderIngestCard(status) {
   }
   if (byPrefix.length) {
     kvTable(card, 'Failing objects by prefix', ['Prefix', 'Objects', 'Max attempts', 'Next retry'],
-      byPrefix.map((p) => [p.prefix, p.count, p.max_attempts, p.next_attempt_at ? formatTimestamp(p.next_attempt_at) : '—']));
+      byPrefix.map((p) => [p.prefix, p.count, p.max_attempts, p.next_attempt_at ? formatDateTime(p.next_attempt_at) : '—']));
   }
   if (status.last_error) kvBlock(card, 'Last poll error', status.last_error, tone === 'ok' ? 'warn' : tone);
   return { card, tone };
@@ -3678,9 +3827,17 @@ function renderStorageCard(status) {
   return { card, tone };
 }
 
+// Alert channels (from /api/alerts/channels) and the anomaly notices sent to
+// Mattermost, in one card.
 function renderNotificationsCard(status) {
   const n = status.notifications;
-  if (!n) return null;
+  const channels = state.pipeline.channels;
+  if (!n && !channels) return null;
+  if (!n) {
+    const { card, body } = pipelineCard('Notification channels', 'ok', channelsSummary(channels).short);
+    kvRow(body, 'Alert channels', channelsSummary(channels).long);
+    return { card, tone: 'ok' };
+  }
   let tone = 'ok';
   let label = 'Delivering';
   if (n.status_error) { tone = 'unknown'; label = 'Unknown'; }
@@ -3689,11 +3846,13 @@ function renderNotificationsCard(status) {
   else if (!n.running) { tone = 'error'; label = 'Not running'; }
   else if (n.last_problem?.status === 'failed') { tone = 'warn'; label = 'Some failed'; }
   else if (n.last_problem) { tone = 'warn'; label = 'Retrying'; }
-  const { card, body } = pipelineCard('Mattermost notifications', tone, label);
+  const { card, body } = pipelineCard('Notification channels', tone, `${channelsSummary(channels).short} · notices ${label.toLowerCase()}`);
+  kvRow(body, 'Alert channels', channelsSummary(channels).long);
   if (!n.enabled) {
-    kvRow(body, 'Status', 'Disabled in configuration (webapp.mattermost.enabled)');
+    kvRow(body, 'Anomaly notices', 'Off in configuration (webapp.mattermost.enabled)');
     return { card, tone: 'ok' }; // off by choice is not a fault
   }
+  kvRow(body, 'Anomaly notices', `Mattermost · ${label}`, tone === 'ok' ? '' : tone);
   if (!n.configured) {
     kvRow(body, 'Status', 'Enabled, but the webhook URL environment variable is empty or not an http(s) URL; nothing is sent', 'error');
   }
@@ -3750,12 +3909,15 @@ function renderPipeline() {
       : 'Not checked yet';
 
   if (!status) {
-    content.innerHTML = '';
-    banner.hidden = false;
-    banner.className = `pipeline-banner tone-${state.pipeline.error ? 'error' : 'unknown'}`;
-    banner.textContent = state.pipeline.error
-      ? `Status unavailable: ${state.pipeline.error}`
-      : 'Loading pipeline status…';
+    banner.hidden = true;
+    if (state.pipeline.error) {
+      setPanelState(content, 'error', {
+        message: `Status unavailable: ${state.pipeline.error}`,
+        action: { label: 'Retry', onClick: () => refreshStatus().catch(() => {}) },
+      });
+    } else {
+      content.replaceChildren(panelStateNode('loading', { layout: 'cards', lines: 4 }));
+    }
     return;
   }
 
@@ -3780,6 +3942,34 @@ function renderPipeline() {
   banner.hidden = false;
   banner.className = `pipeline-banner tone-${tone}`;
   banner.textContent = problems.length ? `${summary} Note: ${problems.join('; ')}.` : summary;
+  if (state.pipeline.error) {
+    // The last data stays on screen; the failed refresh can be retried.
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'ghost panel-state-action pipeline-retry';
+    retry.textContent = 'Retry';
+    retry.addEventListener('click', () => refreshStatus().catch(() => {}));
+    banner.append(' ', retry);
+  }
+}
+
+// "2 channels (Mattermost, Slack)" for the Notification channels card.
+function channelsSummary(channels) {
+  if (!Array.isArray(channels)) return { short: 'channels unknown', long: 'Could not load the alert channels' };
+  if (!channels.length) return { short: 'no channels', long: 'None yet: add one under Alerts → Channels' };
+  const types = [...new Set(channels.map((c) => String(c.type || 'webhook')))].join(', ');
+  const word = channels.length === 1 ? 'channel' : 'channels';
+  return { short: `${channels.length} ${word}`, long: `${channels.length} ${word} (${types})` };
+}
+
+async function loadPipelineChannels() {
+  try {
+    const data = await fetchJson('/api/alerts/channels');
+    state.pipeline.channels = Array.isArray(data.channels) ? data.channels : [];
+  } catch (_) {
+    state.pipeline.channels = null;
+  }
+  if (state.activeTab === 'pipeline') renderPipeline();
 }
 
 async function refreshStatus() {
@@ -3810,6 +4000,7 @@ async function refreshStatus() {
 
 function startPipelinePolling() {
   stopPipelinePolling();
+  loadPipelineChannels();
   const fresh = state.pipeline.fetchedAt && Date.now() - state.pipeline.fetchedAt < 10000;
   if (fresh) renderPipeline();
   else refreshStatus().catch(() => {});
@@ -4130,6 +4321,7 @@ async function loadViews() {
 }
 
 function renderViews() {
+  updateCreateAlertButton();
   el('viewsCount').textContent = state.views.loaded ? `(${state.views.list.length})` : '';
   renderViewBar();
   renderViewsMenu();
@@ -4579,12 +4771,13 @@ function alertWatermarkText(mark) {
   if (!mark) return 'Rules on saved views, evaluated up to the ingest watermark.';
   if (!mark.at) return 'Waiting for the first complete S3 poll: rules report unknown until then.';
   const lag = Number(mark.lag_secs);
-  const text = `Data complete up to ${formatTimestamp(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
+  const text = `Data complete up to ${formatDateTime(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
   return mark.stale ? `${text} The pipeline is stale: absence rules (<, <=) report unknown.` : text;
 }
 
 function renderAlerts() {
   el('alertsSubtitle').textContent = alertWatermarkText(alertsState.watermark);
+  updateCreateAlertButton();
   const errorBox = el('alertsError');
   errorBox.hidden = !alertsState.error;
   errorBox.textContent = alertsState.error;
@@ -4592,7 +4785,9 @@ function renderAlerts() {
   if (!alertsState.rules.length) {
     // Before the first successful load, a failure shows only the error box.
     const message = alertsState.loaded
-      ? 'No alert rules yet. Save a view, then “Create alert” here or from the Views menu (🔔).'
+      ? (state.views.list.length
+        ? 'No alert rules yet. Use “Create alert”, or the 🔔 in the Views menu.'
+        : 'No alert rules yet. Alerts watch a saved view: save one in Logs first.')
       : alertsState.error ? '' : 'Loading…';
     list.innerHTML = message ? `<div class="empty-state">${escapeHtml(message)}</div>` : '';
     return;
@@ -4603,7 +4798,7 @@ function renderAlerts() {
     const status = rule.status || {};
     const lastValue = status.last_value === null || status.last_value === undefined ? '—' : String(status.last_value);
     const viewName = rule.view_id === null ? '(no view)' : viewNames.get(rule.view_id) || `view #${Number(rule.view_id)}`;
-    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatTimestamp(rule.mute_until)}` : '';
+    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatDateTime(rule.mute_until)}` : '';
     const notes = [];
     if (rule.disabled_reason) notes.push(rule.disabled_reason);
     if (status.unknown_reason) notes.push(`Unknown: ${status.unknown_reason}`);
@@ -4644,7 +4839,7 @@ function alertHistoryMarkup(history) {
   if (history.error) return `<div class="views-error">${escapeHtml(history.error)}</div>`;
   if (!history.items.length) return '<div class="subtle">No state changes recorded yet (kept 30 days).</div>';
   const rows = history.items.map((e) => `<tr>
-      <td>${escapeHtml(formatTimestamp(e.ts))}</td>
+      <td>${escapeHtml(formatDateTime(e.ts))}</td>
       <td>${escapeHtml(e.group_key || '—')}</td>
       <td>${escapeHtml(e.from_state || '—')} → <b>${escapeHtml(e.state)}</b>${e.muted ? ' (muted)' : ''}</td>
       <td>${escapeHtml(e.value === null || e.value === undefined ? '—' : String(e.value))}</td>
@@ -4666,7 +4861,7 @@ function alertDeliveryMarkup(e) {
   const attempts = Number(e.attempts || 0);
   if (attempts > 1 || (attempts && e.notified !== 'sent')) parts.push(`<span class="subtle">${attempts} attempt${attempts === 1 ? '' : 's'}</span>`);
   if ((e.notified === 'retrying' || e.notified === 'queued') && e.next_attempt_at) {
-    parts.push(`<span class="subtle">next ${escapeHtml(formatTimestamp(e.next_attempt_at))}</span>`);
+    parts.push(`<span class="subtle">next ${escapeHtml(formatDateTime(e.next_attempt_at))}</span>`);
   }
   if (e.error) parts.push(`<span class="alert-error-text">${escapeHtml(e.error)}</span>`);
   if (e.retryable) parts.push(`<button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`);
@@ -4823,7 +5018,7 @@ async function runAlertBacktest() {
     if (requestId !== alertsState.backtestId) return;
     const fired = Number(result.fired || 0);
     const series = (result.series || []).map((point) => Number(point.value));
-    const last = (result.fires || []).slice(-3).map((f) => formatTimestamp(f.at)).join(', ');
+    const last = (result.fires || []).slice(-3).map((f) => formatDateTime(f.at)).join(', ');
     box.innerHTML = `<div><b>Would have fired ${escapeHtml(String(fired))} time${fired === 1 ? '' : 's'} in 7 days</b>${body.group_by !== 'none' ? ' (all groups together)' : ''}${result.approximate ? ' · approximate' : ''}</div>
       ${last ? `<div class="subtle">Latest: ${escapeHtml(last)}</div>` : ''}
       <div class="alert-backtest-spark">${alertSparkMarkup(series.slice(-200), body.threshold)}</div>`;
@@ -4928,7 +5123,24 @@ async function addChannel() {
 }
 
 el('alertsRefresh').addEventListener('click', () => loadAlerts());
-el('alertsCreateBtn').addEventListener('click', () => openAlertForm());
+// With no saved view to alert on, the button goes to Logs to save one.
+el('alertsCreateBtn').addEventListener('click', () => {
+  if (state.views.list.length) {
+    openAlertForm();
+    return;
+  }
+  switchTab('logs');
+  if (isDrawerMode()) openFiltersDrawer();
+  else if (state.filtersCollapsed) el('filtersToggle').click();
+  el('saveViewBtn').focus();
+});
+
+function updateCreateAlertButton() {
+  const button = el('alertsCreateBtn');
+  const none = state.views.loaded && !state.views.list.length;
+  button.textContent = none ? 'Save a view first' : 'Create alert';
+  button.title = none ? 'Alerts watch a saved view: open Logs, set filters and Save view' : 'Create an alert rule on a saved view';
+}
 el('alertsChannelsBtn').addEventListener('click', () => openChannels());
 el('alertsList').addEventListener('click', (event) => {
   const button = event.target instanceof Element ? event.target.closest('[data-alert-action]') : null;
@@ -5000,7 +5212,7 @@ function renderAskBox() {
 
 function askValueText(key, value) {
   if (key === 'range') return ASK_RANGE_LABELS[value] || value;
-  if (key === 'from' || key === 'to') return formatTimestamp(value);
+  if (key === 'from' || key === 'to') return formatDateTime(value);
   return value;
 }
 
@@ -5782,12 +5994,6 @@ window.addEventListener('keydown', (event) => {
     closeContext();
   }
 });
-el('todayShortcut').addEventListener('click', () => {
-  forgetHistogramZoom();
-  el('rangePreset').value = 'today';
-  setDefaultDateRange();
-  reloadLogs();
-});
 el('clearFilters').addEventListener('click', () => {
   el('scope').value = '';
   el('namespace').value = '';
@@ -5813,7 +6019,13 @@ el('securityShortcut').addEventListener('click', () => {
 });
 el('rangePreset').addEventListener('change', () => {
   const preset = RANGE_PRESETS[el('rangePreset').value];
-  if (!preset) return;
+  if (!preset) {
+    // "Custom range": go to the Start field (in the drawer on narrow screens).
+    if (isDrawerMode()) openFiltersDrawer();
+    else if (state.filtersCollapsed) el('filtersToggle').click();
+    el('start').focus();
+    return;
+  }
   forgetHistogramZoom();
   preset.apply();
   reloadLogs();
@@ -5876,6 +6088,24 @@ el('fieldSidebarToggle').addEventListener('click', () => {
   setFieldsCollapsed(collapsed);
   writeFlag(FIELDS_COLLAPSED_KEY, collapsed);
 });
+// Arrow keys, Home and End move within one field's value list.
+el('fieldList').addEventListener('keydown', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('.field-value') : null;
+  const list = button ? button.closest('.field-values') : null;
+  if (!list) return;
+  const buttons = Array.from(list.querySelectorAll('.field-value'));
+  const index = buttons.indexOf(button);
+  let next = null;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = Math.min(buttons.length - 1, index + 1);
+  else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+  else if (event.key === 'Home') next = 0;
+  else if (event.key === 'End') next = buttons.length - 1;
+  if (next === null) return;
+  event.preventDefault();
+  button.tabIndex = -1;
+  buttons[next].tabIndex = 0;
+  buttons[next].focus();
+});
 el('fieldList').addEventListener('mousedown', (event) => {
   if (event.shiftKey) event.preventDefault(); // no text selection on Shift-click
 });
@@ -5907,6 +6137,7 @@ el('live').addEventListener('change', () => {
   renderFreshness();
   if (el('live').checked) startTailPolling(); else stopTailPolling();
 });
+el('investigateGoInsights').addEventListener('click', () => switchTab('insights'));
 el('openInActionableBtn').addEventListener('click', () => {
   switchTab('actionable');
 });

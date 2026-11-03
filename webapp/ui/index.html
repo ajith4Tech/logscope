@@ -44,7 +44,7 @@
             <span id="insightsBadge" class="tab-badge" hidden></span>
           </button>
           <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable" tabindex="-1">
-            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17"/></svg><span class="tab-label">Actionable</span><span class="tab-label-short" aria-hidden="true">Actions</span>
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17"/></svg><span class="tab-label">Investigate</span><span class="tab-label-short" aria-hidden="true">Investigate</span>
             <span id="actionableBadge" class="tab-badge" hidden></span>
           </button>
           <button id="tabAlerts" class="tab" role="tab" aria-selected="false" aria-controls="panelAlerts" tabindex="-1">
@@ -74,6 +74,7 @@
             </div>
           </div>
           <div class="filter-helper">Defaults to the current day. Only namespaces already present in cached S3 logs appear here.</div>
+            <div id="filtersZone" class="filter-helper filters-zone"></div>
           <div id="viewBar" class="view-bar" hidden>
             <span class="view-bar-label">View</span>
             <span id="viewBarName" class="view-bar-name"></span>
@@ -89,7 +90,7 @@
               <label for="askInput" class="ask-label">Ask</label>
               <div class="ask-row">
                 <input id="askInput" type="search" maxlength="500" placeholder="e.g. errors in payments since 9am" title="Describe the logs you want; the proposed filters are shown before anything is applied" />
-                <button id="askSubmit" type="submit" class="ghost">Ask</button>
+                <button id="askSubmit" type="submit" class="ghost" title="AI: proposes filters from your request">✦ Ask</button>
               </div>
             </form>
             <div id="askStatus" class="ask-status" role="status" hidden></div>
@@ -150,9 +151,9 @@
             </div>
             <div id="pinnedViewsCards" class="pinned-views-cards"></div>
           </section>
-          <div id="dashboardLoading" class="dashboard-state" hidden>Loading dashboard…</div>
-          <div id="dashboardError" class="dashboard-state dashboard-state-error" hidden></div>
-          <div id="dashboardEmpty" class="empty-state" hidden>No log data found for the selected filters.</div>
+          <div id="dashboardLoading" class="panel-state-host" hidden></div>
+          <div id="dashboardError" class="panel-state-host" hidden></div>
+          <div id="dashboardEmpty" class="panel-state-host" hidden></div>
           <div id="dashboardContent" class="dashboard-grid" hidden>
             <section class="dashboard-section dashboard-summary-section">
               <div class="section-head">
@@ -245,7 +246,6 @@
                   <option value="custom">Custom range</option>
                 </select>
               </label>
-              <button id="todayShortcut" class="ghost">Today</button>
               <button id="clearFilters" class="ghost">Clear filters</button>
               <label class="toggle" title="Show identical lines from the same source within 5 minutes as one row">
                 <input id="collapseDuplicates" type="checkbox" checked /> Collapse duplicates
@@ -266,7 +266,7 @@
                 <span id="explainCachedBadge" class="cached-badge" hidden>cached</span>
               </div>
               <div class="explain-head-actions">
-                <button id="openInActionableBtn" class="ghost explain-open-actionable" title="Open troubleshooting workspace with this plan">Troubleshoot in Actionable</button>
+                <button id="openInActionableBtn" class="ghost explain-open-actionable" title="Open this plan in the Investigate tab">Investigate</button>
                 <button id="explainDismiss" class="ghost explain-close" aria-label="Dismiss explanation">✕</button>
               </div>
             </div>
@@ -276,9 +276,8 @@
           </div>
 
           <div class="toolbar-note">Newest rows first. Click a row for the full message and source details.</div>
-          <div id="logsError" class="dashboard-state dashboard-state-error" role="alert" hidden></div>
           <!-- Live tail rows held back while a row is open or the list is scrolled -->
-          <button id="newRowsBanner" type="button" class="new-rows-banner" aria-live="polite">▲ <span id="newRowsCount">0</span> new rows — show them</button>
+          <button id="newRowsBanner" type="button" class="new-rows-banner">▲ <span id="newRowsCount">0</span> new rows — show them</button>
           <!-- Log context: entries around one selected entry (replaces the results while open) -->
           <section id="contextView" class="context-view" hidden aria-label="Log context">
             <div class="context-head">
@@ -358,16 +357,16 @@
               <button id="refreshInsights" class="ghost">Refresh</button>
             </div>
           </div>
-          <div id="insightsEmpty" class="empty-state" hidden>No anomalies found for the selected filter.</div>
+          <div id="insightsEmpty" class="panel-state-host" hidden></div>
           <div id="anomalyRows" class="anomaly-rows"></div>
         </div>
 
-        <!-- Actionable panel (Troubleshooting Workspace) -->
+        <!-- Investigate panel (id and URL keep the old "actionable" name) -->
         <div id="panelActionable" aria-labelledby="tabActionable" class="panel actionable-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>
-              <h2>Troubleshooting Workspace</h2>
-              <div class="subtle" id="actionableContextDesc">Active investigation: Filtered Logs</div>
+              <h2>Investigate</h2>
+              <div class="subtle" id="actionableContextDesc">Nothing under investigation yet</div>
             </div>
             <div class="actionable-toolbar">
               <label class="inline-label">Target
@@ -376,16 +375,21 @@
                 </select>
               </label>
               <button id="actionableRefreshBtn" class="primary">
-                <span class="explain-icon-sm">✦</span> <span id="actionableRefreshLabel">Generate Plan</span>
+                <span class="explain-icon-sm" aria-hidden="true">✦</span> <span id="actionableRefreshLabel">Generate plan</span>
               </button>
             </div>
           </div>
 
-          <!-- Empty or prompt state -->
-          <div id="actionableEmpty" class="empty-state">
-            <div class="empty-state-title">No Active Investigation</div>
-            <div class="empty-state-sub">
-              Select an anomaly from Insights or analyze the current logs to start an investigation.
+          <!-- Empty state: how to start an investigation -->
+          <div id="actionableEmpty" class="panel-state panel-state-empty panel-state-howto">
+            <svg class="panel-state-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5"/></svg>
+            <div>
+              <p class="panel-state-text">Nothing under investigation yet. Start one of three ways:</p>
+              <ol class="howto">
+                <li>In <button id="investigateGoInsights" type="button" class="link-btn">Insights</button>, choose <b>Investigate</b> on an anomaly.</li>
+                <li>In Logs, open a line and choose <b>Investigate</b>.</li>
+                <li>Pick a target above and press <b>✦ Generate plan</b> to analyse the logs your filters match.</li>
+              </ol>
             </div>
           </div>
 
@@ -491,11 +495,12 @@
             </div>
           </div>
           <form id="settingsUnlock" class="settings-unlock" autocomplete="off">
-            <label>Admin token
-              <input id="settingsToken" type="password" autocomplete="off" spellcheck="false" required />
-            </label>
-            <button type="submit">Unlock</button>
-            <p class="subtle">The token is LOGSCOPE_ADMIN_TOKEN, or the admin.token file next to the state database (its path is in the server log). It is kept in this browser tab only and is forgotten when the tab closes.</p>
+            <label class="field-label" for="settingsToken">Admin token</label>
+            <div class="field-inline">
+              <input id="settingsToken" type="password" autocomplete="off" spellcheck="false" required aria-describedby="settingsTokenHelp" />
+              <button type="submit">Unlock</button>
+            </div>
+            <p id="settingsTokenHelp" class="field-help">The token is LOGSCOPE_ADMIN_TOKEN, or the admin.token file next to the state database (its path is in the server log). It is kept in this browser tab only and is forgotten when the tab closes.</p>
             <div id="settingsUnlockError" class="settings-error" role="alert" hidden></div>
           </form>
           <div id="settingsBody" hidden>
@@ -647,6 +652,7 @@
         <span class="anomaly-type-badge"></span>
         <div class="anomaly-body">
           <div class="anomaly-title-line">
+            <span class="badge anomaly-sev-inline"></span>
             <span class="anomaly-title"></span>
             <span class="anomaly-source"></span>
           </div>
@@ -658,7 +664,7 @@
           <span class="anomaly-time"></span>
         </div>
         <div class="anomaly-actions">
-          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Investigate in the Actionable tab">Troubleshoot</button>
+          <button type="button" class="anomaly-btn-troubleshoot ghost" title="Open this anomaly in the Investigate tab">Investigate</button>
           <button type="button" class="anomaly-btn-reviewed ghost">✓ Reviewed</button>
           <div class="row-menu">
             <button type="button" class="row-menu-btn ghost" aria-haspopup="menu" aria-expanded="false" aria-label="More actions">⋯</button>
@@ -678,6 +684,9 @@
       </div>
     </article>
   </template>
+
+  <!-- Polite announcements of changes nobody asked for (new rows waiting, health changes) -->
+  <div id="liveAnnouncer" class="visually-hidden" role="status" aria-live="polite"></div>
 
   <!-- Errors from actions that have no panel of their own -->
   <div id="toastRegion" class="toast-region"></div>
