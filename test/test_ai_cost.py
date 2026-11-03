@@ -307,6 +307,9 @@ def test_anomalies_get_a_free_template_summary(tmp_path, served):
 def test_auto_summary_off_by_default_and_min_urgency(tmp_path, monkeypatch):
     calls = _counting_openai(monkeypatch)
     app = _configured_app(tmp_path, monkeypatch)
+    # Isolate anomaly_auto_summary: turn off auto_triage (on by default, and it
+    # would otherwise triage the error_rate_spike below at urgency high).
+    app.ai_settings.update({"flags": {"auto_triage": False}})
     urgent = app.anomaly_store.get_anomaly(_anomaly(app))
     high = app.anomaly_store.get_anomaly(_anomaly(app, type_="error_rate_spike", namespace="shop", rule_key=""))
     assert app.summary_worker.enqueue([urgent, high]) == 0  # anomaly_auto_summary defaults to off

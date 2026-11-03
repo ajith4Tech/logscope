@@ -64,7 +64,7 @@ def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
     error_rate_spike   high
     severity_shift     a rising share of error -> high, of warning -> medium,
                        anything else (including a falling share) -> low
-    message_frequency  medium
+    message_frequency  a flood of error/warning lines -> high, else medium
     other              low
     """
     kind = str(anomaly.get("type") or "")
@@ -82,7 +82,10 @@ def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
             return "low"
         return {"error": "high", "warning": "medium"}.get(severity, "low")
     if kind == "message_frequency":
-        return "medium"
+        # A frequency spike of error/warning lines (e.g. an access-log 4xx/5xx
+        # flood, now classified by severity) is worth triaging; info chatter
+        # stays medium so it is not summarized automatically.
+        return {"error": "high", "warning": "high"}.get(severity, "medium")
     return "low"
 
 
@@ -97,7 +100,7 @@ CASE a.type
               > CAST(COALESCE(json_extract(a.evidence, '$.baseline_share'), 0) AS REAL)
          THEN CASE a.severity WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END
          ELSE 0 END
-  WHEN 'message_frequency' THEN 1
+  WHEN 'message_frequency' THEN CASE a.severity WHEN 'error' THEN 2 WHEN 'warning' THEN 2 ELSE 1 END
   ELSE 0
 END
 """

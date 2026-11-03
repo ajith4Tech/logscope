@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -15,6 +16,8 @@ from typing import Any
 
 from .actions import step_execution_fields
 from .config import AppConfig, InsightsConfig
+from .parser import access_log_fields
+from .patterns import normalize_message
 from .storage import SQLITE_BUSY_TIMEOUT_SECS
 
 logger = logging.getLogger(__name__)
@@ -31,11 +34,21 @@ _SAMPLE_SCAN_ROWS = 500
 # query holds the database for the whole multi-day window.
 _BASELINE_SLICE_HOURS = 24
 _RULE_KEY_SQL_FUNCTION = "logscope_rule_key"
+# Template grouping for message_frequency: the full pattern normalizer
+# (patterns.normalize_message), so lines that differ only in variable parts
+# (IPs, timestamps, numbers) collapse into one key. rule_key_of (raw text,
+# intentionally) stays for Falco rule-name grouping only.
+_TEMPLATE_SQL_FUNCTION = "logscope_message_template"
 
 # Ports of the UI's message-normalization (webapp/ui/app.js ruleKeyOf) so the
 # grouping keys used for anomaly detection are identical to the ones used for
 # the viewer's dedupe feature. Parity is pinned by test_insights.py.
 _FALCO_EVENT_TIME_RE = re.compile(r"\b\d{2}:\d{2}:\d{2}\.\d+:\s*")
+# Target workload of a Falco event, read from its output fields when present
+# (k8s.ns=/k8s.pod= or the .name variants), so new_falco_rule can honour the
+# per-namespace cold-start grace. Absent fields -> no suppression.
+_FALCO_NS_RE = re.compile(r"\bk8s\.ns(?:\.name)?=([a-z0-9][a-z0-9-]*)")
+_FALCO_POD_RE = re.compile(r"\bk8s\.pod(?:\.name)?=([a-z0-9][a-z0-9.-]*)")
 
 
 def rule_key_of(message: str) -> str:
@@ -45,6 +58,32 @@ def rule_key_of(message: str) -> str:
     if detail_index > 0 and "=" in text[detail_index:]:
         text = text[:detail_index]
     return text
+
+
+def falco_target(message: str) -> tuple[str | None, str | None]:
+    """(namespace, pod) a Falco event concerns, from its k8s output fields."""
+    text = str(message or "")
+    ns = _FALCO_NS_RE.search(text)
+    pod = _FALCO_POD_RE.search(text)
+    return (ns.group(1) if ns else None, pod.group(1) if pod else None)
+
+
+_PATH_NUM_RE = re.compile(r"\d+")
+
+
+def message_template(message: str) -> str:
+    """Grouping key for message_frequency. For an HTTP access-log line, the
+    template is method + digit-normalized path + status, so each request shape
+    (a /?author=N scan, a /wp-login.php flood, a CVE probe) is one stable
+    template while lines differing only in IP/time/status-size collapse. The
+    plain whole-line normalizer would instead fold the quoted request line into
+    one "<STR>", losing method and path. Non-access lines fall back to it."""
+    text = str(message or "")
+    fields = access_log_fields(text)
+    if fields is not None:
+        path = _PATH_NUM_RE.sub("<N>", str(fields.get("path") or ""))
+        return f"{fields.get('method') or '-'} {path} {fields['status']}"
+    return normalize_message(text)
 
 
 def is_spike(current: int, baseline: float, multiplier: float, min_count: int) -> bool:
@@ -142,10 +181,16 @@ class AnomalyStore:
         severity: str,
         evidence: dict[str, Any],
         detected_day: str,
+        status: str = "new",
     ) -> tuple[int, str]:
         """Insert or refresh one anomaly. Returns (id, outcome) where outcome is
         "created", "updated" (same occurrence, newer counts) or "recurred" (the
         same anomaly in a different hourly window of the same day).
+
+        `status` is the status for a new row ("new", or "suppressed_cold_start"
+        for a cold-start-suppressed detection). A later non-suppressed detection
+        of the same key promotes a suppressed row to "new" (treated as a
+        recurrence, so it is summarized then).
 
         A recurrence replaces the evidence, so any AI summary, steps and AI
         error written for the earlier occurrence are cleared and the anomaly is
@@ -158,7 +203,8 @@ class AnomalyStore:
         key = (type, namespace, pod, rule_key, detected_day)
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, evidence FROM anomalies WHERE type=? AND namespace=? AND pod=? AND rule_key=? AND detected_day=?",
+                "SELECT id, evidence, status FROM anomalies "
+                "WHERE type=? AND namespace=? AND pod=? AND rule_key=? AND detected_day=?",
                 key,
             ).fetchone()
             if row is None:
@@ -166,12 +212,12 @@ class AnomalyStore:
                     """
                     INSERT INTO anomalies (type, namespace, pod, rule_key, severity, evidence,
                                            detected_at, detected_day, updated_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (type, namespace, pod, rule_key, severity, evidence_json, now, detected_day, now),
+                    (type, namespace, pod, rule_key, severity, evidence_json, now, detected_day, now, status),
                 )
                 self._conn.commit()
-                return int(cur.lastrowid), "created"
+                return int(cur.lastrowid), ("suppressed" if status == "suppressed_cold_start" else "created")
             anomaly_id = int(row["id"])
             try:
                 previous = json.loads(row["evidence"])
@@ -183,6 +229,25 @@ class AnomalyStore:
                 # An older window (e.g. the previous hour, re-evaluated) never
                 # replaces evidence for a newer occurrence.
                 return anomaly_id, "unchanged"
+            if status == "suppressed_cold_start":
+                # Still inside the grace: keep whatever is stored. A suppressed
+                # row stays suppressed; a row already promoted to 'new' is not
+                # demoted by a later, older-window re-evaluation.
+                return anomaly_id, "unchanged"
+            if row["status"] == "suppressed_cold_start":
+                # The grace has elapsed and the group is firing again: promote
+                # the suppressed row to a real, summarizable anomaly.
+                self._conn.execute(
+                    """
+                    UPDATE anomalies SET status='new', evidence=?, severity=?, updated_at=?,
+                        ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL,
+                        ai_meta=NULL
+                    WHERE id=?
+                    """,
+                    (evidence_json, severity, now, anomaly_id),
+                )
+                self._conn.commit()
+                return anomaly_id, "recurred"
             if old_window and new_window and old_window != new_window:
                 self._conn.execute(
                     """
@@ -369,8 +434,13 @@ class InsightsDetector:
         self._lock = threading.RLock()
         self.history_hours: float | None = None
         self.learning = False
+        # Whole hours of counts come from the hourly rollup when it is
+        # complete (checked once per run in _windows); False forces raw rows.
+        self.use_rollup = True
+        self._rollup = False
         with self._lock:
             self._conn.create_function(_RULE_KEY_SQL_FUNCTION, 1, rule_key_of, deterministic=True)
+            self._conn.create_function(_TEMPLATE_SQL_FUNCTION, 1, message_template, deterministic=True)
 
     @staticmethod
     def _iso(value: datetime) -> str:
@@ -383,6 +453,32 @@ class InsightsDetector:
             return None
         return datetime.fromtimestamp(float(row[0][0]), timezone.utc)
 
+    def _first_seen(self, namespace: str, pod: str | None) -> float | None:
+        """Earliest stored event time for one namespace (and pod, when given),
+        in epoch seconds; None when that namespace/pod has no records. Used by
+        the cold-start grace, so a container's own start-up noise is not an
+        anomaly until the namespace/pod has existed for cold_start_grace_s."""
+        where = " WHERE namespace = ?"
+        args: list[Any] = [namespace]
+        if pod:
+            where += " AND pod = ?"
+            args.append(pod)
+        row = self._query(f"SELECT MIN(ts_epoch) FROM records{where}", tuple(args))
+        if not row or row[0][0] is None:
+            return None
+        return float(row[0][0])
+
+    def _in_cold_start(self, window: _Window, namespace: str, pod: str | None) -> bool:
+        """True when `window` overlaps the namespace/pod's cold-start grace, so
+        the events it counts include start-up-era records. Measured against the
+        events' own time (window.start), not `now`, so ingest lag cannot let a
+        start-up burst through once the detector finally sees it."""
+        grace = float(self.cfg.cold_start_grace_s)
+        if grace <= 0:
+            return False
+        first = self._first_seen(namespace, pod or None)
+        return first is not None and window.start.timestamp() < first + grace
+
     def _windows(self, now: datetime) -> list[_Window]:
         """The windows to evaluate at `now`, oldest first. Updates
         history_hours / learning."""
@@ -393,6 +489,7 @@ class InsightsDetector:
             timedelta(hours=max(1.0, float(self.cfg.min_baseline_hours))), span
         )
         first = self._first_record_time()
+        self._rollup = self.use_rollup and self._rollup_complete()
         self.history_hours = (
             None if first is None else round(max(0.0, (hour_start - first).total_seconds() / 3600), 1)
         )
@@ -417,6 +514,30 @@ class InsightsDetector:
             lo = nxt
         return out
 
+    def _rollup_complete(self) -> bool:
+        """counts_hourly holds every row: no rebuild and no ts_epoch backfill
+        pending, and no row newer than the last one it counted (a writer
+        that went around LogStorage, e.g. an older version)."""
+        try:
+            if not self._query("SELECT 1 FROM sqlite_master WHERE name = 'counts_hourly'", ()):
+                return False
+            if self._query("SELECT 1 FROM app_state WHERE name = 'rollup_upper'", ()) \
+                    or self._query("SELECT 1 FROM records WHERE ts_epoch IS NULL LIMIT 1", ()):
+                return False
+            counted = self._query("SELECT value FROM app_state WHERE name = 'rollup_max_id'", ())
+            newest = self._query("SELECT COALESCE(MAX(id), 0) FROM records", ())[0][0]
+            return int(newest) <= int(counted[0][0] if counted else 0)
+        except (sqlite3.OperationalError, ValueError):
+            return False
+
+    @staticmethod
+    def _rollup_sql(sql: str) -> str | None:
+        """A key or filter expression on counts_hourly, or None when it needs
+        the message (rule keys). The expressions are fixed by the detectors."""
+        if _RULE_KEY_SQL_FUNCTION in sql or "message" in sql:
+            return None
+        return sql.replace("severity_bucket", "severity")
+
     def _query(self, sql: str, args: tuple) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(sql, args).fetchall()
@@ -425,9 +546,29 @@ class InsightsDetector:
         self, start: datetime, end: datetime, keys: tuple[str, ...], where: str = "", args: tuple = ()
     ) -> dict[tuple, int]:
         """{key tuple: row count} for start <= event time < end, aggregated in SQL
-        one slice at a time. `keys` are SQL expressions (fixed by the callers)."""
+        one slice at a time. `keys` are SQL expressions (fixed by the callers).
+        Whole hours come from the hourly rollup when it can express the keys
+        and filter; the partial hours at the edges always from records."""
         select = ", ".join(f"{expr} AS k{i}" for i, expr in enumerate(keys))
         group = ", ".join(f"k{i}" for i in range(len(keys)))
+        out: dict[tuple, int] = {}
+        rollup_keys = [self._rollup_sql(k) for k in keys]
+        rollup_where = self._rollup_sql(where)
+        h1 = math.ceil(start.timestamp() / 3600) * 3600
+        h2 = math.floor(end.timestamp() / 3600) * 3600
+        if self._rollup and rollup_where is not None and None not in rollup_keys and h1 < h2:
+            rows = self._query(
+                f"SELECT {', '.join(f'{k} AS k{i}' for i, k in enumerate(rollup_keys))}, SUM(n) FROM counts_hourly "
+                f"WHERE hour_epoch >= ? AND hour_epoch < ?{rollup_where} GROUP BY {group}", (h1, h2, *args))
+            for row in rows:
+                out[tuple(row[i] for i in range(len(keys)))] = int(row[len(keys)])
+            edges = [(start, datetime.fromtimestamp(h1, timezone.utc)), (datetime.fromtimestamp(h2, timezone.utc), end)]
+            return self._add(out, *(self._counts_raw(lo, hi, select, group, len(keys), where, args)
+                                    for lo, hi in edges if lo < hi))
+        return self._counts_raw(start, end, select, group, len(keys), where, args)
+
+    def _counts_raw(self, start: datetime, end: datetime, select: str, group: str, nkeys: int, where: str,
+                    args: tuple) -> dict[tuple, int]:
         out: dict[tuple, int] = {}
         for lo, hi in self._slices(start, end):
             rows = self._query(
@@ -436,8 +577,8 @@ class InsightsDetector:
                 (lo, hi, *args),
             )
             for row in rows:
-                key = tuple(row[i] for i in range(len(keys)))
-                out[key] = out.get(key, 0) + int(row[len(keys)])
+                key = tuple(row[i] for i in range(nkeys))
+                out[key] = out.get(key, 0) + int(row[nkeys])
         return out
 
     @staticmethod
@@ -482,6 +623,14 @@ class InsightsDetector:
         gap (an outage, not a quiet cluster), which dilutes the baseline."""
         hour = start.replace(minute=0, second=0, microsecond=0)
         found = 0
+        h1 = math.ceil(start.timestamp() / 3600) * 3600
+        h2 = math.floor(end.timestamp() / 3600) * 3600
+        if self._rollup and h1 < h2:  # whole hours: one query on the rollup instead of one per hour
+            found = int(self._query("SELECT COUNT(DISTINCT hour_epoch) FROM counts_hourly "
+                                    "WHERE hour_epoch >= ? AND hour_epoch < ?", (h1, h2))[0][0])
+            edges = [(start, datetime.fromtimestamp(h1, timezone.utc)), (datetime.fromtimestamp(h2, timezone.utc), end)]
+            return found + sum(1 for lo, hi in edges if lo < hi and self._query(
+                "SELECT 1 FROM records WHERE ts_epoch >= ? AND ts_epoch < ? LIMIT 1", (lo.timestamp(), hi.timestamp())))
         while hour < end:
             lo, hi = max(hour, start), min(hour + timedelta(hours=1), end)
             if self._query("SELECT 1 FROM records WHERE ts_epoch >= ? AND ts_epoch < ? LIMIT 1",
@@ -537,11 +686,23 @@ class InsightsDetector:
         describe: Callable[[tuple], tuple[str, str, str, str]],
         sample_filter: Callable[[tuple], tuple[str, tuple]],
         baseline_filter: Callable[[set[tuple]], tuple[str, tuple]],
+        cold_start: bool = False,
+        require_baseline: bool = False,
     ) -> list[dict[str, Any]]:
         """Shared rule for error spikes and message frequency: a group is
         anomalous when its count in the window reaches `min_count` and is at
         least `multiplier` times the baseline's expected count for the same
-        observed duration. The newest flagged window wins per group."""
+        observed duration. The newest flagged window wins per group.
+
+        With `require_baseline`, a group whose baseline holds fewer than
+        `min_baseline_samples` occurrences is skipped as insufficient data (its
+        ratio would be "infinite"); this guards the rare-event detectors (error
+        spikes) from a brand-new namespace's start-up burst. message_frequency
+        leaves it off: a new high-volume template clearing the (much higher)
+        frequency floor is exactly what it must catch. With `cold_start`, a flag
+        raised while the namespace/pod is still inside its cold-start grace is
+        kept but marked suppressed, so a container's own start-up is recorded,
+        not alerted."""
         windows = self._windows(now)
         if not windows:
             return []
@@ -557,13 +718,16 @@ class InsightsDetector:
             for key, count in counts.items():
                 if key not in candidates:
                     continue
-                avg = baseline.get(key, 0) / max(window.baseline_hours, 1e-9)
+                baseline_count = baseline.get(key, 0)
+                if require_baseline and baseline_count < self.cfg.min_baseline_samples:
+                    continue  # insufficient baseline: not an "infinite" spike
+                avg = baseline_count / max(window.baseline_hours, 1e-9)
                 expected = avg * window.hours
                 if not is_spike(count, expected, multiplier, min_count):
                     continue
                 namespace, pod, rule_key, severity = describe(key)
                 sample_where, sample_args = sample_filter(key)
-                found[key] = {
+                anomaly = {
                     "type": type_,
                     "namespace": namespace,
                     "pod": pod,
@@ -576,6 +740,9 @@ class InsightsDetector:
                         multiplier=multiplier,
                     ),
                 }
+                if cold_start and self._in_cold_start(window, namespace, pod or None):
+                    anomaly["suppressed"] = "cold_start"
+                found[key] = anomaly
         return list(found.values())
 
     def detect_error_spikes(self, now: datetime, *, per_pod: bool = False) -> list[dict[str, Any]]:
@@ -595,22 +762,32 @@ class InsightsDetector:
             baseline_filter=lambda keys: (
                 self._in_list("namespace"), (json.dumps(sorted({k[0] for k in keys})),)
             ),
+            cold_start=True,
+            require_baseline=True,
         )
 
     def detect_message_frequency(self, now: datetime) -> list[dict[str, Any]]:
-        rule_key = f"{_RULE_KEY_SQL_FUNCTION}(message)"
+        # Group on the normalized template (not raw text), scoped by
+        # namespace/pod/container and severity bucket, so lines that differ
+        # only in variable parts (IPs, timestamps, numbers) collapse into one
+        # key and a real frequency spike can be seen. The stored rule_key is
+        # the readable template; the severity carries into the urgency.
+        template = f"{_TEMPLATE_SQL_FUNCTION}(message)"
         return self._rate_anomalies(
             now,
             type_="message_frequency",
-            keys=("namespace", rule_key),
+            keys=("namespace", "pod", "container", "severity_bucket", template),
             where="",
             multiplier=self.cfg.frequency_multiplier,
             min_count=self.cfg.frequency_min_count,
-            describe=lambda key: (key[0], "", key[1], ""),
-            sample_filter=lambda key: (f" AND namespace = ? AND {rule_key} = ?", key),
+            describe=lambda key: (key[0], key[1], key[4], key[3]),
+            sample_filter=lambda key: (
+                f" AND namespace = ? AND pod = ? AND container = ? AND severity_bucket = ? AND {template} = ?",
+                key,
+            ),
             baseline_filter=lambda keys: (
-                self._in_list("namespace") + self._in_list(rule_key),
-                (json.dumps(sorted({k[0] for k in keys})), json.dumps(sorted({k[1] for k in keys}))),
+                self._in_list("namespace") + self._in_list(template),
+                (json.dumps(sorted({k[0] for k in keys})), json.dumps(sorted({k[4] for k in keys}))),
             ),
         )
 
@@ -644,7 +821,7 @@ class InsightsDetector:
                 samples = self._samples(window, f"{security} AND {rule_key} = ?", (key,))
                 if not samples:
                     continue
-                found[key] = {
+                anomaly = {
                     "type": "new_falco_rule",
                     "namespace": "",
                     "pod": "",
@@ -654,6 +831,13 @@ class InsightsDetector:
                         window, count, samples, first_seen_timestamp=samples[0]["timestamp"]
                     ),
                 }
+                # A rule that first fires while the workload it concerns is still
+                # in its cold-start grace is the container's own start-up (e.g. an
+                # entrypoint shell), not a novel threat: record but do not alert.
+                target_ns, target_pod = falco_target(samples[0]["message"])
+                if target_ns and self._in_cold_start(window, target_ns, target_pod):
+                    anomaly["suppressed"] = "cold_start"
+                found[key] = anomaly
         return list(found.values())
 
     def detect_severity_shift(self, now: datetime) -> list[dict[str, Any]]:
@@ -683,7 +867,7 @@ class InsightsDetector:
                 baseline_totals[namespace] = baseline_totals.get(namespace, 0) + count
             for (namespace, bucket), current_count in sorted(current.items()):
                 baseline_total = baseline_totals.get(namespace, 0)
-                if baseline_total == 0 or current_count < self.cfg.shift_min_count:
+                if baseline_total < max(1, self.cfg.min_baseline_samples) or current_count < self.cfg.shift_min_count:
                     continue
                 current_share = current_count / current_totals[namespace]
                 baseline_share = baseline.get((namespace, bucket), 0) / baseline_total
@@ -814,11 +998,13 @@ class InsightsJob:
         return counts
 
     def detect_once(self, now: datetime) -> dict[str, int]:
-        counts = {"anomalies_created": 0, "anomalies_updated": 0, "anomalies_recurred": 0, "anomalies_unchanged": 0}
+        counts = {"anomalies_created": 0, "anomalies_updated": 0, "anomalies_recurred": 0,
+                  "anomalies_unchanged": 0, "anomalies_suppressed": 0}
         for anomaly in self.detector.detect_all(now):
             # The day of the window, not of the run: the previous hour checked
             # just after midnight belongs to the day before.
             day = str(anomaly["evidence"].get("window_start") or now.strftime("%Y-%m-%d"))[:10]
+            status = "suppressed_cold_start" if anomaly.get("suppressed") else "new"
             _, outcome = self.store.record_detection(
                 type=anomaly["type"],
                 namespace=anomaly["namespace"],
@@ -827,6 +1013,7 @@ class InsightsJob:
                 severity=anomaly["severity"],
                 evidence=anomaly["evidence"],
                 detected_day=day,
+                status=status,
             )
             counts[f"anomalies_{outcome}"] += 1
         return counts

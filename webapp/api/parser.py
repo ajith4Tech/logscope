@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
+from logscope.lineformat import FIELD_SEPARATOR, TIMESTAMP_PATTERN
+
 from .storage import to_epoch
 
+# The timestamp group comes from the constant render validates format.* against.
+_SEP = re.escape(FIELD_SEPARATOR)
 LINE_RE = re.compile(
-    r"^(?P<timestamp>[^ ]+) - (?P<namespace>[^ ]+) - (?P<pod>[^/]+)/(?P<container>[^ ]+) - (?P<message>.*)$"
+    rf"^(?P<timestamp>{TIMESTAMP_PATTERN}){_SEP}(?P<namespace>[^ ]+){_SEP}(?P<pod>[^/]+)/(?P<container>[^ ]+)"
+    rf"{_SEP}(?P<message>.*)$"
 )
 
 
@@ -37,6 +43,92 @@ def parse_flat_line(raw_line: str) -> ParsedLine:
         message=message,
         is_security_suffix=is_security_suffix,
     )
+
+
+# ── HTTP access-log classification (additive) ────────────────────────────────
+# Access logs (Traefik JSON, nginx/Apache common/combined) carry an HTTP status
+# but no "error"/"warn" keyword, so the keyword classifier files them as info and
+# a 4xx/5xx flood is invisible. We re-derive severity from the status and attach
+# the parsed fields; lines that do not match an access-log shape are untouched.
+
+# nginx/Apache common & combined: IP ident user [time] "METHOD path proto" status size ...
+_ACCESS_COMMON_RE = re.compile(
+    r'^(?P<client_ip>\S+) \S+ \S+ \[[^\]]+\] '
+    r'"(?P<method>[A-Z]{3,10}) (?P<path>\S+)(?: [^"]*)?" '
+    r'(?P<status>\d{3})(?: (?P<size>\S+))?'
+    r'(?: "(?P<referer>[^"]*)" "(?P<ua>[^"]*)")?'
+)
+# Traefik JSON access-log keys (and common aliases from nginx/Envoy JSON).
+_JSON_STATUS_KEYS = ("DownstreamStatus", "OriginStatus", "status", "http.status_code", "status_code")
+_JSON_METHOD_KEYS = ("RequestMethod", "method", "http.method")
+_JSON_PATH_KEYS = ("RequestPath", "RequestURI", "path", "http.path", "uri")
+_JSON_IP_KEYS = ("ClientHost", "ClientAddr", "client_ip", "remote_addr", "RemoteAddr")
+_JSON_UA_KEYS = ("request_User-Agent", "RequestUserAgent", "user_agent", "http.user_agent")
+_JSON_DURATION_KEYS = ("Duration", "duration", "request_time")
+# Statuses that mean trouble even though the line holds no error keyword.
+_WARNING_STATUSES = frozenset({401, 403, 404, 429})
+
+
+def _first_key(obj: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in obj and obj[key] not in (None, ""):
+            return obj[key]
+    return None
+
+
+def access_log_fields(message: str) -> dict[str, Any] | None:
+    """Parse one access-log line (Traefik JSON or common/combined) into
+    {method, path, status, client_ip, user_agent, duration}, or None when the
+    line is not an access log. Only `status` is required."""
+    text = str(message or "").strip()
+    if not text:
+        return None
+    if text[0] == "{" and text[-1] == "}":
+        try:
+            obj = json.loads(text)
+        except (ValueError, TypeError):
+            obj = None
+        if isinstance(obj, dict):
+            raw_status = _first_key(obj, _JSON_STATUS_KEYS)
+            try:
+                status = int(raw_status)
+            except (TypeError, ValueError):
+                return None
+            if not 100 <= status <= 599:
+                return None
+            return {
+                "method": _first_key(obj, _JSON_METHOD_KEYS),
+                "path": _first_key(obj, _JSON_PATH_KEYS),
+                "status": status,
+                "client_ip": _first_key(obj, _JSON_IP_KEYS),
+                "user_agent": _first_key(obj, _JSON_UA_KEYS),
+                "duration": _first_key(obj, _JSON_DURATION_KEYS),
+            }
+        return None
+    match = _ACCESS_COMMON_RE.match(text)
+    if not match:
+        return None
+    status = int(match.group("status"))
+    if not 100 <= status <= 599:
+        return None
+    return {
+        "method": match.group("method"),
+        "path": match.group("path"),
+        "status": status,
+        "client_ip": match.group("client_ip"),
+        "user_agent": match.groupdict().get("ua"),
+        "duration": None,
+    }
+
+
+def access_log_severity(status: int) -> str | None:
+    """Status-based severity override, or None to keep existing classification.
+    >=500 -> error; 401/403/404/429 -> warning; everything else unchanged."""
+    if status >= 500:
+        return "error"
+    if status in _WARNING_STATUSES:
+        return "warning"
+    return None
 
 
 def route_scope(namespace: str, infra_namespaces: tuple[str, ...]) -> str:
@@ -77,11 +169,21 @@ def make_record(
         ts_epoch = fallback_epoch
 
     scope = "security" if source_scope == "security" else route_scope(parsed.namespace, infra_namespaces)
+    severity_bucket = source_bucket
+    http_meta: str | None = None
+    # Access-log re-classification is additive and skips security (Falco) lines.
+    if scope != "security":
+        fields = access_log_fields(parsed.message)
+        if fields is not None:
+            http_meta = json.dumps(fields, separators=(",", ":"))
+            override = access_log_severity(int(fields["status"]))
+            if override is not None:
+                severity_bucket = override
     return {
         "timestamp": parsed.timestamp,
         "ts_epoch": ts_epoch,
         "ts_fallback": ts_fallback,
-        "severity_bucket": source_bucket,
+        "severity_bucket": severity_bucket,
         "scope": scope,
         "namespace": parsed.namespace,
         "pod": parsed.pod,
@@ -92,4 +194,5 @@ def make_record(
         "source_etag": source_etag,
         "line_number": line_number,
         "is_falco": 1 if scope == "security" else 0,
+        "http_meta": http_meta,
     }

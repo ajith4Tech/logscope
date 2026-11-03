@@ -56,7 +56,7 @@ from .ai_summary import (
 )
 from .alerts import AlertEngine, AlertRules, RuleError, backtest
 from .channels import ChannelError, ChannelStore
-from .config import AppConfig, load_app_config, source_prefixes
+from .config import AppConfig, falco_warnings, load_app_config, prefix_root, source_prefixes
 from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, meta_of
 from .ingest import S3Ingestor, _key_time_format
 from .insights import AnomalyStore, InsightsJob
@@ -86,6 +86,10 @@ _FTS_MIGRATION_PAUSE_SECS = 0.05
 # this backoff instead of waiting for a restart.
 _FTS_MIGRATION_RETRY_SECS = 60
 _FTS_MIGRATION_RETRY_MAX_SECS = 1800
+_OPTIMIZE_INTERVAL_SECS = 3600
+# Off-peak hours (UTC) for the daily full-text merge, and its time budget.
+_FTS_MERGE_HOURS_UTC = frozenset({2, 3, 4})
+_FTS_MERGE_BUDGET_SECS = 600
 # Filter values longer than this are rejected (400); searches are short.
 _MAX_QUERY_PARAM_CHARS = 1000
 # Search modes: "phrase" (default; words matched as written) or "raw" FTS5
@@ -687,13 +691,13 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/styles.css":
             self._serve_asset("styles.css", "text/css; charset=utf-8")
             return
+        if parsed.path == "/favicon.svg":
+            self._serve_asset("favicon.svg", "image/svg+xml")
+            return
         if parsed.path == "/api/status":
             self._send_json(app.status())
             return
         if parsed.path == "/api/facets":
-        if parsed.path == "/favicon.svg":
-            self._serve_asset("favicon.svg", "image/svg+xml")
-            return
             self._send_json(app.storage.query_facets(_query_params(params)))
             return
         if parsed.path == "/api/fields":
@@ -971,6 +975,7 @@ class WebApp:
         self._thread = threading.Thread(target=self._ingest_loop, daemon=True)
         self._fts_thread = threading.Thread(target=self._fts_migration_loop, daemon=True)
         self._ts_thread = threading.Thread(target=self._ts_backfill_loop, daemon=True)
+        self._rollup_thread = threading.Thread(target=self._rollup_rebuild_loop, daemon=True)
         self._started_at = time.monotonic()
         self._last_poll_finished: float | None = None
         self.anomaly_store = AnomalyStore(cfg.webapp.db_path)
@@ -1034,7 +1039,8 @@ class WebApp:
         self.mute_limiter = ClientRateLimiter(max_failures=_MUTES_PER_MINUTE)
         # Automatic anomaly summaries run here, never in the detection loop.
         self.summary_worker = SummaryWorker(
-            self.explainer, self.anomaly_store, min_urgency=lambda: self.cfg.ai.auto_summary_min_urgency)
+            self.explainer, self.anomaly_store, min_urgency=lambda: self.cfg.ai.auto_summary_min_urgency,
+            triage_min_urgency=lambda: self.cfg.ai.auto_triage_min_urgency)
         # kubectl actions run with this process's credentials and the HTTP API
         # has no auth of its own, so they are opt-in: LOGSCOPE_ACTIONS_ENABLED=true.
         self.actions_enabled = _env_flag("LOGSCOPE_ACTIONS_ENABLED", False)
@@ -1057,6 +1063,8 @@ class WebApp:
             _env_int("LOGSCOPE_AI_RATE_LIMIT_PER_MINUTE", _DEFAULT_AI_RATE_LIMIT_PER_MINUTE)
         )
         self._last_prune_at: float | None = None
+        self._last_optimize_at: float | None = None
+        self._last_fts_merge_day = None
         self._db_busy_since: float | None = None
 
     def start(self) -> None:
@@ -1065,6 +1073,13 @@ class WebApp:
             self._fts_thread.start()
         if self.storage.ts_backfill_pending:
             self._ts_thread.start()
+        if not self.storage.rollup_ready:
+            self._rollup_thread.start()
+        try:  # cheap; a database without statistics gets a full ANALYZE from the ingest loop
+            self.storage.optimize()
+            self._last_optimize_at = time.monotonic()
+        except sqlite3.Error as exc:
+            logger.warning("PRAGMA optimize at start failed: %s", exc)
         if self.cfg.insights.enabled:
             self.insights.start()
         self.summary_worker.start()
@@ -1078,6 +1093,8 @@ class WebApp:
             self._fts_thread.join(timeout=5)
         if self._ts_thread.is_alive():
             self._ts_thread.join(timeout=5)
+        if self._rollup_thread.is_alive():
+            self._rollup_thread.join(timeout=5)
         if self.cfg.insights.enabled:
             self.insights.stop()
         self.summary_worker.stop()
@@ -1089,56 +1106,74 @@ class WebApp:
             try:
                 self.ingestor.ingest_once()
                 self._maybe_prune()
+                self._maybe_maintain()
             except Exception:
                 logger.exception("Ingest loop iteration failed")
             self._last_poll_finished = time.monotonic()
             self._stop.wait(self.cfg.webapp.poll_interval_secs)
 
-    def _fts_migration_loop(self) -> None:
-        """Move a database created by an older version to the smaller
-        full-text index in the background. Searches keep using the old index
-        until the swap; progress is committed per batch, so a restart resumes.
-        A failed step (e.g. disk full) is retried with backoff and reported
-        in /api/status storage.fts_migration.last_error."""
-        logger.info("Migrating the full-text index to external content (runs in the background)")
+    def _background_steps(self, what: str, step, error_attr: str) -> None:
+        """Run step() (True when finished) until done: each call commits and
+        releases the lock, so a restart resumes. A failed step (e.g. disk
+        full) is retried with backoff and reported in /api/status as
+        storage.<error_attr>."""
+        logger.info("%s (runs in the background)", what)
         retry = _FTS_MIGRATION_RETRY_SECS
         while not self._stop.is_set():
             try:
-                if self.storage.migrate_fts_step():
-                    self.storage.fts_migration_error = None
-                    return
+                finished = step()
             except sqlite3.Error as exc:
-                self.storage.fts_migration_error = f"{type(exc).__name__}: {exc}"[:300]
-                logger.warning("Full-text index migration paused (%s); retrying in %ds", exc, retry)
+                setattr(self.storage, error_attr, f"{type(exc).__name__}: {exc}"[:300])
+                logger.warning("%s paused (%s); retrying in %ds", what, exc, retry)
                 self._stop.wait(retry)
                 retry = min(retry * 2, _FTS_MIGRATION_RETRY_MAX_SECS)
                 continue
-            self.storage.fts_migration_error = None
+            setattr(self.storage, error_attr, None)
+            if finished:
+                logger.info("%s: done", what)
+                return
             retry = _FTS_MIGRATION_RETRY_SECS
             self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
 
+    def _fts_migration_loop(self) -> None:
+        """Move a database created by an older version to the smaller
+        full-text index; searches keep using the old index until the swap."""
+        self._background_steps("Migrating the full-text index to external content",
+                               self.storage.migrate_fts_step, "fts_migration_error")
+
     def _ts_backfill_loop(self) -> None:
-        """Give rows written by an older version their ts_epoch, in batches
-        (storage.TS_BACKFILL_BATCH) that each commit and release the lock;
-        a restart resumes. Failures retry with backoff and are reported in
-        /api/status storage.ts_backfill.last_error."""
-        logger.info("Backfilling ts_epoch for existing records (runs in the background)")
-        retry = _FTS_MIGRATION_RETRY_SECS
-        while not self._stop.is_set():
-            try:
-                if not self.storage.backfill_ts_step():
-                    self.storage.ts_backfill_error = None
-                    logger.info("ts_epoch backfill complete")
-                    return
-            except sqlite3.Error as exc:
-                self.storage.ts_backfill_error = f"{type(exc).__name__}: {exc}"[:300]
-                logger.warning("ts_epoch backfill paused (%s); retrying in %ds", exc, retry)
-                self._stop.wait(retry)
-                retry = min(retry * 2, _FTS_MIGRATION_RETRY_MAX_SECS)
-                continue
-            self.storage.ts_backfill_error = None
-            retry = _FTS_MIGRATION_RETRY_SECS
-            self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)  # let other threads take the lock
+        """Give rows written by an older version their ts_epoch
+        (storage.TS_BACKFILL_BATCH rows per step)."""
+        self._background_steps("Backfilling ts_epoch for existing records",
+                               lambda: not self.storage.backfill_ts_step(), "ts_backfill_error")
+
+    def _rollup_rebuild_loop(self) -> None:
+        """Build the hourly rollup from rows written before it existed
+        (storage.ROLLUP_REBUILD_BATCH ids per step). Count queries use raw
+        rows until it is complete."""
+        self._background_steps("Building the hourly rollup", self.storage.rebuild_rollup_step, "rollup_error")
+
+    def _maybe_maintain(self) -> None:
+        """Planner statistics and full-text index upkeep, from the ingest
+        loop: PRAGMA optimize every hour, a sampled ANALYZE after large
+        ingests, and the FTS merge (an incremental 'optimize') once a day in
+        the off-peak hours, in short locked steps."""
+        now = time.monotonic()
+        if self.storage.analyze_due:
+            self.storage.optimize(analyze=True)
+            self._last_optimize_at = now
+        elif self._last_optimize_at is None or now - self._last_optimize_at >= _OPTIMIZE_INTERVAL_SECS:
+            self.storage.optimize()
+            self._last_optimize_at = now
+        today = datetime.now(timezone.utc)
+        if today.hour in _FTS_MERGE_HOURS_UTC and self._last_fts_merge_day != today.date():
+            self._last_fts_merge_day = today.date()
+            deadline = now + _FTS_MERGE_BUDGET_SECS
+            steps = 0
+            while not self._stop.is_set() and time.monotonic() < deadline and self.storage.fts_merge_step():
+                steps += 1
+                self._stop.wait(_FTS_MIGRATION_PAUSE_SECS)
+            logger.info("Full-text index merge: %d step(s)", steps)
 
     def _maybe_prune(self) -> None:
         days = self.cfg.webapp.retention_days
@@ -1200,6 +1235,11 @@ class WebApp:
         try:
             status = self.storage.get_status()
             status["ingest"] = self.ingest_health(status)
+            root = prefix_root(self.cfg)
+            security, other = self.storage.object_counts(root)
+            status["config_warnings"] = falco_warnings(
+                falco_enabled=self.cfg.falco_namespace is not None, security_objects=security,
+                other_objects=other, root=root)
         except sqlite3.Error as exc:
             logger.warning("Status query failed: %s", exc)
             status = {

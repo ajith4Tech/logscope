@@ -26,6 +26,11 @@ from .notify import anomaly_urgency
 logger = logging.getLogger(__name__)
 
 FEATURE = "anomaly_auto_summary"
+# Auto-triage: a narrower, on-by-default path through the same queue. Only
+# these anomaly types are triaged (Falco novelty already carries its own
+# context, so it is never auto-triaged — avoids doubling cost on noisy rules).
+TRIAGE_FEATURE = "auto_triage"
+TRIAGE_TYPES = frozenset({"message_frequency", "error_rate_spike", "severity_shift"})
 MAX_WORKERS = 2
 BATCH_SIZE = 5
 MAX_QUEUE = 100
@@ -47,10 +52,12 @@ def _window(anomaly: dict[str, Any]) -> str:
 
 class SummaryWorker:
     def __init__(self, explainer: Explainer, store: Any, *, min_urgency: Callable[[], str],
+                 triage_min_urgency: Callable[[], str] | None = None,
                  workers: int = MAX_WORKERS, batch_size: int = BATCH_SIZE, max_queue: int = MAX_QUEUE):
         self.explainer = explainer
         self.store = store
         self._min_urgency = min_urgency
+        self._triage_min_urgency = triage_min_urgency
         self.workers = max(1, workers)
         self.batch_size = max(1, batch_size)
         self.max_queue = max(1, max_queue)
@@ -67,10 +74,21 @@ class SummaryWorker:
     # -- intake (called from the insights loop; never blocks on a provider) ------
 
     def wants(self, anomaly: dict[str, Any]) -> bool:
-        if not self.explainer.settings.enabled(FEATURE):
-            return False
-        threshold = URGENCY_ORDER.get(self._min_urgency(), URGENCY_ORDER["urgent"])
-        return URGENCY_ORDER.get(anomaly_urgency(anomaly, _evidence(anomaly)), 0) >= threshold
+        settings = self.explainer.settings
+        urgency = URGENCY_ORDER.get(anomaly_urgency(anomaly, _evidence(anomaly)), 0)
+        # Auto-summary: every anomaly type, at auto_summary_min_urgency (opt-in).
+        auto_summary = settings.enabled(FEATURE) and urgency >= URGENCY_ORDER.get(
+            self._min_urgency(), URGENCY_ORDER["urgent"]
+        )
+        # Auto-triage: rate/shift types only, at auto_triage_min_urgency (on by
+        # default). new_falco_rule is never triaged.
+        auto_triage = (
+            self._triage_min_urgency is not None
+            and settings.enabled(TRIAGE_FEATURE)
+            and str(anomaly.get("type") or "") in TRIAGE_TYPES
+            and urgency >= URGENCY_ORDER.get(self._triage_min_urgency(), URGENCY_ORDER["high"])
+        )
+        return auto_summary or auto_triage
 
     def enqueue(self, anomalies: list[dict[str, Any]]) -> int:
         added = 0

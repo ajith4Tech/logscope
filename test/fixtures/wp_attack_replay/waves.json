@@ -1,0 +1,55 @@
+{
+  "_comment": "Redacted replay of the WordPress detection test (test-results/wp-detection.md). Shapes kept; IPs/timestamps are fixture values. 'message' is a str.format template over i (0-based) and ip. Times are NOW-relative; see test_wp_regression.py. bucket = the severity Vector would assign (what Logscope receives); access-log lines are re-classified from their HTTP status at ingest.",
+  "now": "2026-11-02T10:55:00Z",
+  "specs": [
+    {
+      "name": "history_marker",
+      "scope": "infra", "bucket": "info",
+      "namespace": "kube-system", "pod": "coredns-54996dc9b4-v64rb", "container": "coredns",
+      "count": 1, "start": "2026-10-31T08:00:00Z", "step_s": 1,
+      "message": "[INFO] ready"
+    },
+    {
+      "name": "startup_db_errors",
+      "scope": "namespace", "bucket": "error",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "wordpress",
+      "count": 11, "start": "2026-11-02T09:05:00Z", "step_s": 3,
+      "message": "MySQL Connection Error: (2002) Connection refused - retrying ({i})"
+    },
+    {
+      "name": "startup_shell",
+      "scope": "security", "bucket": "info",
+      "namespace": "falco", "pod": "falco-vqfb4", "container": "falco",
+      "count": 1, "start": "2026-11-02T09:05:05Z", "step_s": 1,
+      "message": "Run shell untrusted: 09:05:05.123456789: Notice Shell spawned by untrusted binary (parent_exe=apache2 k8s.ns=sec-test k8s.pod=wordpress-7d79967bc8-qjt4c)"
+    },
+    {
+      "name": "idle_baseline",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 20, "start": "2026-11-02T09:15:00Z", "step_s": 120,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:09:15:{i:02d} +0000] \"GET / HTTP/1.1\" 200 5120 \"-\" \"Mozilla/5.0 (baseline)\""
+    },
+    {
+      "name": "A_enum",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 40, "start": "2026-11-02T10:42:00Z", "step_s": 0,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:10:42:00 +0000] \"GET /?author={i} HTTP/1.1\" 404 1234 \"-\" \"attack-probe/1.0\""
+    },
+    {
+      "name": "B_bruteforce",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 400, "start": "2026-11-02T10:46:00Z", "step_s": 0,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:10:46:00 +0000] \"POST /wp-login.php HTTP/1.1\" 200 3598 \"-\" \"attack-probe/1.0\""
+    },
+    {
+      "name": "C_cve",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 3, "start": "2026-11-02T10:51:00Z", "step_s": 0,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:10:51:00 +0000] \"POST /?rest_route=/wp/v2/posts/1&id=1abc HTTP/1.1\" 200 180 \"-\" \"attack-probe/1.0\""
+    }
+  ]
+}

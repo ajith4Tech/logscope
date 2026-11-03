@@ -62,7 +62,12 @@ FIELD_ENV = {
 SETTINGS_FIELDS = tuple(FIELD_ENV)
 CLEAR_KEY = "__clear__"
 
-FEATURES = ("explain_line", "explain_filtered", "anomaly_auto_summary", "anomaly_manual_summary", "nl_filters")
+FEATURES = ("explain_line", "explain_filtered", "anomaly_auto_summary", "anomaly_manual_summary", "nl_filters",
+            "auto_triage")
+# Everything on by default except anomaly_auto_summary (which summarizes every
+# anomaly type and so is opt-in). auto_triage is a narrower, on-by-default
+# version: it triages only rate/shift anomalies that transition to firing at or
+# above webapp.ai.auto_triage_min_urgency, reusing the same worker and budgets.
 DEFAULT_FLAGS = {feature: feature != "anomaly_auto_summary" for feature in FEATURES}
 # Metered but outside the feature flags and per-feature budgets.
 TEST_FEATURE = "settings_test"
