@@ -94,7 +94,7 @@ def _app(tmp_path, *, ai: dict | None = None, **alerts) -> WebApp:
     app.alerts._started = NOW
     app.clock = clock
     app.sent = Sent()
-    app.alerts.deliverer = Deliverer(sleep=lambda s: None, guarded=app.sent.guarded, trusted=app.sent.trusted)
+    app.alerts.deliverer = Deliverer(guarded=app.sent.guarded, trusted=app.sent.trusted)
     _listed(app, NOW)
     return app
 
@@ -434,7 +434,7 @@ def test_delivery_to_each_channel_type_with_hmac(tmp_path, monkeypatch):
     hook = Hook()
     try:
         app = _app(tmp_path, public_url="https://logscope.example.com")
-        app.alerts.deliverer = Deliverer(sleep=lambda s: None)
+        app.alerts.deliverer = Deliverer()
         secret = "s3cret-for-hmac-signing-0123"
         ids = [app.alert_channels.create({"name": "mm", "type": "mattermost", "url": hook.url("/mm")})["id"],
                app.alert_channels.create({"name": "slack", "type": "slack", "url": hook.url("/slack")})["id"],
@@ -461,31 +461,29 @@ def test_delivery_to_each_channel_type_with_hmac(tmp_path, monkeypatch):
         hook.close()
 
 
-def test_delivery_retries_then_records_the_failure(tmp_path, monkeypatch):
+def test_one_send_per_pass_and_the_durable_schedule_retries(tmp_path, monkeypatch):
     monkeypatch.setenv(channels.ALLOWED_HOSTS_ENV, "127.0.0.1")
     hook = Hook(codes=[500, 503])
-    delays = []
     try:
         app = _app(tmp_path)
-        app.alerts.deliverer = Deliverer(sleep=delays.append)
+        app.alerts.deliverer = Deliverer()
         channel = app.alert_channels.create({"name": "hook", "type": "webhook", "url": hook.url()})
-        ok_rule = _fire(app, [channel["id"]])
-        assert len(hook.requests) == 3 and delays == [1.0, 2.0]  # two retries with backoff, then 200
-        assert _events(app, ok_rule["id"])[0]["notified"] == 1
-        app.alert_rules.delete(ok_rule["id"])
-        delays.clear()
-        hook.codes = [500] * 5
-        failed = _fire(app, [channel["id"]])
-        assert len(hook.requests) == 3 + 5 and delays == [1.0, 2.0, 4.0, 8.0]
-        event = _events(app, failed["id"])[0]
-        # Still queued: durable delivery retries it later (see the backoff tests).
-        assert event["notified"] == 2 and event["attempts"] == 1
+        rule = _fire(app, [channel["id"]])
+        assert len(hook.requests) == 1                  # no in-process retries or sleeps
+        event = _events(app, rule["id"])[0]
+        assert (event["notified"], event["attempts"]) == (2, 1)
         assert event["error"] == f"channel {channel['id']}: HTTP 500"
-        # A permanent error is not retried.
+        app.clock.t += timedelta(seconds=30)
+        app.alerts.deliver_pending()                    # 503: still queued, next try in 60 s
+        assert len(hook.requests) == 2 and _events(app, rule["id"])[0]["attempts"] == 2
+        app.clock.t += timedelta(seconds=60)
+        app.alerts.deliver_pending()                    # 200
+        assert len(hook.requests) == 3 and _events(app, rule["id"])[0]["notified"] == 1
+        # A permanent error costs one request too.
         hook.codes = [404]
         before = len(hook.requests)
-        assert Deliverer(sleep=delays.append).send(app.alert_channels.get(channel["id"]),
-                                                   app.alerts.message(app.alert_rules.get(failed["id"]), event))
+        assert Deliverer().send(app.alert_channels.get(channel["id"]),
+                                app.alerts.message(app.alert_rules.get(rule["id"]), event)) == "HTTP 404"
         assert len(hook.requests) == before + 1
     finally:
         hook.close()
@@ -552,7 +550,7 @@ def test_webhook_urls_never_in_responses_or_logs(tmp_path, served, monkeypatch, 
     hook = Hook(codes=[500] * 20)
     try:
         app = _app(tmp_path)
-        app.alerts.deliverer = Deliverer(sleep=lambda s: None)
+        app.alerts.deliverer = Deliverer()
         server = served(app)
         marker = "UIHOOKSECRET4242abcdef"
         status, created = _request(server, "POST", "/api/alerts/channels", body=json.dumps(
