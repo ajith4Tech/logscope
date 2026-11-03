@@ -27,7 +27,7 @@ only has empty examples.
 
 | This kit (Helm `deploy/values-agent.yaml`) | Local file kit |
 |---|---|
-| Extra hostPath for checkpoints (`paths.checkpoint`, DirectoryOrCreate) | Chart default `/var/lib/vector` mount — do not duplicate |
+| Checkpoints in the chart's own `data` hostPath volume, at `paths.checkpoint` (`persistence.hostPath.path`) | The same |
 | S3 sink when `sinks.s3.enabled` | File sink when `sinks.file.enabled` |
 | Bucket and region written literally into the sink (Vector 0.57+ does not interpolate `${ENV}` by default; the `AWS_REGION` / `S3_BUCKET` env vars are set but not read by the config). Keys from the Secret `sinks.s3.secret_name` as env, or IRSA annotation | No AWS env |
 

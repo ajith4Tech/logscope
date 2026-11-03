@@ -2,6 +2,7 @@
 # image-multi, and nothing touches a cluster (k3s-import only prints commands).
 #
 #   make test                 pytest
+#   make loadtest ROWS=N      synthetic load test (scripts/loadtest.py; default 1000000 rows)
 #   make render               generate deploy/*.yaml from config.yaml (gitignored)
 #   make bin                  onefile binary -> dist/logscope-<version>-linux-<arch>
 #   make image                container image for this machine's arch (--load)
@@ -35,10 +36,10 @@ BUILD_ARGS = --build-arg VERSION=$(VERSION) --build-arg REVISION=$(REVISION) \
              --build-arg CREATED=$(CREATED) --build-arg SOURCE=$(SOURCE) \
              --build-arg INCLUDE_KUBECTL=$(INCLUDE_KUBECTL)
 
-.PHONY: help deps-lock test render bin image image-multi smoke k3s-import sbom scan version
+.PHONY: help deps-lock test loadtest render bin image image-multi smoke k3s-import sbom scan version
 
 help:
-	@sed -n '2,13p' Makefile | sed 's/^# \{0,1\}//'
+	@sed -n '2,14p' Makefile | sed 's/^# \{0,1\}//'
 	@echo
 	@echo "VERSION=$(VERSION) IMAGE=$(IMAGE) TAG=$(TAG) ARCH=$(ARCH)"
 
@@ -53,6 +54,10 @@ deps-lock:
 
 test:
 	$(PYTHON) -m pytest -q
+
+ROWS ?= 1000000
+loadtest:
+	$(PYTHON) scripts/loadtest.py --rows $(ROWS)
 
 # Rendered outputs hold real cluster/S3 config; they are gitignored.
 render:

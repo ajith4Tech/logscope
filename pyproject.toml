@@ -16,6 +16,9 @@ dependencies = ["PyYAML>=6.0", "boto3>=1.28", "cryptography>=42"]
 
 [project.optional-dependencies]
 anthropic = ["anthropic"]
+# Development only (never in the image): the test suite and the load test's
+# S3 ingest run against moto (scripts/loadtest.py).
+test = ["pytest", "moto[s3]>=5"]
 
 [project.scripts]
 logscope = "logscope.cli:main"
@@ -29,6 +32,10 @@ webapp = ["ui/index.html", "ui/app.js", "ui/styles.css", "ui/favicon.svg"]
 
 [tool.setuptools.dynamic]
 version = { attr = "logscope.version.__version__" }
+
+[tool.pytest.ini_options]
+markers = ["slow: long-running (the load test); run with -m slow"]
+addopts = "-m 'not slow'"
 
 [tool.ruff]
 target-version = "py310"
@@ -57,6 +64,8 @@ ignore = [
 # parameter of the same name is how pytest injects them).
 "test/**" = ["S101", "S104", "S105", "S106", "S108", "S311", "S603", "S607", "E402", "F811"]
 "scripts/test_*.py" = ["S101", "S105", "S603", "S607", "E402"]
+# Synthetic data for the load test: seeded pseudo-random on purpose.
+"scripts/loadtest.py" = ["S311"]
 # Entry-point shims put the repository on sys.path before importing.
 "scripts/*.py" = ["E402"]
 

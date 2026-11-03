@@ -12,11 +12,13 @@ exist only here.
 
 The same commands are available as `logscope db ...` (binary and image).
 
---db defaults to $LOGSCOPE_WEBAPP_DB_PATH (set to /data/logscope.sqlite by the
-Helm chart). With --state, backup / verify / restore work on the durable state
-database (saved views) instead: --db then defaults to
-$LOGSCOPE_WEBAPP_STATE_DB_PATH, else $XDG_DATA_HOME/logscope/state.sqlite, and
-copies are created with mode 0600. Nothing is ever deleted or overwritten:
+--db defaults to the server's cache: $LOGSCOPE_WEBAPP_DB_PATH (set to
+/data/logscope.sqlite by the Helm chart), else webapp.backend.db_path of
+--config (default: the server's default config, if present), else
+$XDG_CACHE_HOME/logscope/cache.sqlite. With --state, backup / verify / restore
+work on the durable state database (saved views) instead: --db then defaults to
+$LOGSCOPE_WEBAPP_STATE_DB_PATH, else webapp.backend.state_db_path, else
+$XDG_DATA_HOME/logscope/state.sqlite, and copies are created with mode 0600. Nothing is ever deleted or overwritten:
 backup refuses an existing destination, and restore keeps the replaced database as
 <db>.pre-restore-<UTC timestamp> (plus its -wal/-shm files, if present). Restore
 copies and verifies the backup beside the database before swapping it in, so a
@@ -34,9 +36,13 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yaml
+
+from logscope.resources import default_server_config
+
 from .state import REQUIRED_TABLES as _STATE_REQUIRED_TABLES
 from .state import default_state_db_path, env_state_db_path
-from .storage import SQLITE_BUSY_TIMEOUT_SECS
+from .storage import CACHE_DB_ENV, SQLITE_BUSY_TIMEOUT_SECS, default_cache_db_path
 
 _REQUIRED_TABLES = ("records", "ingested_objects", "app_state")
 _COUNTED_TABLES = ("records", "ingested_objects", "anomalies")
@@ -276,18 +282,40 @@ def compact(db: Path) -> dict:
     return {"path": str(db), "bytes_before": before, "bytes_after": db.stat().st_size, **verify(db)}
 
 
-def _default_db(state: bool = False) -> Path | None:
+def _configured_path(config: Path | None, key: str) -> Path | None:
+    """webapp.backend.<key> from a config file, without the full validation
+    of load_app_config (a partial config is enough to find a database)."""
+    if config is None or not config.is_file():
+        return None
+    try:
+        raw = yaml.safe_load(config.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise ValueError(f"cannot read {config}: {exc}") from None
+    backend = ((raw.get("webapp") or {}).get("backend") or {}) if isinstance(raw, dict) else {}
+    value = backend.get(key) if isinstance(backend, dict) else None
+    return Path(str(value)).expanduser() if value else None
+
+
+def _default_db(state: bool = False, config: Path | None = None) -> Path:
+    """Like the server: the environment variable, else the config file's
+    webapp.backend path, else the default location."""
     if state:
-        return env_state_db_path() or default_state_db_path()
-    value = os.environ.get("LOGSCOPE_WEBAPP_DB_PATH", "").strip()
-    return Path(value) if value else None
+        return env_state_db_path() or _configured_path(config, "state_db_path") or default_state_db_path()
+    value = os.environ.get(CACHE_DB_ENV, "").strip()
+    if value:
+        return Path(value).expanduser()
+    return _configured_path(config, "db_path") or default_cache_db_path()
 
 
 def main(argv: list[str] | None = None, prog: str = "python -m webapp.api.dbtool") -> int:
     parser = argparse.ArgumentParser(prog=prog, description=__doc__.split("\n\n")[0])
     parser.add_argument("--db", type=Path, default=None,
-                        help="database file (default: $LOGSCOPE_WEBAPP_DB_PATH; with --state, "
-                             "$LOGSCOPE_WEBAPP_STATE_DB_PATH or $XDG_DATA_HOME/logscope/state.sqlite)")
+                        help="database file (default: $LOGSCOPE_WEBAPP_DB_PATH, else webapp.backend.db_path of "
+                             "--config, else $XDG_CACHE_HOME/logscope/cache.sqlite; with --state, "
+                             "$LOGSCOPE_WEBAPP_STATE_DB_PATH, else webapp.backend.state_db_path, else "
+                             "$XDG_DATA_HOME/logscope/state.sqlite)")
+    parser.add_argument("--config", type=Path, default=None,
+                        help=f"config file for the default paths (default: {default_server_config()} if present)")
     state_help = "the durable state database (saved views) instead of the log cache"
     sub = parser.add_subparsers(dest="command", required=True)
     p_backup = sub.add_parser("backup", help="consistent online copy to a new file")
@@ -308,13 +336,11 @@ def main(argv: list[str] | None = None, prog: str = "python -m webapp.api.dbtool
     args = parser.parse_args(argv)
 
     state = bool(getattr(args, "state", False))
-    db = args.db or _default_db(state)
     try:
+        db = args.db or _default_db(state, args.config or default_server_config())
         if args.command == "verify":
             report = verify(args.path, state=state)
         else:
-            if db is None:
-                parser.error("--db is required (or set LOGSCOPE_WEBAPP_DB_PATH)")
             if args.command == "backup":
                 report = backup(db, args.dest, state=state)
             elif args.command == "restore":

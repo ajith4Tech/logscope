@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 from .version import __revision__, __version__
 
@@ -236,6 +237,43 @@ def _report_s3(report: _Report, cfg) -> None:
         report.ok("s3-endpoint", f"override {endpoint}")
 
 
+def _report_falco(report: _Report, cfg: Any, config: Path) -> None:
+    """Warn when this config's falco.enabled disagrees with the rendered
+    Vector config (deploy/vector.yaml next to it) or with the objects already
+    in the local cache. Read-only: the cache is opened with mode=ro."""
+    import yaml
+
+    from webapp.api.config import falco_warnings, prefix_root
+    from webapp.api.storage import count_objects_under
+
+    vector_falco = None
+    rendered = config.parent / "deploy" / "vector.yaml"
+    try:
+        doc = yaml.safe_load(rendered.read_text()) if rendered.is_file() else None
+        if isinstance(doc, dict):
+            vector_falco = "falco_security" in (doc.get("transforms") or {})
+    except (OSError, yaml.YAMLError):
+        vector_falco = None
+    root = prefix_root(cfg)
+    security = other = 0
+    if cfg.webapp.db_path.is_file():
+        try:
+            conn = sqlite3.connect(f"file:{cfg.webapp.db_path}?mode=ro", uri=True, timeout=2)
+            try:
+                security, other = count_objects_under(conn, root + "security/")
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass  # a cache that cannot be read is reported by the db check
+    warnings = falco_warnings(falco_enabled=cfg.falco_namespace is not None, security_objects=security,
+                              other_objects=other, root=root, vector_falco=vector_falco)
+    for warning in warnings:
+        report.warn("falco", warning)
+    if not warnings:
+        report.ok("falco", f"falco.enabled is {str(cfg.falco_namespace is not None).lower()}; "
+                           f"{root}security/ is always ingested")
+
+
 def selfcheck(config: Path) -> int:
     """Local readiness checks; never contacts S3 or an AI provider."""
     report = _Report()
@@ -262,6 +300,7 @@ def selfcheck(config: Path) -> int:
         (report.warn if reason else report.ok)("tmp", f"{tmp} {'not writable: ' + reason if reason else 'writable'}")
         _report_ai(report, cfg)
         _report_s3(report, cfg)
+        _report_falco(report, cfg, config)
     print("selfcheck: " + ("FAILED" if report.failed else "passed"))
     return 1 if report.failed else 0
 
