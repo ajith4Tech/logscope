@@ -19,8 +19,6 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -267,17 +265,43 @@ def test_new_falco_rule_is_never_auto_triaged(tmp_path):
 
 # ── Part 5: the remaining gap stays visible ──────────────────────────────────
 
-@pytest.mark.xfail(reason="No web-attack signature pack yet: a content-injection "
-                          "PoC (few requests, HTTP 200) is not auto-detected.",
-                   strict=True)
-def test_wave_c_cve_is_detected(tmp_path):
+def test_wave_c_cve_identified_by_signature(tmp_path):
+    # Wave C is only 3 requests (below the frequency floor), so no volume anomaly
+    # fires -- that half of the gap remains (needs web->runtime correlation). But
+    # the web-attack signature pack now correctly identifies the CVE shape, which
+    # is what the real test showed the AI could already do manually.
+    from webapp.api.signatures import SignatureKB, load_rules
+    store, job, now, records = _replay(tmp_path)
+    job.detect_once(now)
+    kb = SignatureKB(load_rules())
+    matches = [kb.match_record(r) for r in records["C_cve"]]
+    assert matches and all(m is not None for m in matches)
+    assert matches[0].id == "wp-rest-content-injection"
+    assert matches[0].attack_type == "content-injection"
+    assert matches[0].confidence == "high"
+    # Still no volume anomaly for it (the remaining, documented gap).
+    cve_anoms = [a for a in _anomalies(store, type="message_frequency", namespace="sec-test")
+                 if "rest_route" in str(a.get("rule_key", ""))]
+    assert cve_anoms == []
+
+
+def test_firing_anomaly_carries_web_signature(tmp_path):
+    # Part 2.2: a firing rate anomaly whose sample lines match a web-attack
+    # signature surfaces it (and its attack_type) through the existing
+    # anomaly_template_summary attach point -- no AI call, any urgency.
+    from webapp.api.explain import anomaly_template_summary
+    from webapp.api.signatures import SignatureKB, load_rules
     store, job, now, _ = _replay(tmp_path)
     job.detect_once(now)
-    # Wave C is 3 requests at HTTP 200: below the frequency floor and carrying no
-    # attack signature, so nothing fires. This xfail documents the open gap.
-    cve = [a for a in _anomalies(store, type="message_frequency", namespace="sec-test")
-           if "rest_route" in str(a.get("rule_key", ""))]
-    assert cve
+    kb = SignatureKB(load_rules())
+
+    warn = _anomalies(store, type="message_frequency", severity="warning")[0]  # Wave A: author 404s
+    summ = anomaly_template_summary(kb, warn)
+    assert summ["signature"] and summ["signature"]["id"] == "wp-author-enumeration"
+    assert summ["attack_type"] == "enumeration"
+
+    info = _anomalies(store, type="message_frequency", severity="info")[0]  # Wave B: wp-login flood
+    assert anomaly_template_summary(kb, info)["attack_type"] == "brute-force"
 
 
 # ── before/after scorecard (printed with -s) ─────────────────────────────────
@@ -292,7 +316,7 @@ def test_print_before_after_table(tmp_path):
     rows = [
         ("Wave A (enum, 404 flood)", "no", "yes (message_frequency/warning)", "Part 1+2"),
         ("Wave B (brute force, 400x)", "no", "yes (message_frequency, 1 template x400)", "Part 1"),
-        ("Wave C (CVE PoC)", "no", "no (documented gap, xfail)", "needs signatures"),
+        ("Wave C (CVE PoC)", "no", "signature match: wp-rest-content-injection", "Part 2 (sig pack)"),
         ("Start-up DB-retry errors", "FALSE POSITIVE", "suppressed", "Part 3"),
         ("Start-up entrypoint shell", "FALSE POSITIVE", "suppressed_cold_start", "Part 3"),
         ("Auto-triage of warning spike", "no", "ai_meta attached", "Part 4"),

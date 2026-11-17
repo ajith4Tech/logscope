@@ -27,6 +27,7 @@ datas = [(str(ROOT / "webapp" / "ui" / name), "webapp/ui") for name in ("index.h
 datas.append((str(ROOT / "config.example.yaml"), "."))  # `logscope render` fallback config
 # Built-in log signatures, read next to webapp/api/signatures.py.
 datas.append((str(ROOT / "webapp" / "api" / "signatures.yaml"), "webapp/api"))
+datas.append((str(ROOT / "webapp" / "api" / "signatures_web.yaml"), "webapp/api"))
 # botocore/boto3 service models and endpoint data are JSON files, not imports.
 datas += collect_data_files("botocore") + collect_data_files("boto3")
 

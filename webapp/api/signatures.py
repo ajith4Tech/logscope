@@ -20,7 +20,13 @@ import yaml
 from .actions import describe_action, resolve_action, step_execution_fields
 
 BUILTIN_PATH = Path(__file__).with_name("signatures.yaml")
+# Web-attack signatures live in their own file, loaded after the operational
+# ones. They match on the access-log request line (method/path/status/UA as
+# text) and carry a confidence and an attack_type for later correlation work.
+WEB_PATH = Path(__file__).with_name("signatures_web.yaml")
 PLACEHOLDERS = ("namespace", "pod", "container")
+_CONFIDENCES = ("low", "medium", "high")
+_ATTACK_TYPE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 # Values used to check that a rule's commands are valid once filled in.
 SAMPLE_VALUES = {"namespace": "default", "pod": "web-7d9f8b6c5d-x2kqp", "container": "app"}
 _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
@@ -47,6 +53,8 @@ class Signature:
     steps: tuple[dict[str, str], ...]
     message_re: re.Pattern[str] | None = None
     falco_rule_re: re.Pattern[str] | None = None
+    confidence: str = ""
+    attack_type: str = ""
     builtin: bool = True
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
@@ -107,7 +115,8 @@ def parse_rule(rule: Any, *, builtin: bool, index: int) -> Signature:
     where = f"signature #{index + 1}"
     if not isinstance(rule, dict):
         raise SignatureError(f"{where}: must be a mapping")
-    unknown = sorted(set(rule) - {"id", "match", "severity", "title", "explanation", "steps"})
+    unknown = sorted(set(rule) - {"id", "match", "severity", "title", "explanation", "steps",
+                                  "confidence", "attack_type"})
     if unknown:
         raise SignatureError(f"{where}: unknown key '{unknown[0]}'")
     rule_id = rule.get("id")
@@ -120,6 +129,12 @@ def parse_rule(rule: Any, *, builtin: bool, index: int) -> Signature:
     severity = str(rule.get("severity") or "info").lower()
     if severity not in _SEVERITIES:
         raise SignatureError(f"{where}: 'severity' must be one of {list(_SEVERITIES)}")
+    confidence = str(rule.get("confidence") or "").lower()
+    if confidence and confidence not in _CONFIDENCES:
+        raise SignatureError(f"{where}: 'confidence' must be one of {list(_CONFIDENCES)}")
+    attack_type = str(rule.get("attack_type") or "")
+    if attack_type and not _ATTACK_TYPE_RE.match(attack_type):
+        raise SignatureError(f"{where}: 'attack_type' must match {_ATTACK_TYPE_RE.pattern}")
     steps_raw = rule.get("steps") or []
     if not isinstance(steps_raw, list) or not 1 <= len(steps_raw) <= 5:
         raise SignatureError(f"{where}: 'steps' must list 1 to 5 steps")
@@ -138,17 +153,27 @@ def parse_rule(rule: Any, *, builtin: bool, index: int) -> Signature:
     return Signature(
         id=rule_id, title=_text(rule, "title", where), explanation=_text(rule, "explanation", where),
         severity=severity, steps=tuple(steps), message_re=_compile(match.get("message"), f"{where} match.message"),
-        falco_rule_re=_compile(match.get("falco_rule"), f"{where} match.falco_rule"), builtin=builtin, raw=rule,
+        falco_rule_re=_compile(match.get("falco_rule"), f"{where} match.falco_rule"),
+        confidence=confidence, attack_type=attack_type, builtin=builtin, raw=rule,
     )
 
 
-def load_rules(user_rules: Iterable[Any] = (), *, builtin_path: Path = BUILTIN_PATH) -> tuple[Signature, ...]:
-    """Built-in rules, then the operator's. Raises SignatureError on any invalid rule."""
-    with builtin_path.open("r", encoding="utf-8") as fh:
+def _load_builtin(path: Path) -> list[Any]:
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
-    builtin = data.get("rules") if isinstance(data, dict) else None
-    if not isinstance(builtin, list):
-        raise SignatureError(f"{builtin_path}: 'rules' must be a list")
+    rules = data.get("rules") if isinstance(data, dict) else None
+    if not isinstance(rules, list):
+        raise SignatureError(f"{path}: 'rules' must be a list")
+    return rules
+
+
+def load_rules(user_rules: Iterable[Any] = (), *, builtin_path: Path = BUILTIN_PATH,
+               web_path: Path = WEB_PATH) -> tuple[Signature, ...]:
+    """Built-in operational rules, then the web-attack pack, then the operator's.
+    Raises SignatureError on any invalid rule."""
+    builtin = _load_builtin(builtin_path) + _load_builtin(web_path)
     user = list(user_rules or [])
     if len(builtin) + len(user) > _MAX_RULES:
         raise SignatureError(f"At most {_MAX_RULES} signatures")
@@ -215,7 +240,9 @@ class SignatureKB:
             "steps": steps,
             "suggested_action": suggested,
             "source": "signature",
-            "signature": {"id": rule.id, "title": rule.title, "severity": rule.severity, "builtin": rule.builtin},
+            "signature": {"id": rule.id, "title": rule.title, "severity": rule.severity, "builtin": rule.builtin,
+                          **({"confidence": rule.confidence} if rule.confidence else {}),
+                          **({"attack_type": rule.attack_type} if rule.attack_type else {})},
         }
 
     def answer_many(self, matches: list[tuple[Signature, int, dict[str, Any]]], total: int) -> dict[str, Any]:

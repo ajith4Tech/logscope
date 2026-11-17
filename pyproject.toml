@@ -28,7 +28,7 @@ packages = ["logscope", "webapp", "webapp.api"]
 
 [tool.setuptools.package-data]
 webapp = ["ui/index.html", "ui/app.js", "ui/styles.css", "ui/favicon.svg"]
-"webapp.api" = ["signatures.yaml"]
+"webapp.api" = ["signatures.yaml", "signatures_web.yaml"]
 
 [tool.setuptools.dynamic]
 version = { attr = "logscope.version.__version__" }
