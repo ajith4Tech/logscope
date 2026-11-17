@@ -3741,6 +3741,7 @@ function renderIngestCard(status) {
       byPrefix.map((p) => [p.prefix, p.count, p.max_attempts, p.next_attempt_at ? formatDateTime(p.next_attempt_at) : '—']));
   }
   if (status.last_error) kvBlock(card, 'Last poll error', status.last_error, tone === 'ok' ? 'warn' : tone);
+  for (const warning of status.config_warnings || []) kvBlock(card, 'Configuration', warning, 'warn');
   return { card, tone };
 }
 
@@ -4855,17 +4856,30 @@ const ALERT_DELIVERY_LABELS = {
   failed_final: 'failed (gave up)', superseded: 'superseded',
 };
 
-function alertDeliveryMarkup(e) {
-  const label = ALERT_DELIVERY_LABELS[e.notified] || String(e.notified || '—');
-  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(e.notified || 'no')}">${escapeHtml(label)}</span>`];
-  const attempts = Number(e.attempts || 0);
-  if (attempts > 1 || (attempts && e.notified !== 'sent')) parts.push(`<span class="subtle">${attempts} attempt${attempts === 1 ? '' : 's'}</span>`);
-  if ((e.notified === 'retrying' || e.notified === 'queued') && e.next_attempt_at) {
-    parts.push(`<span class="subtle">next ${escapeHtml(formatDateTime(e.next_attempt_at))}</span>`);
+function alertDeliveryStatusMarkup(status, attempts, nextAt, error) {
+  const label = ALERT_DELIVERY_LABELS[status] || String(status || '—');
+  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(status || 'no')}">${escapeHtml(label)}</span>`];
+  const n = Number(attempts || 0);
+  if (n > 1 || (n && status !== 'sent')) parts.push(`<span class="subtle">${n} attempt${n === 1 ? '' : 's'}</span>`);
+  if ((status === 'retrying' || status === 'queued') && nextAt) {
+    parts.push(`<span class="subtle">next ${escapeHtml(formatDateTime(nextAt))}</span>`);
   }
-  if (e.error) parts.push(`<span class="alert-error-text">${escapeHtml(e.error)}</span>`);
-  if (e.retryable) parts.push(`<button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`);
+  if (error) parts.push(`<span class="alert-error-text">${escapeHtml(error)}</span>`);
   return parts.join(' ');
+}
+
+// One line per channel when the event has per-channel delivery rows (each
+// channel is retried on its own); the event's aggregate otherwise.
+function alertDeliveryMarkup(e) {
+  const deliveries = Array.isArray(e.deliveries) ? e.deliveries : [];
+  const names = new Map(alertsState.channels.map((c) => [Number(c.id), c.name]));
+  const body = deliveries.length
+    ? `<ul class="alert-deliveries">${deliveries.map((d) => `<li><span class="alert-delivery-channel">${escapeHtml(names.get(Number(d.channel_id)) || `channel ${Number(d.channel_id)}`)}</span> ${alertDeliveryStatusMarkup(d.state, d.attempts, d.next_attempt_at, d.last_error)}</li>`).join('')}</ul>`
+    : alertDeliveryStatusMarkup(e.notified, e.attempts, e.next_attempt_at, e.error);
+  const retry = e.retryable
+    ? ` <button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`
+    : '';
+  return body + retry;
 }
 
 async function loadAlertHistory(id) {
