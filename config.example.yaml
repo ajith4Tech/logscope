@@ -16,9 +16,9 @@ paths:
   # Node directory mounted into Vector (and the backup job) at /data.
   # Create it on every node before the first deploy (Directory, not create).
   host_path: /var/lib/logscope
-  # Vector's data_dir (read checkpoints, S3 disk buffers) in both kits.
-  # deploy/values-agent.yaml always mounts it as a hostPath (DirectoryOrCreate),
-  # whether or not sinks.s3.enabled; deploy/values-local.yaml adds no mount.
+  # Vector's data_dir (read checkpoints, S3 disk buffers) in both kits. The
+  # vector chart mounts its "data" hostPath volume there; both rendered values
+  # files point that volume (persistence.hostPath.path) at this host path.
   checkpoint: /var/lib/vector
 
 routing:
@@ -63,6 +63,7 @@ falco:
 #   log_type     = error | warning | info | debug | metrics
 # Empty Kubernetes fields become "-" so awk/cut positions stay stable.
 format:
+  # One token without whitespace (the web app parses it back); render refuses others.
   timestamp: "%Y-%m-%dT%H:%M:%SZ"
   line: "{timestamp} - {namespace} - {pod}/{container} - {message}"
   # Metrics use the same template by default (Prometheus lines are wrapped
@@ -205,6 +206,10 @@ webapp:
     sample_timestamps_max: 10      # sample timestamps kept in evidence
     min_baseline_hours: 24         # history needed before detectors fire ("learning" until then)
     min_partial_window_minutes: 15 # evaluate the current hour once this much of it has passed
+    cold_start_grace_s: 600        # suppress a namespace/pod's error_rate_spike & new_falco_rule
+                                   # for this long after its first record (start-up noise); still recorded
+    min_baseline_samples: 5        # min baseline occurrences before an error/shift ratio is computed
+                                   # (below it = insufficient data, not an "infinite" spike)
   # AI (optional). Providers: openrouter, gemini, openai, anthropic; anything
   # else (e.g. none) leaves AI off. The Settings tab overrides these. Keys come
   # from the env var below (default per provider: OPENROUTER_API_KEY,
@@ -224,10 +229,12 @@ webapp:
     # prices:                       # USD per million tokens, for usage cost estimates
     #   some-model-id: {input: 1.0, output: 4.0, cached: 0.1}
     # features: {anomaly_auto_summary: false}   # explain_line, explain_filtered, anomaly_auto_summary,
-    #                                           # anomaly_manual_summary, nl_filters
+    #                                           # anomaly_manual_summary, nl_filters, auto_triage
     # budgets: {daily_tokens: 2000000, daily_cost_usd: 5, daily_calls: {explain_filtered: 200}}  # UTC days
     # cache_ttl_hours: 168            # AI answers cached per log template (0 = off)
     # auto_summary_min_urgency: urgent # with anomaly_auto_summary on: low | medium | high | urgent
+    # auto_triage_min_urgency: high    # auto_triage (on by default) summarizes rate/shift anomalies
+    #                                  # at/above this urgency on transition to firing; never Falco novelty
     # signatures: []                  # extra known-pattern rules, format of webapp/api/signatures.yaml
   # Optional Mattermost notifications for Insights anomalies (off by default).
   # Sent once per anomaly occurrence at or above min_urgency; a recurrence of the

@@ -45,6 +45,7 @@ import logging
 import math
 import re
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -99,6 +100,9 @@ RETRY_SCHEDULE_SECS = (30, 60, 120, 300, 600, 1800)
 RETRY_HOURLY_SECS = 3600
 DELIVERY_GIVE_UP_SECS = 24 * 3600
 DELIVERY_BATCH = 200
+# One delivery pass starts no new send after this long (each send has its own
+# channels.SEND_TIMEOUT_SECS); what is left stays due for the next pass.
+DELIVERY_PASS_DEADLINE_SECS = 60
 _LABEL_KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 _STATE_ORDER = {"firing": 4, "pending": 3, "unknown": 2, "resolved": 1, "ok": 0}
@@ -379,6 +383,8 @@ class AlertRules:
         with self._db.lock:
             self._get(rule_id)
             self._db.conn.execute("DELETE FROM alert_rules WHERE id = ?", (rule_id,))
+            self._db.conn.execute("DELETE FROM alert_deliveries WHERE event_id IN "
+                                  "(SELECT id FROM alert_events WHERE rule_id = ?)", (rule_id,))
             self._db.conn.execute("DELETE FROM alert_events WHERE rule_id = ?", (rule_id,))
 
     def mute(self, rule_id: int, body: Any) -> dict[str, Any]:
@@ -440,7 +446,8 @@ class AlertEngine:
                  time_format: str = "", display_tz: str = "UTC", public_url: str = "",
                  batch_timeout: int = 600, margin: int = 120, tick_secs: float = 30.0,
                  ai_service: Any = None, ai_fn: Callable[[dict, Any], Any] | None = None,
-                 ai_configured: Callable[[], bool] = lambda: False, clock: Callable[[], datetime] = _now):
+                 ai_configured: Callable[[], bool] = lambda: False, clock: Callable[[], datetime] = _now,
+                 monotonic: Callable[[], float] = time.monotonic):
         self._db = db
         self._storage = storage
         self.rules = rules
@@ -459,6 +466,7 @@ class AlertEngine:
         self._ai_fn = ai_fn
         self._ai_configured = ai_configured
         self._clock = clock
+        self._monotonic = monotonic
         self._lock = threading.RLock()
         self._groups: dict[tuple[int | None, str], GroupState] = {}
         self._runtime: dict[int, RuleRuntime] = {}
@@ -564,6 +572,10 @@ class AlertEngine:
             removed += count
             if count < PRUNE_BATCH:
                 break
+        if removed:
+            with self._db.lock:
+                self._db.conn.execute(
+                    "DELETE FROM alert_deliveries WHERE event_id NOT IN (SELECT id FROM alert_events)")
         return removed
 
     def forget(self, rule_id: int, reason: str, *, record: bool = True) -> None:
@@ -738,103 +750,184 @@ class AlertEngine:
 
     # -- delivery ---------------------------------------------------------------------
 
-    def deliver_pending(self, now: datetime | None = None) -> int:
-        """Attempt every queued notification that is due, oldest first.
-        Returns how many were attempted."""
+    def deliver_pending(self, now: datetime | None = None, *, deadline_secs: float | None = None) -> int:
+        """Attempt every queued notification that is due, oldest first: one
+        send per due channel (each with the Deliverer's timeout). Stops
+        starting new sends after deadline_secs (DELIVERY_PASS_DEADLINE_SECS);
+        whatever is left stays due for the next pass. Returns how many events
+        were attempted."""
         now = now or self._clock()
+        deadline = self._monotonic() + (DELIVERY_PASS_DEADLINE_SECS if deadline_secs is None else deadline_secs)
         with self._db.lock:
             due = [int(row[0]) for row in self._db.conn.execute(
                 "SELECT id FROM alert_events WHERE notified = ? AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
                 "ORDER BY id LIMIT ?", (NOTIFY_QUEUED, iso_js(now), DELIVERY_BATCH))]
         done = 0
         for event_id in due:
-            if self._stop.is_set():
-                break  # still queued in the table: the next start resumes it
-            self._deliver(event_id, now)
+            if self._stop.is_set() or self._monotonic() >= deadline:
+                break  # still queued in the table: the next pass (or start) resumes it
+            self._deliver(event_id, now, deadline)
             done += 1
         return done
 
-    def _deliver(self, event_id: int, now: datetime) -> None:
+    def _event_channels(self, event: dict[str, Any]) -> list[int] | str:
+        """The channel ids an event goes to, or why it cannot be sent."""
+        if event["rule_id"] is None:
+            return [ENV_CHANNEL_ID]
+        try:
+            rule = self.rules.get(event["rule_id"])
+        except RuleError:
+            return "the rule was deleted"
+        return list(rule["channel_ids"]) or "no channels"
+
+    def _deliver(self, event_id: int, now: datetime, deadline: float) -> None:
         with self._db.lock:
             event = self._db.conn.execute("SELECT * FROM alert_events WHERE id = ?", (event_id,)).fetchone()
+            rows = self._db.conn.execute("SELECT * FROM alert_deliveries WHERE event_id = ?", (event_id,)).fetchall()
         if event is None or event["notified"] != NOTIFY_QUEUED:
             return  # superseded or retried meanwhile
         event = dict(event)
-        if event["rule_id"] is None:
-            channel_ids = [ENV_CHANNEL_ID]
-            message = self.pipeline_message(event)
-        else:
-            try:
-                rule = self.rules.get(event["rule_id"])
-            except RuleError:
-                self._set_delivery(event, NOTIFY_FAILED_FINAL, "the rule was deleted")
-                return
-            channel_ids = rule["channel_ids"]
-            if not channel_ids:
-                self._set_delivery(event, NOTIFY_FAILED_FINAL, "no channels")
-                return
-            # A retry does not ask the AI again: one metered call per notification.
-            message = self.message(rule, event, ai=not event.get("attempts"))
-        errors = []
-        sent = 0
-        for channel_id in channel_ids:
-            channel = self.channels.get(channel_id)
-            if channel is None or not channel.enabled or not channel.url:
-                errors.append(f"channel {channel_id}: not available")
-                continue
-            failure = self.deliverer.send(channel, message)
-            if failure:
-                errors.append(f"channel {channel_id}: {failure}")
-            else:
-                sent += 1
-        error = "; ".join(errors)[:1000] or None
-        if sent:
-            self._set_delivery(event, NOTIFY_SENT, error)
-            self._supersede_older(event)
+        channel_ids = self._event_channels(event)
+        if isinstance(channel_ids, str):  # nothing to send to: give up now
+            with self._db.lock:
+                self._db.conn.execute(
+                    "UPDATE alert_deliveries SET state = 'failed_final', next_attempt_at = NULL, last_error = ? "
+                    "WHERE event_id = ? AND state = 'queued'", (channel_ids, event_id))
+                self._db.conn.execute(
+                    "UPDATE alert_events SET notified = ?, error = ?, next_attempt_at = NULL WHERE id = ?",
+                    (NOTIFY_FAILED_FINAL, channel_ids, event_id))
             return
-        attempts = int(event.get("attempts") or 0) + 1
-        next_at = now + timedelta(seconds=retry_delay(attempts))
-        created = _parse(event["ts"]) or now
-        if (next_at - created).total_seconds() > DELIVERY_GIVE_UP_SECS:
-            self._set_delivery(event, NOTIFY_FAILED_FINAL, error)
+        if not rows:  # first pass: one row per channel the rule has now
+            with self._db.lock:
+                self._db.conn.executemany(
+                    "INSERT OR IGNORE INTO alert_deliveries (event_id, channel_id, state, next_attempt_at) "
+                    "VALUES (?, ?, 'queued', ?)", [(event_id, c, event["next_attempt_at"]) for c in channel_ids])
+                rows = self._db.conn.execute(
+                    "SELECT * FROM alert_deliveries WHERE event_id = ?", (event_id,)).fetchall()
+        due = [dict(r) for r in rows if r["state"] == "queued"
+               and (r["next_attempt_at"] is None or r["next_attempt_at"] <= iso_js(now))]
+        if due:
+            if event["rule_id"] is None:
+                message = self.pipeline_message(event)
+            else:
+                # A retry does not ask the AI again: one metered call per notification.
+                message = self.message(self.rules.get(event["rule_id"]), event, ai=not event.get("attempts"))
+            created = _parse(event["ts"]) or now
+            for delivery in due:
+                if self._monotonic() >= deadline:
+                    break  # this channel stays due
+                self._send_one(event, delivery, message, now, created)
+        self._refresh_event(event_id)
+
+    def _send_one(self, event: dict[str, Any], delivery: dict[str, Any], message: Message, now: datetime,
+                  created: datetime) -> None:
+        channel_id = delivery["channel_id"]
+        channel = self.channels.get(channel_id)
+        if channel is None or not channel.enabled or not channel.url:
+            failure: str | None = "not available"
         else:
-            self._set_delivery(event, NOTIFY_QUEUED, error, next_attempt_at=next_at)
-
-    def _set_delivery(self, event: dict[str, Any], status: int, error: str | None, *,
-                      next_attempt_at: datetime | None = None) -> None:
-        """Record one delivery attempt of an event."""
+            failure = self.deliverer.send(channel, message)
+        attempts = int(delivery["attempts"]) + 1
         with self._db.lock:
+            if failure is None:
+                self._db.conn.execute(
+                    "UPDATE alert_deliveries SET state = 'sent', attempts = ?, next_attempt_at = NULL, "
+                    "last_error = NULL, sent_at = ? WHERE event_id = ? AND channel_id = ?",
+                    (attempts, iso_js(now), event["id"], channel_id))
+                self._supersede_older(event, channel_id)
+                return
+            next_at = now + timedelta(seconds=retry_delay(attempts))
+            final = (next_at - created).total_seconds() > DELIVERY_GIVE_UP_SECS
             self._db.conn.execute(
-                "UPDATE alert_events SET notified = ?, error = ?, attempts = attempts + 1, next_attempt_at = ? "
-                "WHERE id = ?",
-                (status, error, iso_js(next_attempt_at) if next_attempt_at else None, event["id"]))
+                "UPDATE alert_deliveries SET state = ?, attempts = ?, next_attempt_at = ?, last_error = ? "
+                "WHERE event_id = ? AND channel_id = ?",
+                ("failed_final" if final else "queued", attempts, None if final else iso_js(next_at),
+                 failure[:300], event["id"], channel_id))
 
-    def _supersede_older(self, event: dict[str, Any]) -> None:
-        """A newer transition of this (rule, group) went out: older firing
-        notifications still waiting describe a state that is over."""
+    def _refresh_event(self, event_id: int) -> None:
+        """alert_events' delivery columns from the event's per-channel rows:
+        queued while any channel is; else superseded when every channel was,
+        sent when at least one channel got it, failed_final otherwise."""
         with self._db.lock:
+            rows = self._db.conn.execute(
+                "SELECT * FROM alert_deliveries WHERE event_id = ? ORDER BY channel_id", (event_id,)).fetchall()
+            if not rows:
+                return
+            states = [r["state"] for r in rows]
+            if "queued" in states:
+                status = NOTIFY_QUEUED
+            elif all(s == "superseded" for s in states):
+                status = NOTIFY_SUPERSEDED
+            elif "sent" in states:
+                status = NOTIFY_SENT
+            else:
+                status = NOTIFY_FAILED_FINAL
+            pending = [r["next_attempt_at"] for r in rows if r["state"] == "queued" and r["next_attempt_at"]]
+            if status == NOTIFY_SUPERSEDED:
+                error = rows[0]["last_error"]
+            else:
+                error = "; ".join(f"channel {r['channel_id']}: {r['last_error']}" for r in rows
+                                  if r["last_error"] and r["state"] in ("queued", "failed_final"))[:1000] or None
             self._db.conn.execute(
-                "UPDATE alert_events SET notified = ?, next_attempt_at = NULL, "
-                "error = 'superseded by event ' || ? WHERE rule_id IS ? AND group_key = ? AND id < ? "
-                "AND notified = ? AND state = 'firing'",
-                (NOTIFY_SUPERSEDED, event["id"], event["rule_id"], event["group_key"], event["id"], NOTIFY_QUEUED))
+                "UPDATE alert_events SET notified = ?, attempts = ?, next_attempt_at = ?, error = ? WHERE id = ?",
+                (status, max(int(r["attempts"]) for r in rows), min(pending) if pending and status == NOTIFY_QUEUED
+                 else None, error, event_id))
+
+    def _supersede_older(self, event: dict[str, Any], channel_id: int) -> None:
+        """A newer transition of this (rule, group) reached this channel:
+        older firing notifications still waiting for it describe a state
+        that is over."""
+        older = [int(r[0]) for r in self._db.conn.execute(
+            "SELECT DISTINCT d.event_id FROM alert_deliveries d JOIN alert_events e ON e.id = d.event_id "
+            "WHERE d.channel_id = ? AND d.state = 'queued' AND e.rule_id IS ? AND e.group_key = ? AND e.id < ? "
+            "AND e.state = 'firing'", (channel_id, event["rule_id"], event["group_key"], event["id"]))]
+        for older_id in older:
+            self._db.conn.execute(
+                "UPDATE alert_deliveries SET state = 'superseded', next_attempt_at = NULL, last_error = ? "
+                "WHERE event_id = ? AND channel_id = ? AND state = 'queued'",
+                (f"superseded by event {event['id']}", older_id, channel_id))
+            self._refresh_event(older_id)
 
     def retry_now(self, event_id: int) -> dict[str, Any]:
-        """Admin "retry now": a queued (backing off) or failed notification is
-        due immediately. A failed_final one gets one more attempt; if that
-        fails too it stays failed_final (it is past the retry window)."""
+        """Admin "retry now": every channel of a queued (backing off) or failed
+        notification that has not received it is due immediately. A
+        failed_final channel gets one more attempt; if that fails too it stays
+        failed_final (it is past the retry window)."""
+        now = iso_js(self._clock())
         with self._db.lock:
             row = self._db.conn.execute("SELECT * FROM alert_events WHERE id = ?", (event_id,)).fetchone()
             if row is None:
                 raise RuleError("Alert event not found", status=404)
-            if row["notified"] not in (NOTIFY_QUEUED, NOTIFY_FAILED, NOTIFY_FAILED_FINAL):
+            gave_up = self._db.conn.execute(
+                "SELECT 1 FROM alert_deliveries WHERE event_id = ? AND state = 'failed_final'", (event_id,)).fetchone()
+            if row["notified"] not in (NOTIFY_QUEUED, NOTIFY_FAILED, NOTIFY_FAILED_FINAL) and gave_up is None:
                 raise RuleError(f"A notification that is {_NOTIFY_NAMES.get(row['notified'], 'unknown')} "
                                 "cannot be retried", status=409)
+            self._db.conn.execute(
+                "UPDATE alert_deliveries SET state = 'queued', next_attempt_at = ? "
+                "WHERE event_id = ? AND state IN ('queued', 'failed_final')", (now, event_id))
             self._db.conn.execute("UPDATE alert_events SET notified = ?, next_attempt_at = ? WHERE id = ?",
-                                  (NOTIFY_QUEUED, iso_js(self._clock()), event_id))
+                                  (NOTIFY_QUEUED, now, event_id))
             row = self._db.conn.execute("SELECT * FROM alert_events WHERE id = ?", (event_id,)).fetchone()
+            item = _event_view(row)
+            item["deliveries"] = self._deliveries_view([event_id]).get(event_id, [])
+            item["retryable"] = True
         self._wake.set()
-        return _event_view(row)
+        return item
+
+    def _deliveries_view(self, event_ids: list[int]) -> dict[int, list[dict[str, Any]]]:
+        out: dict[int, list[dict[str, Any]]] = {}
+        if not event_ids:
+            return out
+        for r in self._db.conn.execute(
+                "SELECT event_id, channel_id, state, attempts, next_attempt_at, last_error, sent_at "
+                "FROM alert_deliveries WHERE event_id IN (SELECT value FROM json_each(?)) ORDER BY channel_id",
+                (json.dumps(event_ids),)):
+            item = dict(r)
+            if item["state"] == "queued" and item["attempts"]:
+                item["state"] = "retrying"
+            out.setdefault(int(r["event_id"]), []).append(item)
+        return out
 
     def delivery_status(self) -> dict[str, Any]:
         """Notifications waiting (with how many are retrying) and the oldest
@@ -1024,7 +1117,12 @@ class AlertEngine:
             rows = self._db.conn.execute(
                 f"SELECT * FROM alert_events WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
                 (*args, limit + 1)).fetchall()
-        items = [_event_view(r) for r in rows[:limit]]
+            items = [_event_view(r) for r in rows[:limit]]
+            deliveries = self._deliveries_view([item["id"] for item in items])
+        for item in items:
+            item["deliveries"] = deliveries.get(item["id"], [])
+            # A settled event can still have a channel that gave up.
+            item["retryable"] = item["retryable"] or any(d["state"] == "failed_final" for d in item["deliveries"])
         return {"items": items, "next_cursor": items[-1]["id"] if len(rows) > limit else None}
 
     def test_channel(self, channel_id: int) -> dict[str, Any]:

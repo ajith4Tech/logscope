@@ -197,6 +197,24 @@ MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
         "ALTER TABLE alert_events ADD COLUMN next_attempt_at TEXT",
         "CREATE INDEX idx_alert_events_delivery ON alert_events(notified, next_attempt_at)",
     )),
+    # Delivery per channel: each channel of an event is retried on its own
+    # schedule; alert_events.notified/attempts/next_attempt_at/error are the
+    # aggregate over its rows (see alerts.AlertEngine._refresh_event).
+    (7, (
+        """
+        CREATE TABLE alert_deliveries (
+            event_id INTEGER NOT NULL,
+            channel_id INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK (state IN ('queued', 'sent', 'failed_final', 'superseded')),
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            sent_at TEXT,
+            PRIMARY KEY (event_id, channel_id)
+        )
+        """,
+        "CREATE INDEX idx_alert_deliveries_due ON alert_deliveries(state, next_attempt_at)",
+    )),
 )
 # What identifies a state database (also one written before a later
 # migration, e.g. a restored backup): tables added later are not required.

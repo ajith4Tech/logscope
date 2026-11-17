@@ -216,8 +216,13 @@ def anomaly_template_summary(kb: SignatureKB, anomaly: dict[str, Any]) -> dict[s
         "counts": {"current": count, "expected": expected, "baseline_avg_per_hour": ev.get("baseline_avg_per_hour"),
                    "ratio": ratio, "baseline_share": ev.get("baseline_share"), "current_share": ev.get("current_share")},
         "templates": [{"template": t["template"], "count": t["count"]} for t in digest["templates"]],
-        "signature": ({"id": rule.id, "title": rule.title, "explanation": rule.explanation, "severity": rule.severity}
+        "signature": ({"id": rule.id, "title": rule.title, "explanation": rule.explanation, "severity": rule.severity,
+                       **({"confidence": rule.confidence} if rule.confidence else {}),
+                       **({"attack_type": rule.attack_type} if rule.attack_type else {})}
                       if rule else None),
+        # Surfaced for later web->runtime correlation work; empty when no web
+        # signature matched.
+        "attack_type": rule.attack_type if rule else "",
     }
 
 

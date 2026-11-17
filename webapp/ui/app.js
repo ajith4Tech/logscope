@@ -1,7 +1,8 @@
 const GROUP_WINDOW_MS = 5 * 60 * 1000; // collapse identical alerts within 5 minutes
 const EXPLAIN_COOLDOWN_MS = 12000; // client-side cooldown after clicking Explain
-const CURRENT_LOG_LIMIT = 7;
-const OLDER_LOG_LIMIT = 50;
+const LOG_PAGE_SIZE = 200; // rows per /api/logs page (first page and each "Load older")
+const LOG_ROWS_MAX = 2000; // loaded rows kept in the list; live tail trims the oldest beyond this
+const SCROLLED_AWAY_PX = 40; // list scrolled further than this holds new tail rows back
 const COUNT_FORMATTER = new Intl.NumberFormat();
 const HOUR_MS = 60 * 60 * 1000;
 const CONTEXT_LINE_CHOICES = [10, 25, 50];
@@ -31,8 +32,10 @@ const state = {
     stale: false, // filters changed while the Logs tab was hidden
     histogram: null, // last /api/histogram response
     prevRange: null, // range before the first histogram zoom (for "Reset range")
-    drag: null, // { from, to } bucket indexes while selecting
+    rangeTotal: null, // entries in the applied range (histogram sum), null until loaded
+    rangeTruncated: false, // the histogram left out its oldest buckets
   },
+  resultCounts: null, // { lines, rows } in the list, for the result summary
   dashboard: {
     data: null,
     loading: false,
@@ -40,15 +43,15 @@ const state = {
     loaded: false,
     requestId: 0,
   },
-  items: [],
-  nextCursor: null,
+  items: [], // loaded rows, newest first: the first page plus every older page
+  nextCursor: null, // cursor of the next older page; null at the end
   hasMore: false,
-  olderItems: [],
-  olderCursor: null,
-  olderHasMore: false,
   olderLoading: false,
   olderRequestId: 0,
-  olderOverlayOpen: false,
+  olderTrimmed: false, // live tail dropped the oldest rows; older pages need a reload
+  scrolledSincePage: false, // the reader scrolled since the last page (gates infinite scroll)
+  pendingTail: [], // live tail rows held back behind the "N new rows" banner
+  pendingTruncated: false, // a tail poll hit its limit, so more rows may be waiting
   // Row id (ingest order) the live tail continues from; set by every reload.
   liveCursor: null,
   liveTimer: null,
@@ -58,9 +61,12 @@ const state = {
   endIsLive: true,
   lastUpdatedAt: null,
   lastStatus: null,
+  // Open rows by row id; a merged row is open when any of its lines is.
   expandedRows: new Set(),
-  expandedGroups: new Set(),
-  groupByRule: false,
+  rowGroups: new Map(), // row id of each rendered row -> its group (for one-row re-renders)
+  collapseDuplicates: true,
+  filtersCollapsed: false, // wide screens: filter sidebar hidden (remembered in localStorage)
+  filtersDrawerOpen: false, // narrow screens: filter drawer open
   aiConfigured: false,
   // Feature flags from /api/status (ai_features); a feature turned off in
   // Settings hides its buttons.
@@ -134,8 +140,8 @@ function dashboardContextText() {
   if (filters.severity_bucket) parts.push(`severity=${filters.severity_bucket}`);
   if (filters.q) parts.push(`search=${filters.q}`);
   if (FILTER_EXCLUDES.some(([, param]) => filters[param])) parts.push('exclusions applied');
-  if (filters.start || filters.before) parts.push('time range applied');
-  return parts.length ? `Overview for ${parts.join(', ')}` : 'Overview for the current filter set';
+  const range = rangeLabel();
+  return parts.length ? `${range} · ${parts.join(', ')}` : `${range} · all logs`;
 }
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
@@ -161,8 +167,14 @@ function switchTab(name, { history = 'push' } = {}) {
     const active = tab === name;
     el(tabId).classList.toggle('active', active);
     el(tabId).setAttribute('aria-selected', active ? 'true' : 'false');
+    el(tabId).tabIndex = active ? 0 : -1; // the tab list is one Tab stop
     el(panelId).hidden = !active;
   }
+  // The filter panel and active-filter bar only belong to tabs the filters apply to.
+  const filtered = FILTER_TABS.includes(name);
+  el('layout').classList.toggle('no-filters', !filtered);
+  el('filterBar').hidden = !filtered;
+  if (!filtered) closeFiltersDrawer({ refocus: false });
 
   // The dashboard only loads when it is shown and its data is out of date
   // (filters changed since the last load); switching tabs alone never reloads it.
@@ -192,6 +204,208 @@ for (const tab of TABS) {
   el(TAB_IDS[tab][0]).addEventListener('click', () => switchTab(tab));
 }
 
+// ARIA tabs with manual activation: arrow keys, Home and End move focus
+// between tabs; Enter or Space (a button click) opens the focused tab, since
+// opening one can start a load.
+document.querySelector('[role="tablist"]').addEventListener('keydown', (event) => {
+  const tabs = TABS.map((tab) => el(TAB_IDS[tab][0]));
+  const index = tabs.indexOf(document.activeElement);
+  if (index === -1) return;
+  let next = null;
+  if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+  else if (event.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length;
+  else if (event.key === 'Home') next = 0;
+  else if (event.key === 'End') next = tabs.length - 1;
+  if (next === null) return;
+  event.preventDefault();
+  tabs[next].focus();
+  tabs[next].scrollIntoView({ block: 'nearest', inline: 'nearest' });
+});
+
+// Edge fades on the tab strip show that it scrolls sideways when it does.
+function updateTabFades() {
+  const scroller = el('tabScroller');
+  const max = scroller.scrollWidth - scroller.clientWidth;
+  scroller.classList.toggle('fade-left', scroller.scrollLeft > 2);
+  scroller.classList.toggle('fade-right', max - scroller.scrollLeft > 2);
+}
+el('tabScroller').addEventListener('scroll', updateTabFades, { passive: true });
+window.addEventListener('resize', updateTabFades);
+
+// ─── Filter panel: collapse, drawer, active-filter chips ─────────────────────
+// Wide screens: a sidebar that can be hidden (remembered per browser). At
+// 1024px and below: a slide-in drawer opened from "Filters (n)" that keeps
+// focus inside it until it closes.
+
+const FILTER_TABS = ['logs', 'insights', 'dashboard'];
+const DRAWER_QUERY = window.matchMedia('(max-width: 1024px)');
+const FILTERS_COLLAPSED_KEY = 'logscope.filters.collapsed';
+const FIELDS_COLLAPSED_KEY = 'logscope.fields.collapsed';
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+// localStorage can be missing or throw (private windows, blocked site data);
+// `fallback` applies then and when nothing was stored yet.
+function readFlag(key, fallback = false) {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value === null ? fallback : value === '1';
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function writeFlag(key, on) {
+  try { window.localStorage.setItem(key, on ? '1' : '0'); } catch (_) { /* not remembered */ }
+}
+
+function isDrawerMode() {
+  return Boolean(DRAWER_QUERY && DRAWER_QUERY.matches);
+}
+
+function applyFiltersLayout() {
+  const drawer = isDrawerMode();
+  el('layout').classList.toggle('filters-collapsed', !drawer && state.filtersCollapsed);
+  el('filtersToggle').setAttribute('aria-expanded', String(drawer ? state.filtersDrawerOpen : !state.filtersCollapsed));
+  el('filtersCollapse').title = drawer ? 'Close filters' : 'Hide filters';
+  el('filtersCollapse').setAttribute('aria-label', el('filtersCollapse').title);
+  el('filtersCollapse').textContent = drawer ? '✕' : '‹';
+}
+
+function setFiltersInert(on) {
+  for (const node of [el('skipToResults'), document.querySelector('.topbar'), el('tabScroller'), document.querySelector('.main-content')]) {
+    if (node) node.inert = on;
+  }
+}
+
+function openFiltersDrawer() {
+  const panel = el('filtersPanel');
+  state.filtersDrawerOpen = true;
+  panel.classList.add('drawer-open');
+  panel.setAttribute('role', 'dialog');
+  panel.setAttribute('aria-modal', 'true');
+  el('filtersBackdrop').hidden = false;
+  setFiltersInert(true);
+  applyFiltersLayout();
+  const first = panel.querySelector(FOCUSABLE);
+  if (first) first.focus();
+}
+
+function closeFiltersDrawer({ refocus = true } = {}) {
+  if (!state.filtersDrawerOpen) return;
+  const panel = el('filtersPanel');
+  state.filtersDrawerOpen = false;
+  panel.classList.remove('drawer-open');
+  panel.removeAttribute('role');
+  panel.removeAttribute('aria-modal');
+  el('filtersBackdrop').hidden = true;
+  setFiltersInert(false);
+  applyFiltersLayout();
+  if (refocus) el('filtersToggle').focus();
+}
+
+el('filtersToggle').addEventListener('click', () => {
+  if (isDrawerMode()) {
+    openFiltersDrawer();
+    return;
+  }
+  state.filtersCollapsed = !state.filtersCollapsed;
+  writeFlag(FILTERS_COLLAPSED_KEY, state.filtersCollapsed);
+  applyFiltersLayout();
+});
+el('filtersCollapse').addEventListener('click', () => {
+  if (isDrawerMode()) {
+    closeFiltersDrawer();
+    return;
+  }
+  state.filtersCollapsed = true;
+  writeFlag(FILTERS_COLLAPSED_KEY, true);
+  applyFiltersLayout();
+  el('filtersToggle').focus();
+});
+el('filtersBackdrop').addEventListener('click', () => closeFiltersDrawer());
+// Esc closes the drawer (after an open combobox or menu inside it has used
+// it); Tab wraps around inside it as well as the rest of the page being inert.
+el('filtersPanel').addEventListener('keydown', (event) => {
+  if (!state.filtersDrawerOpen) return;
+  if (event.key === 'Escape' && !event.defaultPrevented) {
+    event.preventDefault();
+    closeFiltersDrawer();
+  } else if (event.key === 'Tab') {
+    const items = Array.from(el('filtersPanel').querySelectorAll(FOCUSABLE)).filter((node) => node.offsetParent !== null);
+    if (!items.length) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+});
+if (DRAWER_QUERY && DRAWER_QUERY.addEventListener) {
+  DRAWER_QUERY.addEventListener('change', () => {
+    if (!isDrawerMode()) closeFiltersDrawer({ refocus: false });
+    applyFiltersLayout();
+  });
+}
+
+// Active filters as removable chips above the results; "Filters (n)" counts them.
+function activeFilterChips() {
+  const chips = [];
+  for (const [field, label] of FIELD_SIDEBAR) {
+    const value = el(field).value.trim();
+    if (value) chips.push({ text: `${label}: ${value}`, remove: () => { el(field).value = ''; } });
+    for (const excluded of state.exclude[field]) {
+      chips.push({
+        text: `not ${label}: ${excluded}`,
+        remove: () => { state.exclude[field] = state.exclude[field].filter((v) => v !== excluded); },
+      });
+    }
+  }
+  const q = el('q').value.trim();
+  if (q) chips.push({ text: `${currentQmode() ? 'Raw query' : 'Search'}: ${q}`, remove: () => { el('q').value = ''; } });
+  return chips;
+}
+
+function renderFilterChips() {
+  const chips = activeFilterChips();
+  el('filtersCount').textContent = chips.length ? ` (${chips.length})` : '';
+  el('filterBar').classList.toggle('is-empty', !chips.length);
+  const box = el('filterChips');
+  box.replaceChildren(...chips.map((chip, index) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'filter-chip';
+    button.setAttribute('role', 'listitem');
+    button.dataset.index = String(index);
+    button.setAttribute('aria-label', `Remove filter ${chip.text}`);
+    button.innerHTML = `<span>${escapeHtml(chip.text)}</span><span class="filter-chip-x" aria-hidden="true">✕</span>`;
+    button.addEventListener('click', () => {
+      chip.remove();
+      reloadLogs();
+      // Keep keyboard focus in the chip bar: the chip now at this place, else
+      // the toggle, else (the bar hides when empty) the first filter.
+      const next = el('filterChips').children[Math.min(index, el('filterChips').children.length - 1)];
+      (next || (el('filtersToggle').offsetParent ? el('filtersToggle') : el('scope'))).focus();
+    });
+    return button;
+  }));
+}
+
+// "Skip to results": the first log row (on the Logs tab), past the top bar,
+// tabs and filters.
+el('skipToResults').addEventListener('click', (event) => {
+  event.preventDefault();
+  if (state.activeTab !== 'logs') switchTab('logs');
+  if (state.context.recordId !== null) closeContext();
+  const first = el('rows').querySelector('.message-button');
+  const target = first || el('logListHost');
+  target.scrollIntoView({ block: 'nearest' });
+  target.focus();
+});
+
 // ─── Date helpers ────────────────────────────────────────────────────────────
 
 function localDateParts(date = new Date()) {
@@ -213,7 +427,6 @@ function setDefaultDateRange() {
   const endParts = localDateParts(now);
   el('start').value = `${startParts.year}-${startParts.month}-${startParts.day}T00:00`;
   el('end').value = `${endParts.year}-${endParts.month}-${endParts.day}T${endParts.hour}:${endParts.minute}`;
-  el('defaultWindowChip').textContent = `Today · ${start.toLocaleDateString()}`;
   state.endIsLive = true;
   state.rangeExact = null;
 }
@@ -237,6 +450,44 @@ function currentRange() {
   };
 }
 
+// The applied range in words: "Today · 2 Nov 2026", "Last 7 days", or the
+// exact bounds.
+function rangeLabel() {
+  const preset = el('rangePreset').value;
+  const { start, before } = currentRange();
+  const fmt = (iso) => formatDateTime(iso, { seconds: false });
+  let label;
+  if (preset === 'today') {
+    label = `Today · ${formatDateTime(new Date(), { time: false })}`;
+  } else if (RANGE_PRESETS[preset]) {
+    label = RANGE_PRESETS[preset].label;
+  } else if (!start && !before) {
+    label = 'All time';
+  } else {
+    label = start ? `${fmt(start)} – ${before ? fmt(before) : 'now'}` : `Until ${fmt(before)}`;
+  }
+  return label;
+}
+
+// The top-bar chip names the applied range and, once for the whole page, the
+// browser time zone that every displayed time is in (the zone part is hidden
+// on narrow screens; it stays in the tooltip).
+function updateRangeChip() {
+  const zone = timeZoneLabel();
+  const chip = el('defaultWindowChip');
+  chip.innerHTML = `<span class="range-label">${escapeHtml(rangeLabel())}</span><span class="range-zone"> · ${escapeHtml(zone)}</span>`;
+  chip.title = `Applied range: ${rangeLabel()} · all times on this page are in ${zone}`;
+  el('filtersZone').textContent = `Times are in ${zone}.`;
+}
+
+function timeZoneLabel() {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local time';
+  const offset = -new Date().getTimezoneOffset();
+  const abs = Math.abs(offset);
+  const pad = (value) => String(value).padStart(2, '0');
+  return `${zone} (UTC${offset < 0 ? '−' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)})`;
+}
+
 // For an open-ended range the End field shows the current time; refresh it
 // so the form matches what is being queried.
 function refreshLiveEnd() {
@@ -249,19 +500,67 @@ function localValueToIso(value) {
   return Number.isFinite(date.getTime()) ? date.toISOString() : '';
 }
 
-function formatTimestamp(value) {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'medium',
-  }).format(new Date(value));
+// One date/time format for the whole page, in the browser's time zone
+// (named once, in the range chip): "2 Nov 2026, 15:22:45". `seconds: false`
+// drops the seconds, `time: false` gives the date alone, `date: false` the
+// time alone.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+function formatDateTime(value, { seconds = true, time = true, date = true } = {}) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (!Number.isFinite(d.getTime())) return '—';
+  const pad = (n) => String(n).padStart(2, '0');
+  const day = `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+  const clock = `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ''}`;
+  if (!time) return day;
+  if (!date) return clock;
+  return `${day}, ${clock}`;
+}
+
+// A span such as a histogram bar: "2 Nov 2026, 15:00–16:00" (both ends
+// dated when it crosses midnight).
+function formatSpan(from, to) {
+  const a = new Date(from);
+  const b = new Date(to);
+  const sameDay = formatDateTime(a, { time: false }) === formatDateTime(new Date(b.getTime() - 1), { time: false });
+  return sameDay
+    ? `${formatDateTime(a, { seconds: false })}–${formatDateTime(b, { seconds: false, date: false })}`
+    : `${formatDateTime(a, { seconds: false })} – ${formatDateTime(b, { seconds: false })}`;
 }
 
 function fmtFreshness(value) {
   if (!value) return 'Waiting for ingestion';
   const seconds = Math.max(0, Math.round((Date.now() - new Date(value).getTime()) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  return `${minutes}m ago`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
+}
+
+// Top bar: "Updated 12s ago" with a dot: live (green), stale (amber: older
+// than the ingest stale threshold) or paused (grey: Live tail off).
+function renderFreshness() {
+  const value = state.lastUpdatedAt || state.lastStatus?.last_successful_ingest_at || null;
+  const live = el('live').checked;
+  const staleSecs = Number(state.lastStatus?.ingest?.stale_after_secs) || 300;
+  const age = value ? (Date.now() - Date.parse(value)) / 1000 : Infinity;
+  const tone = !live ? 'paused' : age > staleSecs ? 'stale' : 'live';
+  const text = value ? `Updated ${fmtFreshness(value)}` : 'Waiting for data';
+  el('freshness').textContent = text;
+  const box = el('liveStatus');
+  box.dataset.tone = tone;
+  box.title = `${text}${value ? ` (${formatDateTime(value)})` : ''} · Live tail ${live ? 'on' : 'off'}${tone === 'stale' ? ' · data is stale' : ''}`;
+}
+
+// Top bar ingest health: a dot and a few words; the full text is in the
+// tooltip and accessible name, and the Pipeline tab has the details.
+function setHealth(tone, short, full) {
+  const pill = el('healthStatus');
+  if (pill.dataset.announced && pill.dataset.announced !== `${tone}|${short}`) announce(`Ingest health: ${short}`);
+  pill.dataset.announced = `${tone}|${short}`;
+  el('health').textContent = short;
+  pill.dataset.tone = tone;
+  pill.title = `${full} · open the Pipeline tab for details`;
+  pill.setAttribute('aria-label', `Ingest health: ${full}. Open the Pipeline tab.`);
 }
 
 // Exclusions as API parameters, comma-separated (Kubernetes names, scopes
@@ -342,6 +641,86 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+// Error toast for actions that have no panel of their own to show it in.
+// A toast with the same key is updated in place instead of stacking (e.g.
+// live tail failing on every poll); dismissToast(key) clears it on recovery.
+const TOAST_MS = 10000;
+function showToast(message, { key = message } = {}) {
+  const region = el('toastRegion');
+  let toast = Array.from(region.children).find((node) => node.dataset.key === key);
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.className = 'toast';
+    toast.setAttribute('role', 'alert');
+    toast.dataset.key = key;
+    const text = document.createElement('span');
+    text.className = 'toast-text';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ghost toast-close';
+    close.textContent = '✕';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.addEventListener('click', () => toast.remove());
+    toast.append(text, close);
+    region.appendChild(toast);
+  }
+  toast.querySelector('.toast-text').textContent = message;
+  window.clearTimeout(Number(toast.dataset.timer));
+  toast.dataset.timer = String(window.setTimeout(() => toast.remove(), TOAST_MS));
+}
+
+function dismissToast(key) {
+  const toast = Array.from(el('toastRegion').children).find((node) => node.dataset.key === key);
+  if (toast) toast.remove();
+}
+
+// ─── Panel states ────────────────────────────────────────────────────────────
+// One pattern for every panel: Loading (a skeleton of the content),
+// Empty (icon + one line + an optional action) and Error (message + Retry).
+// An action is { label, onClick } or { label, id } for a delegated handler.
+const PANEL_STATE_ICONS = {
+  empty: '<svg class="panel-state-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M20 20l-4.5-4.5M8.5 11h5"/></svg>',
+  error: '<svg class="panel-state-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4l9 16H3z"/><path d="M12 10v4M12 17v.5"/></svg>',
+};
+
+function panelStateNode(kind, { message = '', action = null, layout = 'rows', lines = 6 } = {}) {
+  const node = document.createElement('div');
+  if (kind === 'loading') {
+    node.className = `skeleton skeleton-${layout}`;
+    node.setAttribute('role', 'status');
+    node.setAttribute('aria-label', 'Loading');
+    node.innerHTML = Array.from({ length: lines }, () => '<span class="skeleton-block"></span>').join('');
+    return node;
+  }
+  node.className = `panel-state panel-state-${kind}`;
+  if (kind === 'error') node.setAttribute('role', 'alert');
+  node.innerHTML = `${PANEL_STATE_ICONS[kind] || ''}<p class="panel-state-text"></p>`;
+  node.querySelector('.panel-state-text').textContent = message;
+  if (action) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ghost panel-state-action';
+    button.textContent = action.label;
+    if (action.id) button.id = action.id;
+    if (action.onClick) button.addEventListener('click', () => action.onClick());
+    node.appendChild(button);
+  }
+  return node;
+}
+
+function setPanelState(container, kind, options = {}) {
+  container.replaceChildren(panelStateNode(kind, options));
+  container.hidden = false;
+}
+
+// Screen-reader announcements for changes that happen without user action
+// (polite; the callers only announce real changes, never every poll).
+function announce(message) {
+  const region = el('liveAnnouncer');
+  region.textContent = '';
+  window.setTimeout(() => { region.textContent = message; }, 50);
+}
+
 function dashboardStateEls() {
   return {
     loading: el('dashboardLoading'),
@@ -351,10 +730,12 @@ function dashboardStateEls() {
   };
 }
 
-function dashboardChartRow(item, kind, maxCount) {
+// tone: 'severity' colours each bar by its severity, 'error' uses the error
+// colour, anything else is neutral (totals).
+function dashboardChartRow(item, kind, maxCount, tone = 'neutral') {
   const value = item.value ?? '';
   const count = Number(item.count ?? 0);
-  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
+  const width = maxCount > 0 && count > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0; // no bar for 0
   const clickable = value !== '' || kind === 'severity' || kind === 'security';
   const action = kind === 'severity' ? 'severity' : kind === 'namespace' ? 'namespace' : kind === 'search' ? 'search' : kind;
   const actionValue = kind === 'security' ? 'security' : value;
@@ -362,53 +743,29 @@ function dashboardChartRow(item, kind, maxCount) {
   return `
     <button type="button" class="${cls}" data-dashboard-action="${escapeHtml(action)}" data-dashboard-value="${escapeHtml(actionValue)}" ${clickable ? '' : 'disabled'}>
       <span class="dashboard-bar-label">${escapeHtml(dashboardLabel(value))}</span>
-      <span class="dashboard-bar-track"><span class="dashboard-bar-fill" style="width:${width}%"></span></span>
+      <span class="dashboard-bar-track"><span class="dashboard-bar-fill bar-${escapeHtml(tone === 'severity' ? value || 'neutral' : tone)}" style="width:${width}%"></span></span>
       <span class="dashboard-bar-count">${formatCount(count)}</span>
     </button>
   `;
 }
 
-// One hourly bucket. Clicking opens Logs for exactly that hour, as the
-// half-open interval [hour, hour + 1h) in UTC, keeping the other filters
-// (and the severity of the error chart). Empty buckets are not clickable.
-function dashboardTimelineRow(item, maxCount, severity, metricKey = 'total_logs') {
-  const bucketStart = item.timestamp ? new Date(item.timestamp) : null;
-  const valid = Boolean(bucketStart) && Number.isFinite(bucketStart.getTime());
-  const label = valid ? formatTimestamp(item.timestamp) : '—';
-  const count = Number(item[metricKey] ?? 0);
-  const width = maxCount > 0 ? Math.max(4, Math.round((count / maxCount) * 100)) : 0;
-  const startIso = valid ? bucketStart.toISOString() : '';
-  const endIso = valid ? new Date(bucketStart.getTime() + HOUR_MS).toISOString() : '';
-  const clickable = valid && count > 0;
-  const title = valid
-    ? `${startIso.slice(0, 16).replace('T', ' ')} – ${endIso.slice(11, 16)} UTC (end exclusive)${clickable ? ' · open these logs' : ' · no entries in this hour'}`
-    : 'Unknown time bucket';
-  return `
-    <button type="button" class="dashboard-bar-row${clickable ? ' dashboard-action' : ''}" title="${escapeHtml(title)}" data-dashboard-action="hour" data-dashboard-value="${escapeHtml(startIso)}" data-dashboard-severity="${escapeHtml(severity)}" ${clickable ? '' : 'disabled'}>
-      <span class="dashboard-bar-label dashboard-bar-label-wide">${escapeHtml(label)}</span>
-      <span class="dashboard-bar-track dashboard-bar-track-timeline"><span class="dashboard-bar-fill dashboard-bar-fill-alt" style="width:${width}%"></span></span>
-      <span class="dashboard-bar-count">${formatCount(count)}</span>
-    </button>
-  `;
-}
-
-function renderDashboardList(container, items, kind) {
+function renderDashboardList(container, items, kind, tone = 'neutral') {
   if (!container) return;
   if (!items.length) {
     container.innerHTML = '<div class="empty-state dashboard-empty-inline">No data for the selected filters.</div>';
     return;
   }
   const maxCount = Math.max(...items.map((item) => Number(item.count ?? 0)), 1);
-  container.innerHTML = items.map((item) => dashboardChartRow(item, kind, maxCount)).join('');
+  container.innerHTML = items.map((item) => dashboardChartRow(item, kind, maxCount, tone)).join('');
 }
 
 function renderDashboardSummary(summary) {
   const cards = [
     { label: 'Total Logs', value: summary.total_logs, action: 'logs' },
-    { label: 'Errors', value: summary.error_count, action: 'severity', actionValue: 'error' },
+    { label: 'Errors', value: summary.error_count, action: 'severity', actionValue: 'error', tone: 'error' },
     { label: 'Warnings', value: summary.warning_count, action: 'severity', actionValue: 'warning' },
     { label: 'Info', value: summary.info_count, action: 'severity', actionValue: 'info' },
-    { label: 'Security', value: summary.security_count, action: 'security', actionValue: 'security' },
+    { label: 'Security', value: summary.security_count, action: 'security', actionValue: 'security', tone: 'security' },
     { label: 'Namespaces', value: summary.unique_namespaces },
     { label: 'Pods', value: summary.unique_pods },
   ];
@@ -420,69 +777,91 @@ function renderDashboardSummary(summary) {
     const attrs = clickable
       ? `type="button" class="dashboard-summary-card dashboard-action" data-dashboard-action="${escapeHtml(card.action)}" data-dashboard-value="${escapeHtml(card.actionValue || '')}"`
       : 'class="dashboard-summary-card"';
-    return `<${tag} ${attrs}><span class="dashboard-summary-label">${escapeHtml(card.label)}</span><span class="dashboard-summary-value">${formatCount(card.value)}</span></${tag}>`;
+    // Zeros are dimmed; non-zero errors and security counts take their colour.
+    const value = Number(card.value || 0);
+    const tone = value === 0 ? ' is-zero' : card.tone ? ` tone-${card.tone}` : '';
+    return `<${tag} ${attrs.replace('class="dashboard-summary-card', `class="dashboard-summary-card${tone}`)}><span class="dashboard-summary-label">${escapeHtml(card.label)}</span><span class="dashboard-summary-value">${formatCount(card.value)}</span></${tag}>`;
   }).join('');
+}
+
+const dashboardCharts = { volume: null, errors: null };
+
+// A bar of a Dashboard volume chart opens Logs for exactly that time slice
+// (and errors only, from the error chart).
+function openDashboardBucket(chart, index, severity) {
+  const bucket = chart.buckets[index];
+  if (!bucket) return;
+  const end = new Date(Math.min(Date.parse(bucket.t) + chart.bucketMs, Date.now())).toISOString();
+  drillDownFromDashboard('range', bucket.t, severity, end).catch((err) => {
+    showToast(`Could not open these logs: ${err.message}`, { key: 'drilldown' });
+  });
 }
 
 function renderDashboardContent(data) {
   const summary = data.summary || {};
   renderDashboardSummary(summary);
-  renderDashboardList(el('dashboardSeverityChart'), data.severity || [], 'severity');
+  renderDashboardList(el('dashboardSeverityChart'), data.severity || [], 'severity', 'severity');
   renderDashboardList(el('dashboardNamespaceChart'), data.namespaces || [], 'namespace');
-  renderDashboardList(el('dashboardTopErrors'), data.top_errors || [], 'search');
-  renderDashboardList(el('dashboardErrorNamespaces'), data.error_namespaces || [], 'namespace');
-  renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod');
+  renderDashboardList(el('dashboardTopErrors'), data.top_errors || [], 'search', 'error');
+  renderDashboardList(el('dashboardErrorNamespaces'), data.error_namespaces || [], 'namespace', 'error');
+  renderDashboardList(el('dashboardErrorPods'), data.error_pods || [], 'pod', 'error');
 
-  const totalTimeline = el('dashboardTotalVolumeChart');
-  if (totalTimeline) {
-    const items = Array.isArray(data.timeline) ? data.timeline : [];
-    if (!items.length) {
-      totalTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
-    } else {
-      const maxCount = Math.max(...items.map((item) => Number(item.total_logs ?? 0)), 1);
-      totalTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, '', 'total_logs')).join('');
-    }
-  }
-
-  const errorTimeline = el('dashboardErrorVolumeChart');
-  if (errorTimeline) {
-    const items = Array.isArray(data.timeline) ? data.timeline : [];
-    if (!items.length) {
-      errorTimeline.innerHTML = '<div class="empty-state dashboard-empty-inline">No timeline data available.</div>';
-    } else {
-      const maxCount = Math.max(...items.map((item) => Number(item.error_logs ?? 0)), 1);
-      errorTimeline.innerHTML = items.map((item) => dashboardTimelineRow(item, maxCount, 'error', 'error_logs')).join('');
-    }
-  }
+  dashboardCharts.volume ||= createHistogramChart(el('dashboardVolumeChart'), {
+    onSelect: (index) => openDashboardBucket(dashboardCharts.volume, index, ''),
+  });
+  dashboardCharts.errors ||= createHistogramChart(el('dashboardErrorChart'), {
+    severities: ['error'],
+    onSelect: (index) => openDashboardBucket(dashboardCharts.errors, index, 'error'),
+  });
+  const histogram = state.dashboard.histogram;
+  const volume = dashboardCharts.volume.render(histogram);
+  const errors = dashboardCharts.errors.render(histogram);
+  const buckets = dashboardCharts.volume.buckets.length;
+  const size = buckets ? ` · ${formatBucketSize(dashboardCharts.volume.bucketMs)} bars` : '';
+  el('dashboardVolumeSummary').textContent = buckets ? `${formatCount(volume)} entries${size}` : 'No entries';
+  el('dashboardErrorSummary').textContent = buckets ? `${formatCount(errors)} errors${size}` : 'No entries';
 }
 
 function renderDashboard() {
   const { loading, error, empty, content } = dashboardStateEls();
   const hasData = Boolean(state.dashboard.data);
   const totalLogs = Number(state.dashboard.data?.summary?.total_logs ?? 0);
-  if (loading) loading.hidden = !state.dashboard.loading;
-  if (error) {
-    error.hidden = !state.dashboard.error;
-    error.textContent = state.dashboard.error || '';
+  loading.hidden = !state.dashboard.loading;
+  if (state.dashboard.loading && !loading.firstChild) {
+    loading.replaceChildren(panelStateNode('loading', { layout: 'dashboard', lines: 9 }));
   }
-  if (empty) empty.hidden = !(hasData && !state.dashboard.loading && !state.dashboard.error && totalLogs === 0);
+  if (state.dashboard.error) {
+    setPanelState(error, 'error', { message: state.dashboard.error, action: { label: 'Retry', onClick: () => loadDashboard().catch(() => {}) } });
+  } else {
+    error.hidden = true;
+  }
+  const isEmpty = hasData && !state.dashboard.loading && !state.dashboard.error && totalLogs === 0;
+  if (isEmpty) {
+    setPanelState(empty, 'empty', {
+      message: 'No log lines match these filters in this range.',
+      action: activeFilterChips().length ? { label: 'Clear filters', onClick: () => el('clearFilters').click() } : null,
+    });
+  } else {
+    empty.hidden = true;
+  }
   if (content) content.hidden = !hasData || state.dashboard.loading || totalLogs === 0;
   if (hasData) renderDashboardContent(state.dashboard.data);
   const ctx = el('dashboardContext');
   if (ctx) ctx.textContent = dashboardContextText();
 }
 
-async function drillDownFromDashboard(action, value, severity = '') {
+async function drillDownFromDashboard(action, value, severity = '', endValue = '') {
   if (action === 'logs') {
     closeContext({ history: null });
     switchTab('logs');
     return;
   }
-  if (action === 'hour') {
+  if (action === 'range') {
     const start = new Date(value);
-    if (!Number.isFinite(start.getTime())) return;
+    const end = new Date(endValue);
+    if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime())) return;
     forgetHistogramZoom();
-    setExactRange(start.toISOString(), new Date(start.getTime() + HOUR_MS).toISOString());
+    setExactRange(start.toISOString(), end.toISOString());
     if (severity) setSelectValue(el('severity_bucket'), severity);
   } else if (action === 'severity') {
     el('severity_bucket').value = value;
@@ -501,7 +880,7 @@ async function drillDownFromDashboard(action, value, severity = '') {
   // One history entry for the whole drilldown (tab + filters + range).
   switchTab('logs', { history: null });
   updateUrl('push');
-  await loadLogs(true);
+  await loadLogs();
 }
 
 async function loadDashboard() {
@@ -514,8 +893,13 @@ async function loadDashboard() {
   renderDashboard();
   try {
     const params = new URLSearchParams(queryFromFilters());
-    const data = await fetchJson(`/api/dashboard?${params.toString()}`);
+    // The volume charts use the same buckets as the Logs histogram.
+    const [data, histogram] = await Promise.all([
+      fetchJson(`/api/dashboard?${params.toString()}`),
+      fetchJson(`/api/histogram?${histogramQuery()}`),
+    ]);
     if (requestId !== state.dashboard.requestId) return;
+    state.dashboard.histogram = histogram;
     state.dashboard.data = data;
     state.dashboard.loaded = true;
   } catch (err) {
@@ -561,6 +945,10 @@ function toDatetimeLocal(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
+// Pod / container picker: an ARIA 1.2 editable combobox with a listbox popup.
+// Focus stays in the input; arrow keys move the active option
+// (aria-activedescendant), Enter picks it, or the typed text when none is
+// active, and applies; Esc closes the list. Options are not Tab stops.
 function buildCombobox(inputId, facetKey) {
   const input = el(inputId);
   const wrapper = document.createElement('div');
@@ -570,46 +958,93 @@ function buildCombobox(inputId, facetKey) {
   const list = document.createElement('div');
   list.className = 'combobox-list';
   list.id = `${inputId}-list`;
+  list.setAttribute('role', 'listbox');
+  list.setAttribute('aria-label', `${facetKey} values`);
   wrapper.appendChild(list);
+  input.setAttribute('role', 'combobox');
+  input.setAttribute('aria-autocomplete', 'list');
+  input.setAttribute('aria-controls', list.id);
+  input.setAttribute('aria-expanded', 'false');
 
-  const close = () => { list.classList.remove('open'); };
+  let options = [];
+  let active = -1;
+
+  const setActive = (index) => {
+    if (options[active]) options[active].classList.remove('active');
+    active = index;
+    const option = options[active];
+    if (option) {
+      option.classList.add('active');
+      input.setAttribute('aria-activedescendant', option.id);
+      option.scrollIntoView({ block: 'nearest' });
+    } else {
+      input.removeAttribute('aria-activedescendant');
+    }
+  };
+
+  const isOpen = () => list.classList.contains('open');
+
+  const close = () => {
+    setActive(-1);
+    list.classList.remove('open');
+    input.setAttribute('aria-expanded', 'false');
+  };
 
   const renderList = () => {
     const needle = input.value.trim().toLowerCase();
     const values = (state.facets[facetKey] || [])
       .filter((item) => !needle || String(item.value).toLowerCase().includes(needle))
       .slice(0, 200);
-    const parts = ['<button type="button" class="combobox-option" data-value="">All</button>'];
-    for (const item of values) {
-      const selected = item.value === input.value ? ' selected' : '';
-      const value = escapeHtml(item.value ?? '');
-      const count = Number(item.count ?? 0);
-      const safeCount = Number.isFinite(count) ? String(count) : '0';
-      parts.push(`<button type="button" class="combobox-option${selected}" data-value="${value}">${value} <span class="combobox-count">${safeCount}</span></button>`);
-    }
-    if (!values.length) parts.push('<div class="combobox-empty">No matches</div>');
+    const parts = [{ value: '', label: 'All', count: null }]
+      .concat(values.map((item) => ({ value: String(item.value ?? ''), label: String(item.value ?? ''), count: Number(item.count ?? 0) })))
+      .map((item, index) => {
+        const selected = item.value === input.value;
+        const count = item.count === null ? '' : ` <span class="combobox-count">${Number.isFinite(item.count) ? item.count : 0}</span>`;
+        return `<div role="option" id="${inputId}-opt-${index}" tabindex="-1" class="combobox-option${selected ? ' selected' : ''}" aria-selected="${selected}" data-value="${escapeHtml(item.value)}">${escapeHtml(item.label)}${count}</div>`;
+      });
+    if (!values.length) parts.push('<div class="combobox-empty" role="presentation">No matches</div>');
     list.innerHTML = parts.join('');
+    options = Array.from(list.querySelectorAll('[role="option"]'));
+    active = -1;
+    input.removeAttribute('aria-activedescendant');
   };
 
   const open = () => {
     renderList();
     list.classList.add('open');
+    input.setAttribute('aria-expanded', 'true');
+  };
+
+  const choose = (value) => {
+    input.value = value;
+    close();
+    reloadLogs();
   };
 
   input.addEventListener('focus', open);
   input.addEventListener('input', open);
   input.addEventListener('blur', () => window.setTimeout(close, 150));
   list.addEventListener('mousedown', (event) => {
-    const option = event.target.closest('.combobox-option');
+    const option = event.target.closest('[role="option"]');
     if (!option) return;
-    event.preventDefault();
-    input.value = option.dataset.value || '';
-    close();
-    reloadLogs();
+    event.preventDefault(); // keep focus in the input
+    choose(option.dataset.value || '');
   });
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') { event.preventDefault(); close(); input.blur(); }
-    else if (event.key === 'Escape') { close(); }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (!isOpen()) open();
+      if (!options.length) return;
+      const step = event.key === 'ArrowDown' ? 1 : -1;
+      const start = active === -1 ? (step === 1 ? -1 : options.length) : active;
+      setActive((start + step + options.length) % options.length);
+    } else if (event.key === 'Enter') {
+      event.preventDefault(); // the filters form would apply a second time
+      choose(isOpen() && options[active] ? options[active].dataset.value || '' : input.value.trim());
+    } else if (event.key === 'Escape' && isOpen()) {
+      event.preventDefault();
+      close();
+    }
   });
 }
 
@@ -633,23 +1068,25 @@ function groupKeyOf(item) {
   return [item.severity_bucket, item.namespace, item.pod, item.container, message].join('|');
 }
 
+// Rows of the list: with "Collapse duplicates" on, identical lines (same
+// source and normalised message) less than 5 minutes apart share one row;
+// off, every line is its own row.
 function buildGroups(items) {
+  if (!state.collapseDuplicates) return items.map((item) => ({ items: [item] }));
   const groups = [];
   const byKey = new Map();
   for (const item of items) {
     const key = groupKeyOf(item);
     const ts = Date.parse(item.timestamp) || 0;
     let group = byKey.get(key);
-    if (group && !state.groupByRule && Math.abs(ts - group.lastTs) > GROUP_WINDOW_MS) {
-      group = null;
-    }
+    if (group && Math.abs(ts - group.lastTs) > GROUP_WINDOW_MS) group = null;
     if (!group) {
       group = { items: [], lastTs: ts };
       byKey.set(key, group);
       groups.push(group);
     }
     group.items.push(item);
-    if (!state.groupByRule) group.lastTs = ts;
+    group.lastTs = ts;
   }
   return groups;
 }
@@ -657,22 +1094,22 @@ function buildGroups(items) {
 function rowMarkup(item) {
   const tpl = el('rowTemplate');
   const node = tpl.content.firstElementChild.cloneNode(true);
-  node.querySelector('.time').textContent = formatTimestamp(item.timestamp);
-  node.title = item.timestamp;
+  node.querySelector('.time').textContent = formatDateTime(item.timestamp);
   const sev = node.querySelector('.severity');
   sev.classList.add(item.severity_bucket);
+  node.classList.add(`row-sev-${item.severity_bucket}`);
   const badge = node.querySelector('.badge');
   badge.textContent = item.severity_bucket;
   badge.dataset.scope = item.scope;
-  node.querySelector('.scope').textContent = item.scope;
-  node.querySelector('.source').textContent = `${item.namespace} · ${item.pod}/${item.container}`;
+  const scope = node.querySelector('.scope');
+  scope.textContent = item.scope;
+  scope.title = item.scope;
+  const source = node.querySelector('.source');
+  source.textContent = `${item.namespace} · ${item.pod}/${item.container}`;
+  source.title = source.textContent;
   const messageButton = node.querySelector('.message-button');
   messageButton.textContent = item.message;
-  messageButton.title = 'Click row to expand full details';
-  if (aiFeatureOn('explain_line')) {
-    const explainBlock = lineExplainMarkup(String(item.id), item);
-    node.appendChild(explainBlock);
-  }
+  messageButton.title = 'Show the full message and details';
   return node;
 }
 
@@ -739,13 +1176,13 @@ function explainMetaNode(meta, rerun) {
     return b;
   };
   if (meta.source === 'signature') {
-    button('Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
+    button('✦ Ask AI anyway', 'Send it to the AI provider instead of the known-pattern answer',
       () => rerun({ skip_signature: true }));
   } else {
-    button('Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
+    button('✦ Regenerate', 'Ask the AI again, bypassing the cache', () => rerun({ regenerate: true, skip_signature: true, tier: meta.tier || 'fast' }));
   }
   if (meta.tier !== 'deep') {
-    button('Deep analysis', 'Ask the deep model (separate cache and daily budget)',
+    button('✦ Deep analysis', 'Ask the deep model (separate cache and daily budget)',
       () => rerun({ tier: 'deep', skip_signature: true }));
   }
   if (meta.cache_key && meta.source !== 'signature') {
@@ -815,9 +1252,11 @@ function lineExplainMarkup(rowId, item) {
 
   const btn = document.createElement('button');
   btn.type = 'button';
-  btn.className = 'ghost line-explain-btn';
+  btn.className = 'ghost line-explain-btn ai-action';
   btn.textContent = lineState.status === 'loading' ? '✦ Explaining…' : '✦ Explain this line';
-  btn.disabled = lineState.status === 'loading';
+  btn.title = 'AI action: sends this line to the configured AI provider';
+  // aria-disabled, not disabled: the re-render while loading can keep focus here.
+  btn.setAttribute('aria-disabled', String(lineState.status === 'loading'));
   btn.addEventListener('click', (ev) => {
     ev.stopPropagation();
     if (lineState.status === 'loading') return;
@@ -843,8 +1282,8 @@ function lineExplainMarkup(rowId, item) {
       const tBtn = document.createElement('button');
       tBtn.type = 'button';
       tBtn.className = 'ghost line-explain-btn';
-      tBtn.style.marginTop = '6px';
-      tBtn.textContent = '⚡ Troubleshoot in Actionable';
+      tBtn.style.marginTop = 'var(--sp-2)';
+      tBtn.textContent = 'Investigate';
       tBtn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         setPlanFromExplainResult(lineState.rawResult, 'line', null, item);
@@ -866,7 +1305,7 @@ function lineExplainMarkup(rowId, item) {
 async function explainLine(rowId, item, options = {}) {
   if (!aiFeatureOn('explain_line')) return;
   state.lineExplainState.set(rowId, { status: 'loading' });
-  renderAll();
+  rerenderRow(rowId);
   try {
     const result = await fetchJson('/api/explain-line', {
       method: 'POST',
@@ -887,7 +1326,7 @@ async function explainLine(rowId, item, options = {}) {
   } catch (err) {
     state.lineExplainState.set(rowId, { status: 'error', error: err.message });
   }
-  renderAll();
+  rerenderRow(rowId);
   if (state.context.recordId !== null) renderContext();
 }
 
@@ -913,8 +1352,8 @@ function detailMarkup(item, rowId, { inContext = false } = {}) {
   const investigateBtn = document.createElement('button');
   investigateBtn.type = 'button';
   investigateBtn.className = 'ghost row-detail-btn';
-  investigateBtn.textContent = 'Investigate in Actionable';
-  investigateBtn.title = 'Open the troubleshooting workspace for this pod (logs, describe, events)';
+  investigateBtn.textContent = 'Investigate';
+  investigateBtn.title = 'Open this pod in the Investigate tab (logs, describe, events)';
   investigateBtn.addEventListener('click', (ev) => {
     ev.stopPropagation();
     openLineInActionable(item);
@@ -928,98 +1367,162 @@ function detailMarkup(item, rowId, { inContext = false } = {}) {
   if (item.output_fields && Object.keys(item.output_fields).length) {
     addDetailBlock(wrap, 'output_fields', JSON.stringify(item.output_fields, null, 2));
   }
+  if (aiFeatureOn('explain_line')) wrap.appendChild(lineExplainMarkup(rowId, item));
   return wrap;
 }
 
+// The lines a merged row stands for; each time opens that line's context.
 function timestampsMarkup(group) {
   const wrap = document.createElement('div');
-  wrap.className = 'row-detail group-timestamps';
+  wrap.className = 'group-timestamps';
   const label = document.createElement('div');
   label.className = 'detail-label';
-  label.textContent = `${group.items.length} occurrences`;
+  label.textContent = `${group.items.length} occurrences · open one to see its context`;
   wrap.appendChild(label);
+  const list = document.createElement('div');
+  list.className = 'timestamp-list';
   for (const item of group.items) {
-    const line = document.createElement('div');
+    const line = document.createElement('button');
+    line.type = 'button';
     line.className = 'timestamp-line';
-    line.textContent = formatTimestamp(item.timestamp);
-    line.title = item.timestamp;
-    wrap.appendChild(line);
+    line.textContent = formatDateTime(item.timestamp);
+    line.title = 'Show the lines around this one';
+    line.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openContext(Number(item.id));
+    });
+    list.appendChild(line);
   }
+  wrap.appendChild(list);
   return wrap;
 }
 
-function renderRows(items, append = false) {
+// Which control inside which row has focus (by its position among the row's
+// buttons), so a re-render can put focus back on the same control.
+const ROW_FOCUSABLE = 'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])';
+function focusedRowControl() {
+  const active = document.activeElement;
+  const row = active instanceof Element ? active.closest('#rows .row') : null;
+  if (!row) return null;
+  return { rowId: row.dataset.rowId, index: Array.from(row.querySelectorAll(ROW_FOCUSABLE)).indexOf(active) };
+}
+
+function restoreRowFocus(saved) {
+  if (!saved) return;
+  const row = Array.from(el('rows').children).find((node) => node.dataset.rowId === saved.rowId);
+  if (!row) return;
+  const target = row.querySelectorAll(ROW_FOCUSABLE)[saved.index] || row.querySelector('.message-button');
+  if (target) target.focus({ preventScroll: true });
+}
+
+function renderRows(items) {
   const rows = el('rows');
-  if (!append) rows.innerHTML = '';
-  if (!append && !items.length) {
+  const focus = focusedRowControl();
+  rows.innerHTML = '';
+  if (!items.length) {
     const latestCached = state.lastStatus?.latest_record_timestamp;
     const latestHint = latestCached
-      ? ` Latest cached logs reach ${formatTimestamp(latestCached)}.`
+      ? ` Newest cached line: ${formatDateTime(latestCached)}.`
       : '';
-    rows.innerHTML = `<div class="empty-state">No logs found for the current filters.${latestHint} <button id="loadLatestCached" class="ghost empty-action">Load latest cached day</button></div>`;
+    rows.replaceChildren(panelStateNode('empty', {
+      message: `No log lines match these filters.${latestHint}`,
+      action: { label: 'Load latest cached day', id: 'loadLatestCached' },
+    }));
+    state.resultCounts = null;
     el('resultSummary').textContent = 'No rows match';
     return;
   }
-  let collapsed = 0;
-  const visible = items.slice(0, CURRENT_LOG_LIMIT);
-  for (const group of buildGroups(visible)) {
-    const representative = group.items[0];
-    collapsed += group.items.length - 1;
-    const node = rowMarkup(representative);
-    const rowId = String(representative.id);
-    node.dataset.rowId = rowId;
-    if (group.items.length > 1) {
-      const badge = node.querySelector('.badge');
-      const count = document.createElement('span');
-      count.className = 'count-badge';
-      count.textContent = `×${group.items.length}`;
-      count.title = `${group.items.length} identical alerts — click row to show individual timestamps`;
-      badge.after(count);
-      node.classList.add('grouped');
-      node.dataset.groupKey = groupKeyOf(representative);
-      if (state.expandedGroups.has(node.dataset.groupKey)) {
-        node.classList.add('expanded');
-        node.appendChild(timestampsMarkup(group));
-      }
-    }
-    if (state.expandedRows.has(rowId)) {
-      node.classList.add('expanded');
-      node.appendChild(detailMarkup(representative, rowId));
-    }
-    node.addEventListener('click', () => {
-      if (group.items.length > 1) {
-        const key = node.dataset.groupKey;
-        if (state.expandedRows.has(rowId)) {
-          state.expandedRows.delete(rowId);
-        }
-        if (state.expandedGroups.has(key)) {
-          state.expandedGroups.delete(key);
-        } else {
-          state.expandedGroups.add(key);
-        }
-      } else if (state.expandedRows.has(rowId)) {
-        state.expandedRows.delete(rowId);
-      } else {
-        state.expandedRows.add(rowId);
-      }
-      renderAll();
-    });
-    rows.appendChild(node);
+  const groups = buildGroups(items);
+  state.rowGroups = new Map(groups.map((group) => [String(group.items[0].id), group]));
+  const fragment = document.createDocumentFragment();
+  for (const group of groups) fragment.appendChild(rowNode(group));
+  rows.appendChild(fragment);
+  state.resultCounts = { lines: items.length, rows: groups.length };
+  updateResultSummary();
+  restoreRowFocus(focus);
+}
+
+// One row of the list: a line, or a merged group shown by its newest line.
+function rowNode(group) {
+  const representative = group.items[0];
+  const node = rowMarkup(representative);
+  const rowId = String(representative.id);
+  node.dataset.rowId = rowId;
+  const merged = group.items.length > 1;
+  if (merged) {
+    const badge = node.querySelector('.badge');
+    const count = document.createElement('span');
+    count.className = 'count-badge';
+    count.textContent = `×${group.items.length}`;
+    count.title = `${group.items.length} identical lines within 5 minutes — open the row to list them`;
+    badge.after(count);
+    node.classList.add('grouped');
   }
-  const total = append ? state.items.length : visible.length;
-  const groupedNote = collapsed > 0 ? ` · ${collapsed} collapsed` : '';
-  el('resultSummary').textContent = `${total} visible lines${groupedNote}`;
+  const expanded = group.items.some((item) => state.expandedRows.has(String(item.id)));
+  node.querySelector('.message-button').setAttribute('aria-expanded', String(expanded));
+  if (expanded) {
+    node.classList.add('expanded');
+    const detail = detailMarkup(representative, rowId);
+    if (merged) detail.appendChild(timestampsMarkup(group));
+    node.appendChild(detail);
+  }
+  node.addEventListener('click', (ev) => {
+    // Clicks on the detail (text selection, its own buttons) keep the row open.
+    if (ev.target instanceof Element && ev.target.closest('.row-detail')) return;
+    if (expanded) {
+      for (const item of group.items) state.expandedRows.delete(String(item.id));
+    } else {
+      state.expandedRows.add(rowId);
+    }
+    rerenderRow(rowId);
+  });
+  return node;
+}
+
+// Re-renders one row in place (open / close, explain state), keeping focus
+// on the same control; a full render of a long list is far slower.
+function rerenderRow(rowId) {
+  const group = state.rowGroups.get(rowId);
+  const current = Array.from(el('rows').children).find((node) => node.dataset.rowId === rowId);
+  if (!group || !current) {
+    renderAll();
+    return;
+  }
+  const focus = focusedRowControl();
+  current.replaceWith(rowNode(group));
+  restoreRowFocus(focus);
+}
+
+// "200 of 374 lines · 38 groups": lines loaded into the list, the range total
+// once the histogram for the same filters has loaded, and how many rows
+// ("groups") they collapse into.
+function updateResultSummary() {
+  const counts = state.resultCounts;
+  if (!counts) return;
+  const panels = state.logPanels;
+  const total = panels.rangeTotal !== null
+    ? ` of ${formatCount(panels.rangeTotal)}${panels.rangeTruncated ? '+' : ''}`
+    : '';
+  let text = `${formatCount(counts.lines)}${total} line${counts.lines === 1 && !total ? '' : 's'}`;
+  if (counts.rows !== counts.lines) text += ` · ${formatCount(counts.rows)} group${counts.rows === 1 ? '' : 's'}`;
+  el('resultSummary').textContent = text;
 }
 
 function renderAll() {
-  renderRows(state.items, false);
+  renderRows(state.items);
+}
+
+// Whether the list has been scrolled away from its newest rows, either inside
+// the list itself or by scrolling the page past its top.
+function listScrolledAway() {
+  const host = el('logListHost');
+  return host.scrollTop > SCROLLED_AWAY_PX || el('rows').getBoundingClientRect().top < -SCROLLED_AWAY_PX;
 }
 
 // ─── Log context (entries around one selected entry) ─────────────────────────
 
 async function openContext(recordId, { history = 'push' } = {}) {
   if (!Number.isSafeInteger(recordId) || recordId < 0) return;
-  closeOlderLogsOverlay();
   const ctx = state.context;
   ctx.recordId = recordId;
   ctx.data = null;
@@ -1071,8 +1574,8 @@ function contextBoundText(side, bounds, anchor) {
   if (!value) return '';
   if (fromRange) {
     return side === 'before'
-      ? `the active time range starts at ${formatTimestamp(value)}`
-      : `the active time range ends at ${formatTimestamp(value)}`;
+      ? `the active time range starts at ${formatDateTime(value)}`
+      : `the active time range ends at ${formatDateTime(value)}`;
   }
   if (bounds.window_secs) {
     const hours = Math.round(bounds.window_secs / 3600);
@@ -1213,14 +1716,86 @@ function anomalyTypeLabel(type) {
   return map[type] || type;
 }
 
+// Pod and rule key of an anomaly (either may be empty).
+function anomalySourceText(anomaly) {
+  return [anomaly.pod, anomaly.rule_key].filter(Boolean).join(' / ');
+}
+
+// "⋯" menu button (ARIA menu button pattern): click, Enter, Space or
+// ArrowDown opens it on the first item (ArrowUp on the last); arrow keys,
+// Home and End move; Esc closes it and returns focus to the button; Tab or a
+// click outside closes it; choosing an item closes it.
+function attachMenu(trigger, menu) {
+  const items = () => Array.from(menu.querySelectorAll('[role="menuitem"]')).filter((item) => !item.hidden && !item.disabled);
+  const outside = (ev) => {
+    if (!menu.contains(ev.target) && !trigger.contains(ev.target)) close(false);
+  };
+  function close(refocus) {
+    if (menu.hidden) return;
+    menu.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', outside, true);
+    if (refocus) trigger.focus();
+  }
+  const open = (last = false) => {
+    menu.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', outside, true);
+    const list = items();
+    (last ? list[list.length - 1] : list[0])?.focus();
+  };
+  trigger.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    if (menu.hidden) open();
+    else close(true);
+  });
+  trigger.addEventListener('keydown', (ev) => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      open(ev.key === 'ArrowUp');
+    }
+  });
+  menu.addEventListener('keydown', (ev) => {
+    const list = items();
+    const index = list.indexOf(document.activeElement);
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp') {
+      ev.preventDefault();
+      const step = ev.key === 'ArrowDown' ? 1 : -1;
+      list[(index + step + list.length) % list.length]?.focus();
+    } else if (ev.key === 'Home' || ev.key === 'End') {
+      ev.preventDefault();
+      (ev.key === 'Home' ? list[0] : list[list.length - 1])?.focus();
+    } else if (ev.key === 'Escape') {
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(true);
+    } else if (ev.key === 'Tab') {
+      close(false);
+    }
+  });
+  // Capture: close before the item's own handler runs (it stops propagation).
+  menu.addEventListener('click', (ev) => {
+    if (ev.target instanceof Element && ev.target.closest('[role="menuitem"]')) close(true);
+  }, true);
+}
+
 function renderAnomalies() {
   const container = el('anomalyRows');
   container.innerHTML = '';
   const { anomalies } = state;
   const emptyEl = el('insightsEmpty');
-  emptyEl.textContent = 'No anomalies found for the selected filter.';
   emptyEl.hidden = anomalies.length > 0;
-  if (!anomalies.length) return;
+  if (!anomalies.length) {
+    const filtered = el('insightsStatusFilter').value !== '';
+    setPanelState(emptyEl, 'empty', {
+      message: filtered ? 'No anomalies with this status.' : 'No anomalies detected yet.',
+      action: filtered ? { label: 'Show all statuses', onClick: () => {
+        el('insightsStatusFilter').value = '';
+        loadInsights().catch(() => {});
+      } } : null,
+    });
+    return;
+  }
 
   for (const anomaly of anomalies) {
     const tpl = el('anomalyRowTemplate');
@@ -1232,61 +1807,64 @@ function renderAnomalies() {
     typeBadge.textContent = anomalyTypeLabel(anomaly.type);
     typeBadge.classList.add(`atype-${anomaly.type}`);
 
-    node.querySelector('.anomaly-namespace').textContent = anomaly.namespace || '—';
-    const podText = [anomaly.pod, anomaly.rule_key].filter(Boolean).join(' / ');
-    node.querySelector('.anomaly-pod').textContent = podText || '—';
-
-    // Severity badge — FIX: only add a class when severity is non-empty.
-    // message_frequency anomalies have severity: "" by design; classList.add('')
-    // throws a DOMException and previously crashed the whole render loop,
-    // leaving every anomaly after (or including) the first empty-severity one
-    // unrendered — the root cause of "badge shows a count but the list is blank".
-    const sevBadge = node.querySelector('.badge');
-    sevBadge.textContent = anomaly.severity || '—';
-    if (anomaly.severity) {
-      sevBadge.closest('.anomaly-col-severity').classList.add(anomaly.severity);
-    }
-
-    const summaryEl = node.querySelector('.anomaly-summary-text');
-    const actionEl = node.querySelector('.anomaly-action-text');
-    // Free template summary until (or instead of) an AI summary.
+    // Where it happened; empty pod / severity are left out, not shown as "—".
+    node.querySelector('.anomaly-title').textContent = anomaly.namespace || 'Cluster-wide';
     const templateSummary = anomaly.template_summary || {};
-    const sourceEl = node.querySelector('.anomaly-source');
     const meta = anomaly.ai_meta || null;
+    const sourceText = anomalySourceText(anomaly);
+    const snippet = node.querySelector('.anomaly-snippet');
+    snippet.textContent = anomaly.ai_summary || sourceText || templateSummary.headline || '';
+    snippet.title = snippet.textContent;
+    snippet.classList.toggle('anomaly-snippet-source', !anomaly.ai_summary && Boolean(sourceText));
+    snippet.hidden = !snippet.textContent;
+
+    const sourceEl = node.querySelector('.anomaly-source');
     if (anomaly.ai_summary) {
-      summaryEl.textContent = anomaly.ai_summary;
       const label = meta ? sourceLabel(meta) : 'AI';
-      if (label) {
-        const age = meta ? ageFrom(meta) : null;
-        sourceEl.textContent = age === null ? label : `${label} · ${formatAge(age)}`;
-        sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
-        sourceEl.hidden = false;
-      }
+      const age = meta ? ageFrom(meta) : null;
+      sourceEl.textContent = age === null ? label || 'AI' : `${label} · ${formatAge(age)}`;
+      sourceEl.className = `anomaly-source source-badge source-${(meta && meta.source) || 'ai'}`;
     } else {
-      summaryEl.textContent = templateSummary.headline || 'No summary yet.';
-      summaryEl.classList.add('muted');
-      sourceEl.textContent = 'Template';
+      sourceEl.textContent = 'Rule-based';
       sourceEl.className = 'anomaly-source source-badge source-template';
       sourceEl.title = 'Computed from the detection counts and log templates (no AI call)';
-      sourceEl.hidden = false;
     }
-    if (anomaly.ai_suggested_action) {
-      actionEl.textContent = `→ ${anomaly.ai_suggested_action}`;
-    } else if (!anomaly.ai_summary && templateSummary.signature) {
-      actionEl.textContent = `Known pattern: ${templateSummary.signature.title}`;
+
+    const sev = node.querySelector('.anomaly-sev');
+    const sevInline = node.querySelector('.anomaly-sev-inline'); // phones: in the title line
+    if (anomaly.severity) {
+      sev.classList.add(anomaly.severity);
+      sev.querySelector('.badge').textContent = anomaly.severity;
+      sevInline.classList.add('has-sev', anomaly.severity);
+      sevInline.textContent = anomaly.severity;
     } else {
-      actionEl.hidden = true;
+      sev.classList.add('is-empty');
     }
 
-    const statusBadge = node.querySelector('.anomaly-status-badge');
-    statusBadge.textContent = STATUS_LABELS[anomaly.status] || anomaly.status;
-    if (anomaly.status) {
-      statusBadge.classList.add(`astatus-${anomaly.status}`);
+    const counts = templateSummary.counts || {};
+    const current = counts.current ?? anomaly.evidence?.current_count;
+    const countEl = node.querySelector('.anomaly-count');
+    countEl.textContent = current === null || current === undefined ? '' : `${formatCount(current)} lines`;
+    if (counts.ratio) {
+      const ratio = document.createElement('span');
+      ratio.className = 'anomaly-ratio'; // hidden on phones
+      ratio.textContent = ` · ${counts.ratio}×`;
+      countEl.appendChild(ratio);
     }
-
-    node.querySelector('.anomaly-time').textContent = anomaly.detected_at
-      ? formatTimestamp(anomaly.detected_at)
-      : '—';
+    countEl.title = templateSummary.headline || '';
+    const seenAt = anomaly.updated_at || anomaly.detected_at;
+    const timeEl = node.querySelector('.anomaly-time');
+    const statusNote = anomaly.status && anomaly.status !== 'new' ? ` · ${STATUS_LABELS[anomaly.status] || anomaly.status}` : '';
+    if (seenAt) {
+      const word = document.createElement('span');
+      word.className = 'anomaly-seen-word'; // hidden on phones
+      word.textContent = 'seen ';
+      timeEl.replaceChildren(word, `${formatAge((Date.now() - Date.parse(seenAt)) / 1000)}${statusNote}`);
+    } else {
+      timeEl.textContent = statusNote.slice(3);
+    }
+    timeEl.title = [anomaly.detected_at && `Detected ${formatDateTime(anomaly.detected_at)}`,
+      anomaly.updated_at && `last updated ${formatDateTime(anomaly.updated_at)}`].filter(Boolean).join(' · ');
 
     const btnSummarize = node.querySelector('.anomaly-btn-summarize');
     const btnDeep = node.querySelector('.anomaly-btn-deep');
@@ -1298,12 +1876,12 @@ function renderAnomalies() {
       else if (anomaly.ai_summary) btnSummarize.textContent = '✦ Regenerate';
       btnSummarize.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        summarizeAnomaly(anomaly, btnSummarize, fromSignature ? { skip_signature: true }
+        summarizeAnomaly(anomaly, node, fromSignature ? { skip_signature: true }
           : anomaly.ai_summary ? { regenerate: true, skip_signature: true } : {});
       });
       btnDeep.addEventListener('click', (ev) => {
         ev.stopPropagation();
-        summarizeAnomaly(anomaly, btnDeep, { tier: 'deep', skip_signature: true });
+        summarizeAnomaly(anomaly, node, { tier: 'deep', skip_signature: true });
       });
     }
     const btnTroubleshoot = node.querySelector('.anomaly-btn-troubleshoot');
@@ -1317,12 +1895,10 @@ function renderAnomalies() {
       btnDismissed.disabled = true;
       btnDismissed.textContent = '✕ Dismissed';
     }
-    if (btnTroubleshoot) {
-      btnTroubleshoot.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        openAnomalyInActionable(anomaly);
-      });
-    }
+    btnTroubleshoot.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openAnomalyInActionable(anomaly);
+    });
     if (state.focusAnomalyId === anomaly.id) node.classList.add('anomaly-focused');
     btnReviewed.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -1332,30 +1908,41 @@ function renderAnomalies() {
       ev.stopPropagation();
       patchAnomalyStatus(anomaly.id, 'dismissed', node);
     });
+    attachMenu(node.querySelector('.row-menu-btn'), node.querySelector('.row-menu-list'));
 
     const detail = node.querySelector('.anomaly-detail');
     const expandBtn = node.querySelector('.anomaly-expand-btn');
     const anomalyId = String(anomaly.id);
-    if (state.expandedAnomalies.has(anomalyId)) {
-      detail.hidden = false;
-      expandBtn.textContent = '▴';
-      fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
-    }
-    node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
-      if (ev.target.closest('button')) return;
+    detail.id = `anomaly-detail-${anomalyId}`;
+    expandBtn.setAttribute('aria-controls', detail.id);
+    const showExpanded = (expanded) => {
+      detail.hidden = !expanded;
+      expandBtn.textContent = expanded ? '▴' : '▾';
+      expandBtn.setAttribute('aria-expanded', String(expanded));
+      expandBtn.setAttribute('aria-label', expanded ? 'Collapse evidence' : 'Expand evidence');
+      if (expanded) fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+    };
+    if (state.expandedAnomalies.has(anomalyId)) showExpanded(true);
+    // The chevron and a click on the row background (not its other buttons) toggle.
+    const toggleDetail = () => {
       if (state.expandedAnomalies.has(anomalyId)) {
         state.expandedAnomalies.delete(anomalyId);
-        detail.hidden = true;
-        expandBtn.textContent = '▾';
+        showExpanded(false);
         if (state.focusAnomalyId === anomaly.id) state.focusAnomalyId = null;
       } else {
         state.expandedAnomalies.add(anomalyId);
-        detail.hidden = false;
-        expandBtn.textContent = '▴';
-        fillAnomalyDetail(detail.querySelector('.anomaly-detail-inner'), anomaly);
+        showExpanded(true);
         state.focusAnomalyId = anomaly.id;
       }
       updateUrl('replace');
+    };
+    expandBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      toggleDetail();
+    });
+    node.querySelector('.anomaly-main').addEventListener('click', (ev) => {
+      if (ev.target.closest('button, .row-menu')) return;
+      toggleDetail();
     });
 
     container.appendChild(node);
@@ -1365,6 +1952,13 @@ function renderAnomalies() {
 function fillAnomalyDetail(container, anomaly) {
   container.innerHTML = '';
   const evidence = anomaly.evidence || {};
+  const source = [anomaly.namespace && `namespace: ${anomaly.namespace}`, anomaly.pod && `pod: ${anomaly.pod}`,
+    anomaly.rule_key && `rule / pattern: ${anomaly.rule_key}`].filter(Boolean).join('\n');
+  if (source) addDetailBlock(container, 'Source', source);
+  if (anomaly.ai_summary) {
+    const action = anomaly.ai_suggested_action ? `\n\n→ ${anomaly.ai_suggested_action}` : '';
+    addDetailBlock(container, 'AI summary', `${anomaly.ai_summary}${action}`);
+  }
   if (anomaly.evidence_error) addDetailBlock(container, 'Evidence unavailable', anomaly.evidence_error);
   const ts = anomaly.template_summary;
   if (ts) {
@@ -1399,7 +1993,7 @@ function fillAnomalyDetail(container, anomaly) {
     btn.type = 'button';
     btn.className = 'ghost row-detail-btn';
     btn.textContent = 'View logs for this window';
-    btn.title = `${windowRange.start} – ${windowRange.before} UTC (end exclusive)`;
+    btn.title = `${formatSpan(windowRange.start, windowRange.before)} (end exclusive)`;
     btn.addEventListener('click', (ev) => {
       ev.stopPropagation();
       openAnomalyLogs(anomaly);
@@ -1436,10 +2030,17 @@ function openAnomalyLogs(anomaly) {
   closeContext({ history: null });
   switchTab('logs', { history: null });
   updateUrl('push');
-  loadLogs(true);
+  loadLogs();
 }
 
+// Reviewed / Dismiss. The two buttons are disabled while the request runs; a
+// failure is shown on the row itself and the buttons are enabled again.
 async function patchAnomalyStatus(id, status, rowNode) {
+  const buttons = rowNode.querySelectorAll('.anomaly-btn-reviewed, .anomaly-btn-dismissed');
+  const errorBox = rowNode.querySelector('.anomaly-row-error');
+  const wasDisabled = Array.from(buttons, (button) => button.disabled);
+  buttons.forEach((button) => { button.disabled = true; });
+  errorBox.hidden = true;
   try {
     await fetchJson(`/api/anomalies/${id}`, {
       method: 'PATCH',
@@ -1450,16 +2051,15 @@ async function patchAnomalyStatus(id, status, rowNode) {
     if (anomaly) anomaly.status = status;
     renderAnomalies();
   } catch (err) {
-    el('health').textContent = `Failed to update anomaly: ${err.message}`;
+    buttons.forEach((button, index) => { button.disabled = wasDisabled[index]; });
+    errorBox.textContent = `Could not mark as ${status}: ${err.message}`;
+    errorBox.hidden = false;
   }
 }
 
 function showInsightsError(message) {
-  const emptyEl = el('insightsEmpty');
-  const container = el('anomalyRows');
-  container.innerHTML = '';
-  emptyEl.textContent = message;
-  emptyEl.hidden = false;
+  el('anomalyRows').innerHTML = '';
+  setPanelState(el('insightsEmpty'), 'error', { message, action: { label: 'Retry', onClick: () => loadInsights().catch(() => {}) } });
 }
 
 // Returns the in-flight load when one is running, so callers can await it.
@@ -1473,6 +2073,10 @@ async function fetchInsights() {
   const requestId = ++state.insightsRequestId;
   state.insightsLoading = true;
   state.insightsLoaded = false;
+  if (!state.anomalies.length) {
+    el('insightsEmpty').hidden = true;
+    el('anomalyRows').replaceChildren(panelStateNode('loading', { layout: 'list', lines: 6 }));
+  }
   const statusValue = el('insightsStatusFilter').value;
   const params = new URLSearchParams();
   if (statusValue) params.set('status', statusValue);
@@ -1483,10 +2087,15 @@ async function fetchInsights() {
     if (requestId !== state.insightsRequestId) return;
     state.anomalies = data.items || [];
     state.insightsLoaded = true;
-    const newCount = state.anomalies.filter((a) => a.status === 'new').length;
+    const fresh = state.anomalies.filter((a) => a.status === 'new');
+    const newCount = fresh.length;
     const badge = el('insightsBadge');
     if (newCount > 0) {
+      // Neutral count; red only when a new anomaly is about errors.
+      const errors = fresh.some((a) => a.severity === 'error' || a.type === 'error_rate_spike');
       badge.textContent = String(newCount);
+      badge.classList.toggle('tab-badge-neutral', !errors);
+      badge.title = errors ? `${newCount} new anomalies, including errors` : `${newCount} new anomalies`;
       badge.hidden = false;
     } else {
       badge.hidden = true;
@@ -1615,7 +2224,7 @@ async function runExplain(options = {}) {
 }
 
 el('explainBtn').addEventListener('click', () => {
-  runExplain().catch((err) => { el('health').textContent = err.message; });
+  runExplain().catch((err) => showToast(`Explain failed: ${err.message}`, { key: 'explain' }));
 });
 
 el('explainDismiss').addEventListener('click', () => {
@@ -1627,7 +2236,7 @@ el('explainDismiss').addEventListener('click', () => {
   el('explainMeta').replaceChildren();
 });
 
-// ─── Actionable Troubleshooting Workspace ────────────────────────────────────
+// ─── Investigate (the "actionable" tab; ids and URLs keep that name) ─────────
 
 // Names as the server's validator accepts them; anything else (e.g. "-" for
 // a missing pod) is left out instead of producing a doomed command.
@@ -1757,7 +2366,7 @@ function openLineInActionable(item, { history = 'push' } = {}) {
   state.focusAnomalyId = null;
   const where = `${item.namespace} · ${item.pod}/${item.container}`;
   resetInvestigation({
-    summary: `Log entry from ${where} at ${formatTimestamp(item.timestamp)} (${item.severity_bucket}). `
+    summary: `Log entry from ${where} at ${formatDateTime(item.timestamp)} (${item.severity_bucket}). `
       + 'Use the evidence checks below, or "Explain this line" in Logs for AI-suggested steps.',
     steps: [],
     suggested_action: '',
@@ -1981,7 +2590,7 @@ function stepOutputMarkup(step, stepState) {
   outMeta.className = 'step-output-meta';
   if (stepState.ran_at) {
     const at = document.createElement('span');
-    at.textContent = new Date(stepState.ran_at).toLocaleTimeString();
+    at.textContent = formatDateTime(stepState.ran_at, { date: false });
     outMeta.appendChild(at);
   }
   if (stepState.duration_ms !== undefined) {
@@ -2063,7 +2672,7 @@ function renderEvidenceLog(plan) {
     });
     const time = document.createElement('span');
     time.className = 'evidence-log-time';
-    time.textContent = new Date(st.ran_at).toLocaleTimeString();
+    time.textContent = formatDateTime(st.ran_at, { date: false });
     const origin = document.createElement('span');
     origin.className = 'evidence-log-origin';
     origin.textContent = String(key).startsWith('check:') ? 'Check' : `Step ${Number(String(key).split(':')[1]) + 1}`;
@@ -2090,14 +2699,14 @@ function renderActionableWorkspace() {
   if (!plan || !plan.summary) {
     emptyEl.hidden = false;
     wsEl.hidden = true;
-    el('actionableRefreshLabel').textContent = 'Generate Plan';
-    descEl.textContent = 'Ready to investigate';
+    el('actionableRefreshLabel').textContent = 'Generate plan';
+    descEl.textContent = 'Nothing under investigation yet';
     return;
   }
 
   emptyEl.hidden = true;
   wsEl.hidden = false;
-  el('actionableRefreshLabel').textContent = 'Refresh Plan';
+  el('actionableRefreshLabel').textContent = 'Refresh plan';
   const steps = plan.steps || [];
 
   // Context description and the investigation's origin
@@ -2354,233 +2963,146 @@ async function loadFacets() {
 
 function updateHealthFromStatus(status) {
   if (status.database_error) {
-    el('health').textContent = `Database error: ${status.database_error}`;
+    setHealth('error', 'Database error', `Database error: ${status.database_error}`);
     return;
-  }
-  el('health').textContent = status.total_records
-    ? `Cached ${status.total_records} rows from ${status.total_objects} objects`
-    : 'Waiting for ingestion';
-  if (!status.total_records && status.last_error) {
-    el('health').textContent = `Ingestion error: ${status.last_error}`;
   }
   const ingest = status.ingest || {};
-  if (ingest.state === 'stale' || ingest.state === 'stalled') {
+  const cached = `Cached ${formatCount(status.total_records || 0)} rows from ${formatCount(status.total_objects || 0)} objects`;
+  if (ingest.state === 'stalled') {
+    setHealth('error', 'Ingest stalled', 'Ingestion stalled: the S3 poll loop has not completed recently');
+  } else if (ingest.state === 'stale') {
     const since = ingest.seconds_since_last_success;
     const age = Number.isFinite(since) ? ` for ${Math.round(since / 60)}m` : '';
-    el('health').textContent = ingest.state === 'stalled'
-      ? 'Ingestion stalled: the S3 poll loop has not completed recently'
-      : `Ingestion stale: no successful S3 poll${age}${status.last_error ? ` (${status.last_error})` : ''}`;
+    setHealth('warn', 'Ingest stale', `Ingestion stale: no successful S3 poll${age}${status.last_error ? ` (${status.last_error})` : ''}`);
+  } else if (!status.total_records && status.last_error) {
+    setHealth('error', 'Ingest error', `Ingestion error: ${status.last_error}`);
+  } else if (!status.total_records) {
+    setHealth('unknown', 'Waiting', 'Waiting for ingestion');
   } else if (ingest.failing_objects) {
-    el('health').textContent += ` · ${ingest.failing_objects} S3 object(s) failing, retrying`;
+    setHealth('warn', `${ingest.failing_objects} failing`, `${cached} · ${ingest.failing_objects} S3 object(s) failing, retrying`);
+  } else {
+    setHealth('ok', 'Ingest OK', cached);
   }
 }
 
+// "Load older" below the list: appends the next page to the same list (the
+// button, or scrolling near it, loads one page at a time).
 function resetOlderLogsState() {
-  state.olderItems = [];
-  state.olderCursor = null;
-  state.olderHasMore = false;
   state.olderLoading = false;
   state.olderRequestId += 1;
-  closeOlderLogsOverlay();
-  const loadMore = el('loadMore');
-  if (loadMore) {
-    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
-    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
-  }
+  state.olderTrimmed = false;
+  state.scrolledSincePage = false;
+  el('loadMoreError').hidden = true;
+  renderPager();
 }
 
-function openOlderLogsOverlay(explicitUserAction = false) {
-  if (!explicitUserAction) {
-    closeOlderLogsOverlay();
-    return;
-  }
-  const hasOlder = Boolean(state.nextCursor || state.olderCursor || state.olderItems.length);
-  if (!hasOlder) {
-    closeOlderLogsOverlay();
-    return;
-  }
-  state.olderOverlayOpen = true;
-  const overlay = el('olderLogsOverlay');
-  if (overlay) {
-    overlay.hidden = false;
-    overlay.style.display = 'flex';
-  }
-  if (!state.olderItems.length) {
-    loadOlderLogsPage().catch((err) => {
-      el('health').textContent = err.message;
-    });
+function renderPager() {
+  const button = el('loadMore');
+  button.hidden = !state.items.length;
+  if (state.olderTrimmed) {
+    button.disabled = false;
+    button.textContent = 'Reload to see older lines';
   } else {
-    renderOlderLogs();
-  }
-}
-
-function closeOlderLogsOverlay() {
-  state.olderOverlayOpen = false;
-  const overlay = el('olderLogsOverlay');
-  if (overlay) {
-    overlay.hidden = true;
-    overlay.style.display = 'none';
-  }
-}
-
-function ensureOlderLogsClosed() {
-  closeOlderLogsOverlay();
-  const olderLoadMore = el('olderLogsLoadMore');
-  if (olderLoadMore) {
-    olderLoadMore.disabled = true;
-  }
-}
-
-function handleOlderOverlayOutsideClick(event) {
-  const overlay = el('olderLogsOverlay');
-  if (!overlay || overlay.hidden) return;
-  if (event.target === overlay) {
-    closeOlderLogsOverlay();
+    button.disabled = state.olderLoading || !state.nextCursor;
+    button.textContent = state.olderLoading ? 'Loading…' : state.nextCursor ? 'Load older' : 'No older lines in this range';
   }
 }
 
 async function loadOlderLogsPage() {
-  if (state.olderLoading) return;
-  const cursor = state.olderCursor || state.nextCursor;
-  if (!cursor && !state.olderItems.length) {
-    closeOlderLogsOverlay();
+  if (state.olderTrimmed) {
+    reloadLogs();
     return;
   }
-
+  if (state.olderLoading || !state.nextCursor) return;
   const requestId = ++state.olderRequestId;
   state.olderLoading = true;
-  renderOlderLogs();
-
+  el('loadMoreError').hidden = true;
+  renderPager();
   try {
-    const params = new URLSearchParams(queryFromFilters({ limit: String(OLDER_LOG_LIMIT), cursor }));
+    const params = new URLSearchParams(queryFromFilters({ limit: String(LOG_PAGE_SIZE), cursor: state.nextCursor }));
     const data = await fetchJson(`/api/logs?${params.toString()}`);
     if (requestId !== state.olderRequestId) return;
-
-    const items = Array.isArray(data.items) ? data.items : [];
-    if (items.length) {
-      state.olderItems = state.olderItems.concat(items);
-    }
-    state.olderCursor = data.next_cursor || null;
-    state.olderHasMore = Boolean(data.has_more);
-    if (!state.olderCursor && !state.olderHasMore && state.olderItems.length) {
-      state.nextCursor = null;
-    }
+    const known = new Set(state.items.map((item) => item.id));
+    const older = (Array.isArray(data.items) ? data.items : []).filter((item) => !known.has(item.id));
+    state.items = state.items.concat(older);
+    state.nextCursor = data.next_cursor || null;
+    state.hasMore = Boolean(data.has_more);
+    state.scrolledSincePage = false;
+    renderAll();
   } catch (err) {
-    if (requestId === state.olderRequestId) {
-      closeOlderLogsOverlay();
-      el('health').textContent = err.message;
-    }
-    return;
+    if (requestId !== state.olderRequestId) return;
+    el('loadMoreError').textContent = `Could not load older lines: ${err.message}`;
+    el('loadMoreError').hidden = false;
   } finally {
     if (requestId === state.olderRequestId) {
       state.olderLoading = false;
-      renderOlderLogs();
+      renderPager();
     }
   }
 }
 
-function renderOlderLogs() {
-  const container = el('olderLogsList');
-  if (!container) return;
-  container.innerHTML = '';
-
-  if (!state.olderItems.length) {
-    container.innerHTML = '<div class="empty-state">No older logs available for this filter.</div>';
-  } else {
-    for (const item of state.olderItems) {
-      const node = rowMarkup(item);
-      node.classList.add('older-log-row');
-      if (state.expandedRows.has(String(item.id))) {
-        node.classList.add('expanded');
-        node.appendChild(detailMarkup(item, String(item.id)));
-      }
-      container.appendChild(node);
-    }
-  }
-
-  const olderLoadMore = el('olderLogsLoadMore');
-  if (olderLoadMore) {
-    const hasMore = state.olderHasMore || Boolean(state.nextCursor && !state.olderItems.length);
-    olderLoadMore.disabled = state.olderLoading || !hasMore;
-    olderLoadMore.hidden = !hasMore && !state.olderItems.length;
-    olderLoadMore.textContent = state.olderLoading ? 'Loading…' : (hasMore ? 'Load older' : 'No more older logs');
-  }
-}
-
+// A failed load replaces the list with the error and a Retry.
 function showLogsError(message) {
-  const box = el('logsError');
-  box.textContent = message || '';
-  box.hidden = !message;
+  if (!message) return;
+  state.items = [];
+  state.resultCounts = null;
+  el('resultSummary').textContent = 'Load failed';
+  setPanelState(el('rows'), 'error', { message, action: { label: 'Retry', onClick: () => reloadLogs() } });
+  renderPager();
 }
 
 function setLogsLoading(loading) {
   el('rows').setAttribute('aria-busy', loading ? 'true' : 'false');
-  if (loading) el('resultSummary').textContent = 'Loading…';
+  if (!loading) return;
+  el('resultSummary').textContent = '';
+  el('rows').replaceChildren(panelStateNode('loading', { layout: 'rows', lines: 10 }));
 }
 
-// Never rejects: a failed load is shown above the rows (the previous rows stay,
-// labelled as such), so callers need no error handling of their own.
-async function loadLogs(reset = true) {
+// Loads the first page of the applied filters. Never rejects: a failed load
+// is shown above the rows (the previous rows stay, labelled as such), so
+// callers need no error handling of their own.
+async function loadLogs() {
   const requestId = ++state.logsRequestId;
   state.tailRequestId += 1; // a tail response for the previous query must not land on this one
   refreshLiveEnd();
+  state.logPanels.rangeTotal = null; // belongs to the previous query
+  updateRangeChip();
+  renderFilterChips();
   setLogsLoading(true);
   let data;
   try {
-    const params = new URLSearchParams(queryFromFilters({ limit: String(CURRENT_LOG_LIMIT) }));
-    if (!reset && state.nextCursor) params.set('cursor', state.nextCursor);
+    const params = new URLSearchParams(queryFromFilters({ limit: String(LOG_PAGE_SIZE) }));
     data = await fetchJson(`/api/logs?${params.toString()}`);
   } catch (err) {
     if (requestId === state.logsRequestId) {
       setLogsLoading(false);
-      el('resultSummary').textContent = 'Load failed';
-      showLogsError(`Could not load logs: ${err.message}. The rows below are from the previous query.`);
+      showLogsError(`Could not load logs: ${err.message}.`);
     }
     return false;
   }
   if (requestId !== state.logsRequestId) return false;
   setLogsLoading(false);
-  showLogsError('');
   state.nextCursor = data.next_cursor || null;
   state.hasMore = Boolean(data.has_more);
   state.lastUpdatedAt = data.last_updated_at;
-  if (reset) {
-    state.items = Array.isArray(data.items) ? data.items.slice(0, CURRENT_LOG_LIMIT) : [];
-    state.olderItems = [];
-    state.olderCursor = null;
-    state.olderHasMore = false;
-    closeOlderLogsOverlay();
-  } else {
-    state.items = (Array.isArray(data.items) ? data.items : []).slice(0, CURRENT_LOG_LIMIT);
-  }
+  state.items = Array.isArray(data.items) ? data.items : [];
   state.expandedRows.clear();
-  state.expandedGroups.clear();
+  clearPendingTail();
+  resetOlderLogsState();
+  el('logListHost').scrollTop = 0;
   renderAll();
-  renderOlderLogs();
-  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
-  const loadMore = el('loadMore');
-  if (loadMore) {
-    loadMore.disabled = !(state.nextCursor || state.olderCursor || state.olderHasMore);
-    loadMore.textContent = state.nextCursor ? 'Load older' : 'End of results';
-  }
-  if (!el('health').textContent || !el('health').textContent.startsWith('Ingestion')) {
-    el('health').textContent = state.hasMore ? 'More older rows available' : 'End of current page';
-  }
+  renderFreshness();
   // Tail from the newest row that existed when this query ran, whether or not
   // Live is on yet and whether or not the page matched anything.
-  if (reset) state.liveCursor = Number.isFinite(data.max_id) ? data.max_id : null;
-  if (reset) {
-    // Filters may have changed: refresh the dashboard now only if it is on
-    // screen; otherwise mark it out of date so it reloads when opened.
-    if (state.activeTab === 'dashboard') {
-      loadDashboard().catch((err) => {
-        el('health').textContent = err.message;
-      });
-    } else {
-      state.dashboard.loaded = false;
-    }
-    scheduleLogPanels();
+  state.liveCursor = Number.isFinite(data.max_id) ? data.max_id : null;
+  // Filters may have changed: refresh the dashboard now only if it is on
+  // screen; otherwise mark it out of date so it reloads when opened.
+  if (state.activeTab === 'dashboard') {
+    loadDashboard().catch((err) => showToast(`Dashboard: ${err.message}`, { key: 'dashboard' }));
+  } else {
+    state.dashboard.loaded = false;
   }
+  scheduleLogPanels();
   return true;
 }
 
@@ -2589,27 +3111,54 @@ function compareNewestFirst(a, b) {
   return Number(b.id) - Number(a.id);
 }
 
-// New tail rows merged into the visible rows: newest first by event time,
-// each row once, capped to the view size (older rows drop off the bottom).
-function mergeNewestItems(incoming, current, limit) {
+// Rows merged newest first by event time, each row once.
+function mergeNewestItems(incoming, current) {
   const byId = new Map();
   for (const item of incoming.concat(current)) {
     if (!byId.has(item.id)) byId.set(item.id, item);
   }
-  return Array.from(byId.values()).sort(compareNewestFirst).slice(0, limit);
+  return Array.from(byId.values()).sort(compareNewestFirst);
 }
 
-function flashNewRows(count, truncated = false) {
-  const banner = el('newRowsBanner');
-  el('newRowsCount').textContent = truncated ? `${count}+` : String(count);
-  banner.classList.add('show');
-  window.clearTimeout(flashNewRows.timer);
-  flashNewRows.timer = window.setTimeout(() => banner.classList.remove('show'), 6000);
+// New tail rows wait behind the banner while the reader is busy: a row is
+// open, or the list is scrolled away from its newest rows. Otherwise they
+// go straight into the list.
+function tailHeldBack() {
+  return state.expandedRows.size > 0 || listScrolledAway();
+}
+
+function clearPendingTail() {
+  state.pendingTail = [];
+  state.pendingTruncated = false;
+  el('newRowsBanner').classList.remove('show');
+}
+
+function showPendingBanner() {
+  const count = state.pendingTail.length;
+  // Announced once when rows start waiting, not on every poll after that.
+  if (!el('newRowsBanner').classList.contains('show')) announce('New log lines are waiting above the list.');
+  el('newRowsCount').textContent = `${formatCount(count)}${state.pendingTruncated ? '+' : ''}`;
+  el('newRowsBanner').classList.add('show');
+}
+
+// Moves the held-back rows into the list. Past LOG_ROWS_MAX the oldest rows
+// drop off the bottom, and "Load older" then reloads instead of paging on.
+function flushPendingTail() {
+  if (!state.pendingTail.length) return;
+  state.items = mergeNewestItems(state.pendingTail, state.items);
+  if (state.items.length > LOG_ROWS_MAX) {
+    state.items = state.items.slice(0, LOG_ROWS_MAX);
+    state.olderTrimmed = true;
+    renderPager();
+  }
+  clearPendingTail();
+  refreshLiveEnd();
+  renderAll();
 }
 
 // Rows ingested since the last poll (by row id, so objects that arrive late
 // with older timestamps are not skipped). The server returns the newest
-// matches first; they are merged into the view in event-time order.
+// matches first; they are merged into the list in event-time order.
 async function pollTail() {
   if (!el('live').checked) return;
   const requestId = ++state.tailRequestId;
@@ -2618,32 +3167,43 @@ async function pollTail() {
   const params = new URLSearchParams(queryFromFilters(extra));
   const data = await fetchJson(`/api/tail?${params.toString()}`);
   if (requestId !== state.tailRequestId || !el('live').checked) return;
+  dismissToast('tail');
   const hadCursor = state.liveCursor !== null;
   state.liveCursor = Number.isFinite(data.last_id) ? data.last_id : state.liveCursor;
   const items = Array.isArray(data.items) ? data.items : [];
   if (hadCursor && items.length) {
-    state.items = mergeNewestItems(items, state.items, CURRENT_LOG_LIMIT);
-    state.expandedRows.clear();
-    state.expandedGroups.clear();
-    refreshLiveEnd();
-    renderAll();
-    flashNewRows(items.length, Boolean(data.truncated));
+    state.pendingTail = mergeNewestItems(items, state.pendingTail);
+    state.pendingTruncated = state.pendingTruncated || Boolean(data.truncated);
     scheduleLogPanels();
   }
+  if (state.pendingTail.length) {
+    if (tailHeldBack()) showPendingBanner();
+    else flushPendingTail();
+  }
   state.lastUpdatedAt = data.last_updated_at;
-  el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+  renderFreshness();
+}
+
+function tailFailed(err) {
+  showToast(`Live tail failed: ${err.message}. Retrying every 10 s.`, { key: 'tail' });
 }
 
 function startTailPolling() {
   stopTailPolling();
   state.tailRequestId += 1;
   state.liveTimer = window.setInterval(() => {
-    pollTail().catch((err) => {
-      el('health').textContent = err.message;
-    });
-    el('freshness').textContent = fmtFreshness(state.lastUpdatedAt);
+    if (document.hidden) return; // no polling in a background browser tab
+    pollTail().catch(tailFailed);
+    renderFreshness();
   }, 10000);
 }
+
+// Catch up at once when the tab is shown again instead of waiting up to 10s.
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden || !state.liveTimer) return;
+  pollTail().catch(tailFailed);
+  renderFreshness();
+});
 
 function stopTailPolling() {
   if (state.liveTimer) window.clearInterval(state.liveTimer);
@@ -2684,11 +3244,12 @@ async function loadLogPanels() {
   if (panels.abort) panels.abort.abort();
   const controller = new AbortController();
   panels.abort = controller;
+  panels.rangeTotal = null; // the total below is for the filters being loaded
   refreshLiveEnd();
   const qs = new URLSearchParams(queryFromFilters()).toString();
   const [fields, histogram] = await Promise.allSettled([
     fetchJson(`/api/fields?${qs}`, { signal: controller.signal }),
-    fetchJson(`/api/histogram?${qs}`, { signal: controller.signal }),
+    fetchJson(`/api/histogram?${histogramQuery()}`, { signal: controller.signal }),
   ]);
   if (controller.signal.aborted) return; // superseded by a newer refresh
   panels.abort = null;
@@ -2735,16 +3296,23 @@ function renderFieldSidebar(data) {
           <span class="field-value-track"><span class="field-value-fill${sevClass}" style="width:${width}%"></span></span>
         </button>`;
     }).join('');
-    const empty = !rows && !info.partial ? '<div class="field-empty">No values</div>' : '';
+    // A field without values (and nothing excluded) is left out.
+    if (!rows && !chips && !info.partial) return '';
     const partial = info.partial ? '<div class="field-empty">Took too long; narrow the filters to see values.</div>' : '';
     return `
       <section class="field-group">
         <div class="field-group-head"><span class="field-name">${escapeHtml(label)}</span><span class="field-meta">${escapeHtml(meta)}</span></div>
         ${chips ? `<div class="field-chips">${chips}</div>` : ''}
-        ${rows}${empty}${partial}
+        ${rows ? `<div class="field-values" role="group" aria-label="${escapeHtml(label)} values · arrow keys move">${rows}</div>` : ''}${partial}
       </section>`;
   }).join('');
-  el('fieldList').innerHTML = html;
+  el('fieldList').innerHTML = html || '<div class="field-empty">No field values for these filters.</div>';
+  // Each value list is one Tab stop (its selected value, else the first).
+  for (const list of el('fieldList').querySelectorAll('.field-values')) {
+    const buttons = Array.from(list.querySelectorAll('.field-value'));
+    const current = buttons.find((button) => button.classList.contains('active')) || buttons[0];
+    for (const button of buttons) button.tabIndex = button === current ? 0 : -1;
+  }
   updateExcludedCount();
 }
 
@@ -2774,82 +3342,192 @@ function applyFieldValue(field, value, exclude) {
   reloadLogs();
 }
 
+// ─── Histogram chart ─────────────────────────────────────────────────────────
+
+// Histogram query for the applied filters: about 40-60 bars for the range,
+// aligned to the browser's local time (whole local hours and days).
+const HISTOGRAM_TARGET_BARS = 60;
+function histogramQuery() {
+  return new URLSearchParams(queryFromFilters({
+    target_buckets: String(HISTOGRAM_TARGET_BARS),
+    tz_offset_min: String(-new Date().getTimezoneOffset()),
+  })).toString();
+}
+
+// Vertical bars of /api/histogram buckets stacked by severity, with a
+// local-time axis (never past now) and a hover tooltip. The Logs histogram
+// selects a range by dragging (a click zooms to one bar); the Dashboard
+// volume charts open a bar's logs on click. Keyboard: the bars are one Tab
+// stop; arrow keys, Home and End move between them (each is labelled with
+// its time span and count) and Enter opens the focused bar.
+// `severities` limits the stack (the error chart shows errors only).
+function createHistogramChart(root, { severities = null, drag = false, onSelect }) {
+  const bars = root.querySelector('.histogram-bars');
+  const tip = root.querySelector('.histogram-tooltip');
+  const shown = severities || HISTOGRAM_SEVERITIES;
+  const countOf = (b) => (severities
+    ? severities.reduce((sum, sev) => sum + (Number(b[sev]) || 0), 0)
+    : Number(b.total) || 0);
+  const chart = { buckets: [], bucketMs: 60000, drag: null, active: -1 };
+
+  const noun = severities ? `${severities.join(' + ')} lines` : 'entries';
+  const bucketEnd = (bucket) => Math.min(Date.parse(bucket.t) + chart.bucketMs, Date.now());
+  const hideTip = () => { tip.hidden = true; };
+  const mark = (lo, hi) => {
+    for (const col of bars.children) {
+      const index = Number(col.dataset.i);
+      col.classList.toggle('selected', index >= lo && index <= hi);
+    }
+  };
+  const indexAt = (clientX) => {
+    if (!chart.buckets.length) return null;
+    const rect = bars.getBoundingClientRect();
+    if (rect.width <= 0) return null;
+    const index = Math.floor(((clientX - rect.left) / rect.width) * chart.buckets.length);
+    return Math.min(chart.buckets.length - 1, Math.max(0, index));
+  };
+  const showTip = (index, clientX = null) => {
+    const bucket = chart.buckets[index];
+    if (!bucket) return;
+    const lines = severities ? '' : shown
+      .filter((sev) => Number(bucket[sev]) > 0)
+      .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
+      .join('');
+    tip.innerHTML = `
+      <div class="hist-tip-time">${escapeHtml(formatSpan(bucket.t, bucketEnd(bucket)))}</div>
+      <div class="hist-tip-row"><b>${formatCount(countOf(bucket))}</b> ${escapeHtml(noun)}</div>${lines}`;
+    tip.hidden = false;
+    const box = root.getBoundingClientRect();
+    const col = bars.children[index];
+    const x = clientX ?? (col ? col.getBoundingClientRect().left : box.left);
+    tip.style.left = `${Math.min(Math.max(x - box.left + 12, 0), Math.max(0, box.width - tip.offsetWidth))}px`;
+  };
+
+  chart.render = (data) => {
+    const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
+    chart.buckets = buckets;
+    chart.bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
+    chart.drag = null;
+    hideTip();
+    // One Tab stop: the newest bar, or the one the reader moved to.
+    chart.active = buckets.length ? Math.min(chart.active === -1 ? buckets.length - 1 : chart.active, buckets.length - 1) : -1;
+    const max = buckets.reduce((m, b) => Math.max(m, countOf(b)), 0);
+    bars.innerHTML = buckets.map((b, index) => {
+      const count = countOf(b);
+      const height = max > 0 && count > 0 ? Math.max(3, Math.round((count / max) * 100)) : 0;
+      const parts = shown.map((sev) => [sev, Number(b[sev]) || 0]);
+      if (!severities) parts.push(['other', Math.max(0, count - parts.reduce((sum, [, n]) => sum + n, 0))]);
+      const segments = parts
+        .filter(([, n]) => n > 0)
+        .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
+        .join('');
+      const label = `${formatSpan(b.t, bucketEnd(b))}, ${formatCount(count)} ${noun}`;
+      return `<div class="hist-col" data-i="${index}" role="button" tabindex="${index === chart.active ? 0 : -1}" aria-label="${escapeHtml(label)}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
+    }).join('');
+    root.querySelector('.histogram-from').textContent = buckets.length ? formatDateTime(buckets[0].t) : '';
+    root.querySelector('.histogram-to').textContent = buckets.length
+      ? formatDateTime(new Date(bucketEnd(buckets[buckets.length - 1])))
+      : '';
+    return buckets.reduce((sum, b) => sum + countOf(b), 0);
+  };
+
+  bars.addEventListener('pointerdown', (event) => {
+    if (!drag || event.button !== 0) return;
+    const index = indexAt(event.clientX);
+    if (index === null) return;
+    event.preventDefault();
+    bars.setPointerCapture(event.pointerId);
+    chart.drag = { from: index, to: index };
+    mark(index, index);
+  });
+  bars.addEventListener('pointermove', (event) => {
+    const index = indexAt(event.clientX);
+    if (index === null) return;
+    if (chart.drag && chart.drag.to !== index) {
+      chart.drag.to = index;
+      mark(Math.min(chart.drag.from, index), Math.max(chart.drag.from, index));
+    }
+    showTip(index, event.clientX);
+  });
+  bars.addEventListener('pointerup', () => {
+    if (!chart.drag) return;
+    const { from, to } = chart.drag;
+    chart.drag = null;
+    mark(-1, -1);
+    onSelect(Math.min(from, to), Math.max(from, to));
+  });
+  bars.addEventListener('pointercancel', () => {
+    chart.drag = null;
+    mark(-1, -1);
+  });
+  bars.addEventListener('pointerleave', () => {
+    if (!chart.drag && !bars.contains(document.activeElement)) hideTip();
+  });
+  if (!drag) {
+    bars.addEventListener('click', (event) => {
+      const index = indexAt(event.clientX);
+      if (index !== null && countOf(chart.buckets[index]) > 0) onSelect(index, index);
+    });
+  }
+  const focusBar = (index) => {
+    const col = bars.children[index];
+    if (!col) return;
+    if (bars.children[chart.active]) bars.children[chart.active].tabIndex = -1;
+    chart.active = index;
+    col.tabIndex = 0;
+    col.focus();
+  };
+  bars.addEventListener('keydown', (event) => {
+    const n = chart.buckets.length;
+    const index = Number(event.target.dataset?.i);
+    if (!n || !Number.isInteger(index)) return;
+    let next = null;
+    if (event.key === 'ArrowRight') next = Math.min(n - 1, index + 1);
+    else if (event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+    else if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = n - 1;
+    else if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      if (drag || countOf(chart.buckets[index]) > 0) onSelect(index, index);
+      return;
+    }
+    if (next === null) return;
+    event.preventDefault();
+    focusBar(next);
+  });
+  bars.addEventListener('focusin', (event) => {
+    const index = Number(event.target.dataset?.i);
+    if (!Number.isInteger(index)) return;
+    mark(index, index);
+    showTip(index);
+  });
+  bars.addEventListener('focusout', () => {
+    if (chart.drag) return;
+    mark(-1, -1);
+    hideTip();
+  });
+  return chart;
+}
+
+let logsHistogramChart = null;
+
 function renderHistogram(data) {
   const panels = state.logPanels;
-  const buckets = Array.isArray(data?.buckets) ? data.buckets : [];
-  const bucketMs = (Number(data?.bucket_secs) || 60) * 1000;
-  panels.histogram = { buckets, bucketMs };
-  panels.drag = null;
-  hideHistogramTooltip();
-  const total = buckets.reduce((sum, b) => sum + (Number(b.total) || 0), 0);
-  const max = buckets.reduce((m, b) => Math.max(m, Number(b.total) || 0), 0);
-  el('histogramSummary').textContent = buckets.length
-    ? `${formatCount(total)} entries · ${formatBucketSize(bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
+  logsHistogramChart ||= createHistogramChart(el('histogram'), { drag: true, onSelect: applyHistogramSelection });
+  const total = logsHistogramChart.render(data);
+  panels.histogram = { buckets: logsHistogramChart.buckets, bucketMs: logsHistogramChart.bucketMs };
+  panels.rangeTotal = total;
+  panels.rangeTruncated = Boolean(data?.truncated);
+  updateResultSummary();
+  el('histogramSummary').textContent = panels.histogram.buckets.length
+    ? `${formatCount(total)} entries · ${formatBucketSize(panels.histogram.bucketMs)} buckets${data.truncated ? ' · oldest buckets omitted' : ''}`
     : 'No entries in this range';
-  el('histogramBars').innerHTML = buckets.map((b, index) => {
-    const count = Number(b.total) || 0;
-    const height = max > 0 && count > 0 ? Math.max(3, Math.round((count / max) * 100)) : 0;
-    const known = HISTOGRAM_SEVERITIES.reduce((sum, sev) => sum + (Number(b[sev]) || 0), 0);
-    const segments = HISTOGRAM_SEVERITIES
-      .concat('other')
-      .map((sev) => [sev, sev === 'other' ? Math.max(0, count - known) : Number(b[sev]) || 0])
-      .filter(([, n]) => n > 0)
-      .map(([sev, n]) => `<span class="hist-seg hist-${sev}" style="flex-grow:${n}"></span>`)
-      .join('');
-    return `<div class="hist-col" data-i="${index}"><div class="hist-stack" style="height:${height}%">${segments}</div></div>`;
-  }).join('');
-  el('histogramFrom').textContent = buckets.length ? formatTimestamp(buckets[0].t) : '';
-  el('histogramTo').textContent = buckets.length
-    ? formatTimestamp(new Date(Date.parse(buckets[buckets.length - 1].t) + bucketMs).toISOString())
-    : '';
   updateHistogramReset();
 }
 
 function formatBucketSize(ms) {
   const minutes = Math.round(ms / 60000);
   return minutes >= 60 ? `${minutes / 60}h` : `${minutes}m`;
-}
-
-function histogramIndexAt(clientX) {
-  const hist = state.logPanels.histogram;
-  if (!hist || !hist.buckets.length) return null;
-  const rect = el('histogramBars').getBoundingClientRect();
-  if (rect.width <= 0) return null;
-  const index = Math.floor(((clientX - rect.left) / rect.width) * hist.buckets.length);
-  return Math.min(hist.buckets.length - 1, Math.max(0, index));
-}
-
-function markHistogramSelection() {
-  const drag = state.logPanels.drag;
-  const lo = drag ? Math.min(drag.from, drag.to) : -1;
-  const hi = drag ? Math.max(drag.from, drag.to) : -1;
-  for (const col of el('histogramBars').children) {
-    const index = Number(col.dataset.i);
-    col.classList.toggle('selected', index >= lo && index <= hi);
-  }
-}
-
-function showHistogramTooltip(index, clientX) {
-  const hist = state.logPanels.histogram;
-  const bucket = hist?.buckets[index];
-  if (!bucket) return;
-  const tip = el('histogramTooltip');
-  const end = new Date(Date.parse(bucket.t) + hist.bucketMs).toISOString();
-  const lines = HISTOGRAM_SEVERITIES
-    .filter((sev) => Number(bucket[sev]) > 0)
-    .map((sev) => `<div class="hist-tip-row"><span class="hist-tip-dot hist-${sev}"></span>${escapeHtml(sev)} <b>${formatCount(bucket[sev])}</b></div>`)
-    .join('');
-  tip.innerHTML = `
-    <div class="hist-tip-time">${escapeHtml(formatTimestamp(bucket.t))} – ${escapeHtml(formatTimestamp(end))}</div>
-    <div class="hist-tip-row"><b>${formatCount(bucket.total)}</b> entries</div>${lines}`;
-  tip.hidden = false;
-  const box = el('histogram').getBoundingClientRect();
-  const x = Math.min(Math.max(clientX - box.left + 12, 0), Math.max(0, box.width - tip.offsetWidth));
-  tip.style.left = `${x}px`;
-}
-
-function hideHistogramTooltip() {
-  el('histogramTooltip').hidden = true;
 }
 
 // A drag selects [first bucket, last bucket + size); a click zooms to one bucket.
@@ -3032,14 +3710,14 @@ function renderIngestCard(status) {
     ? describeAge(status.last_successful_ingest_at) : 'never', status.last_successful_ingest_at ? '' : 'warn');
   kvRow(body, 'Last poll finished', Number.isFinite(ingest.seconds_since_last_poll)
     ? `${formatDuration(ingest.seconds_since_last_poll)} ago` : 'not yet');
-  kvRow(body, 'Poll interval / stale after', ingest.poll_interval_secs
-    ? `${ingest.poll_interval_secs}s / ${formatDuration(ingest.stale_after_secs)}` : '—');
+  kvRow(body, 'S3 ingest every', ingest.poll_interval_secs
+    ? `${ingest.poll_interval_secs}s · stale after ${formatDuration(ingest.stale_after_secs)}` : '—');
   // Ingestion lag: how far the newest cached data trails the clock.
   const eventAge = secondsSince(status.latest_record_timestamp);
   const lagTone = eventAge === null ? 'unknown'
     : eventAge > (ingest.stale_after_secs || 300) * 2 ? 'warn' : '';
   kvRow(body, 'Newest cached event', status.latest_record_timestamp
-    ? `${describeAge(status.latest_record_timestamp)} (${formatTimestamp(status.latest_record_timestamp)})` : 'no records', lagTone);
+    ? `${describeAge(status.latest_record_timestamp)} (${formatDateTime(status.latest_record_timestamp)})` : 'no records', lagTone);
   kvRow(body, 'Newest S3 object ingested', status.last_object_last_modified
     ? describeAge(status.last_object_last_modified) : 'unknown');
   kvRow(body, 'Cached', status.total_records !== undefined
@@ -3060,9 +3738,10 @@ function renderIngestCard(status) {
   }
   if (byPrefix.length) {
     kvTable(card, 'Failing objects by prefix', ['Prefix', 'Objects', 'Max attempts', 'Next retry'],
-      byPrefix.map((p) => [p.prefix, p.count, p.max_attempts, p.next_attempt_at ? formatTimestamp(p.next_attempt_at) : '—']));
+      byPrefix.map((p) => [p.prefix, p.count, p.max_attempts, p.next_attempt_at ? formatDateTime(p.next_attempt_at) : '—']));
   }
   if (status.last_error) kvBlock(card, 'Last poll error', status.last_error, tone === 'ok' ? 'warn' : tone);
+  for (const warning of status.config_warnings || []) kvBlock(card, 'Configuration', warning, 'warn');
   return { card, tone };
 }
 
@@ -3149,9 +3828,17 @@ function renderStorageCard(status) {
   return { card, tone };
 }
 
+// Alert channels (from /api/alerts/channels) and the anomaly notices sent to
+// Mattermost, in one card.
 function renderNotificationsCard(status) {
   const n = status.notifications;
-  if (!n) return null;
+  const channels = state.pipeline.channels;
+  if (!n && !channels) return null;
+  if (!n) {
+    const { card, body } = pipelineCard('Notification channels', 'ok', channelsSummary(channels).short);
+    kvRow(body, 'Alert channels', channelsSummary(channels).long);
+    return { card, tone: 'ok' };
+  }
   let tone = 'ok';
   let label = 'Delivering';
   if (n.status_error) { tone = 'unknown'; label = 'Unknown'; }
@@ -3160,11 +3847,13 @@ function renderNotificationsCard(status) {
   else if (!n.running) { tone = 'error'; label = 'Not running'; }
   else if (n.last_problem?.status === 'failed') { tone = 'warn'; label = 'Some failed'; }
   else if (n.last_problem) { tone = 'warn'; label = 'Retrying'; }
-  const { card, body } = pipelineCard('Mattermost notifications', tone, label);
+  const { card, body } = pipelineCard('Notification channels', tone, `${channelsSummary(channels).short} · notices ${label.toLowerCase()}`);
+  kvRow(body, 'Alert channels', channelsSummary(channels).long);
   if (!n.enabled) {
-    kvRow(body, 'Status', 'Disabled in configuration (webapp.mattermost.enabled)');
+    kvRow(body, 'Anomaly notices', 'Off in configuration (webapp.mattermost.enabled)');
     return { card, tone: 'ok' }; // off by choice is not a fault
   }
+  kvRow(body, 'Anomaly notices', `Mattermost · ${label}`, tone === 'ok' ? '' : tone);
   if (!n.configured) {
     kvRow(body, 'Status', 'Enabled, but the webhook URL environment variable is empty or not an http(s) URL; nothing is sent', 'error');
   }
@@ -3221,12 +3910,15 @@ function renderPipeline() {
       : 'Not checked yet';
 
   if (!status) {
-    content.innerHTML = '';
-    banner.hidden = false;
-    banner.className = `pipeline-banner tone-${state.pipeline.error ? 'error' : 'unknown'}`;
-    banner.textContent = state.pipeline.error
-      ? `Status unavailable: ${state.pipeline.error}`
-      : 'Loading pipeline status…';
+    banner.hidden = true;
+    if (state.pipeline.error) {
+      setPanelState(content, 'error', {
+        message: `Status unavailable: ${state.pipeline.error}`,
+        action: { label: 'Retry', onClick: () => refreshStatus().catch(() => {}) },
+      });
+    } else {
+      content.replaceChildren(panelStateNode('loading', { layout: 'cards', lines: 4 }));
+    }
     return;
   }
 
@@ -3251,6 +3943,34 @@ function renderPipeline() {
   banner.hidden = false;
   banner.className = `pipeline-banner tone-${tone}`;
   banner.textContent = problems.length ? `${summary} Note: ${problems.join('; ')}.` : summary;
+  if (state.pipeline.error) {
+    // The last data stays on screen; the failed refresh can be retried.
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'ghost panel-state-action pipeline-retry';
+    retry.textContent = 'Retry';
+    retry.addEventListener('click', () => refreshStatus().catch(() => {}));
+    banner.append(' ', retry);
+  }
+}
+
+// "2 channels (Mattermost, Slack)" for the Notification channels card.
+function channelsSummary(channels) {
+  if (!Array.isArray(channels)) return { short: 'channels unknown', long: 'Could not load the alert channels' };
+  if (!channels.length) return { short: 'no channels', long: 'None yet: add one under Alerts → Channels' };
+  const types = [...new Set(channels.map((c) => String(c.type || 'webhook')))].join(', ');
+  const word = channels.length === 1 ? 'channel' : 'channels';
+  return { short: `${channels.length} ${word}`, long: `${channels.length} ${word} (${types})` };
+}
+
+async function loadPipelineChannels() {
+  try {
+    const data = await fetchJson('/api/alerts/channels');
+    state.pipeline.channels = Array.isArray(data.channels) ? data.channels : [];
+  } catch (_) {
+    state.pipeline.channels = null;
+  }
+  if (state.activeTab === 'pipeline') renderPipeline();
 }
 
 async function refreshStatus() {
@@ -3281,6 +4001,7 @@ async function refreshStatus() {
 
 function startPipelinePolling() {
   stopPipelinePolling();
+  loadPipelineChannels();
   const fresh = state.pipeline.fetchedAt && Date.now() - state.pipeline.fetchedAt < 10000;
   if (fresh) renderPipeline();
   else refreshStatus().catch(() => {});
@@ -3506,7 +4227,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });
-    await loadLogs(true);
+    await loadLogs();
     if (parsed.tab === 'logs' && parsed.rec !== null) openContext(parsed.rec, { history: null });
     if (parsed.anomaly !== null && (parsed.tab === 'insights' || parsed.tab === 'actionable')) {
       await focusAnomaly(parsed.anomaly, { openInActionable: parsed.tab === 'actionable' });
@@ -3527,7 +4248,7 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
 
 window.addEventListener('popstate', () => {
   applyUrlState(parseUrlState(window.location.search)).catch((err) => {
-    el('health').textContent = err.message;
+    showToast(`Could not open this link: ${err.message}`, { key: 'url' });
   });
 });
 
@@ -3601,6 +4322,7 @@ async function loadViews() {
 }
 
 function renderViews() {
+  updateCreateAlertButton();
   el('viewsCount').textContent = state.views.loaded ? `(${state.views.list.length})` : '';
   renderViewBar();
   renderViewsMenu();
@@ -3939,7 +4661,7 @@ el('pinnedViewsCards').addEventListener('click', (event) => {
   const view = state.views.list.find((item) => item.id === Number(card.dataset.pinnedViewId));
   if (view) {
     openView(view, { tab: 'logs' }).catch((err) => {
-      el('health').textContent = err.message;
+      showToast(`Could not open the view: ${err.message}`, { key: 'view' });
     });
   }
 });
@@ -4050,20 +4772,25 @@ function alertWatermarkText(mark) {
   if (!mark) return 'Rules on saved views, evaluated up to the ingest watermark.';
   if (!mark.at) return 'Waiting for the first complete S3 poll: rules report unknown until then.';
   const lag = Number(mark.lag_secs);
-  const text = `Data complete up to ${formatTimestamp(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
+  const text = `Data complete up to ${formatDateTime(mark.at)}${Number.isFinite(lag) ? ` (${Math.round(lag / 60)} min behind)` : ''}.`;
   return mark.stale ? `${text} The pipeline is stale: absence rules (<, <=) report unknown.` : text;
 }
 
 function renderAlerts() {
   el('alertsSubtitle').textContent = alertWatermarkText(alertsState.watermark);
+  updateCreateAlertButton();
   const errorBox = el('alertsError');
   errorBox.hidden = !alertsState.error;
   errorBox.textContent = alertsState.error;
   const list = el('alertsList');
   if (!alertsState.rules.length) {
-    list.innerHTML = `<div class="empty-state">${escapeHtml(alertsState.loaded
-      ? 'No alert rules yet. Save a view, then “Create alert” here or from the Views menu (🔔).'
-      : 'Loading…')}</div>`;
+    // Before the first successful load, a failure shows only the error box.
+    const message = alertsState.loaded
+      ? (state.views.list.length
+        ? 'No alert rules yet. Use “Create alert”, or the 🔔 in the Views menu.'
+        : 'No alert rules yet. Alerts watch a saved view: save one in Logs first.')
+      : alertsState.error ? '' : 'Loading…';
+    list.innerHTML = message ? `<div class="empty-state">${escapeHtml(message)}</div>` : '';
     return;
   }
   const viewNames = new Map(state.views.list.map((view) => [view.id, view.name]));
@@ -4072,7 +4799,7 @@ function renderAlerts() {
     const status = rule.status || {};
     const lastValue = status.last_value === null || status.last_value === undefined ? '—' : String(status.last_value);
     const viewName = rule.view_id === null ? '(no view)' : viewNames.get(rule.view_id) || `view #${Number(rule.view_id)}`;
-    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatTimestamp(rule.mute_until)}` : '';
+    const muteText = status.muted && rule.mute_until ? ` · muted until ${formatDateTime(rule.mute_until)}` : '';
     const notes = [];
     if (rule.disabled_reason) notes.push(rule.disabled_reason);
     if (status.unknown_reason) notes.push(`Unknown: ${status.unknown_reason}`);
@@ -4113,7 +4840,7 @@ function alertHistoryMarkup(history) {
   if (history.error) return `<div class="views-error">${escapeHtml(history.error)}</div>`;
   if (!history.items.length) return '<div class="subtle">No state changes recorded yet (kept 30 days).</div>';
   const rows = history.items.map((e) => `<tr>
-      <td>${escapeHtml(formatTimestamp(e.ts))}</td>
+      <td>${escapeHtml(formatDateTime(e.ts))}</td>
       <td>${escapeHtml(e.group_key || '—')}</td>
       <td>${escapeHtml(e.from_state || '—')} → <b>${escapeHtml(e.state)}</b>${e.muted ? ' (muted)' : ''}</td>
       <td>${escapeHtml(e.value === null || e.value === undefined ? '—' : String(e.value))}</td>
@@ -4129,17 +4856,30 @@ const ALERT_DELIVERY_LABELS = {
   failed_final: 'failed (gave up)', superseded: 'superseded',
 };
 
-function alertDeliveryMarkup(e) {
-  const label = ALERT_DELIVERY_LABELS[e.notified] || String(e.notified || '—');
-  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(e.notified || 'no')}">${escapeHtml(label)}</span>`];
-  const attempts = Number(e.attempts || 0);
-  if (attempts > 1 || (attempts && e.notified !== 'sent')) parts.push(`<span class="subtle">${attempts} attempt${attempts === 1 ? '' : 's'}</span>`);
-  if ((e.notified === 'retrying' || e.notified === 'queued') && e.next_attempt_at) {
-    parts.push(`<span class="subtle">next ${escapeHtml(formatTimestamp(e.next_attempt_at))}</span>`);
+function alertDeliveryStatusMarkup(status, attempts, nextAt, error) {
+  const label = ALERT_DELIVERY_LABELS[status] || String(status || '—');
+  const parts = [`<span class="alert-delivery alert-delivery-${escapeHtml(status || 'no')}">${escapeHtml(label)}</span>`];
+  const n = Number(attempts || 0);
+  if (n > 1 || (n && status !== 'sent')) parts.push(`<span class="subtle">${n} attempt${n === 1 ? '' : 's'}</span>`);
+  if ((status === 'retrying' || status === 'queued') && nextAt) {
+    parts.push(`<span class="subtle">next ${escapeHtml(formatDateTime(nextAt))}</span>`);
   }
-  if (e.error) parts.push(`<span class="alert-error-text">${escapeHtml(e.error)}</span>`);
-  if (e.retryable) parts.push(`<button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`);
+  if (error) parts.push(`<span class="alert-error-text">${escapeHtml(error)}</span>`);
   return parts.join(' ');
+}
+
+// One line per channel when the event has per-channel delivery rows (each
+// channel is retried on its own); the event's aggregate otherwise.
+function alertDeliveryMarkup(e) {
+  const deliveries = Array.isArray(e.deliveries) ? e.deliveries : [];
+  const names = new Map(alertsState.channels.map((c) => [Number(c.id), c.name]));
+  const body = deliveries.length
+    ? `<ul class="alert-deliveries">${deliveries.map((d) => `<li><span class="alert-delivery-channel">${escapeHtml(names.get(Number(d.channel_id)) || `channel ${Number(d.channel_id)}`)}</span> ${alertDeliveryStatusMarkup(d.state, d.attempts, d.next_attempt_at, d.last_error)}</li>`).join('')}</ul>`
+    : alertDeliveryStatusMarkup(e.notified, e.attempts, e.next_attempt_at, e.error);
+  const retry = e.retryable
+    ? ` <button type="button" class="ghost alert-retry" data-alert-action="retry" data-event-id="${Number(e.id)}">Retry now</button>`
+    : '';
+  return body + retry;
 }
 
 async function loadAlertHistory(id) {
@@ -4292,7 +5032,7 @@ async function runAlertBacktest() {
     if (requestId !== alertsState.backtestId) return;
     const fired = Number(result.fired || 0);
     const series = (result.series || []).map((point) => Number(point.value));
-    const last = (result.fires || []).slice(-3).map((f) => formatTimestamp(f.at)).join(', ');
+    const last = (result.fires || []).slice(-3).map((f) => formatDateTime(f.at)).join(', ');
     box.innerHTML = `<div><b>Would have fired ${escapeHtml(String(fired))} time${fired === 1 ? '' : 's'} in 7 days</b>${body.group_by !== 'none' ? ' (all groups together)' : ''}${result.approximate ? ' · approximate' : ''}</div>
       ${last ? `<div class="subtle">Latest: ${escapeHtml(last)}</div>` : ''}
       <div class="alert-backtest-spark">${alertSparkMarkup(series.slice(-200), body.threshold)}</div>`;
@@ -4397,7 +5137,24 @@ async function addChannel() {
 }
 
 el('alertsRefresh').addEventListener('click', () => loadAlerts());
-el('alertsCreateBtn').addEventListener('click', () => openAlertForm());
+// With no saved view to alert on, the button goes to Logs to save one.
+el('alertsCreateBtn').addEventListener('click', () => {
+  if (state.views.list.length) {
+    openAlertForm();
+    return;
+  }
+  switchTab('logs');
+  if (isDrawerMode()) openFiltersDrawer();
+  else if (state.filtersCollapsed) el('filtersToggle').click();
+  el('saveViewBtn').focus();
+});
+
+function updateCreateAlertButton() {
+  const button = el('alertsCreateBtn');
+  const none = state.views.loaded && !state.views.list.length;
+  button.textContent = none ? 'Save a view first' : 'Create alert';
+  button.title = none ? 'Alerts watch a saved view: open Logs, set filters and Save view' : 'Create an alert rule on a saved view';
+}
 el('alertsChannelsBtn').addEventListener('click', () => openChannels());
 el('alertsList').addEventListener('click', (event) => {
   const button = event.target instanceof Element ? event.target.closest('[data-alert-action]') : null;
@@ -4469,7 +5226,7 @@ function renderAskBox() {
 
 function askValueText(key, value) {
   if (key === 'range') return ASK_RANGE_LABELS[value] || value;
-  if (key === 'from' || key === 'to') return formatTimestamp(value);
+  if (key === 'from' || key === 'to') return formatDateTime(value);
   return value;
 }
 
@@ -4674,20 +5431,23 @@ function applyAiStatus(status) {
   if (state.insightsLoaded) renderAnomalies();
 }
 
-async function summarizeAnomaly(anomaly, btn, options = {}) {
-  const original = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = options.tier === 'deep' ? 'Analyzing…' : '✦ Summarizing…';
+// Summarize / Deep from the row menu: progress and failures are shown on the
+// row (the menu has closed by then), and the list reloads on success.
+async function summarizeAnomaly(anomaly, rowNode, options = {}) {
+  const note = rowNode.querySelector('.anomaly-row-note');
+  const errorBox = rowNode.querySelector('.anomaly-row-error');
+  note.textContent = options.tier === 'deep' ? '✦ Deep analysis running…' : '✦ Summarizing…';
+  note.hidden = false;
+  errorBox.hidden = true;
   try {
     const result = await postJson(`/api/anomalies/${encodeURIComponent(anomaly.id)}/summarize`,
       explainOptionsQuery(options));
     if (result.degraded) throw new Error(result.error || 'The daily AI budget is used up');
     await fetchInsights();
   } catch (err) {
-    btn.disabled = false;
-    btn.textContent = original;
-    btn.title = `Failed: ${err.message}`;
-    showInsightsError(`AI summary failed: ${err.message}`);
+    note.hidden = true;
+    errorBox.textContent = `AI summary failed: ${err.message}`;
+    errorBox.hidden = false;
   }
 }
 
@@ -5155,7 +5915,13 @@ el('settingsRefresh').addEventListener('click', () => {
 // ─── Init ────────────────────────────────────────────────────────────────────
 
 async function init() {
-  ensureOlderLogsClosed();
+  state.filtersCollapsed = readFlag(FILTERS_COLLAPSED_KEY);
+  applyFiltersLayout();
+  // At 1280px and below the Fields panel stacks above the rows, so it starts
+  // hidden there unless the reader opened it before.
+  const stacked = Boolean(window.matchMedia && window.matchMedia('(max-width: 1280px)').matches);
+  setFieldsCollapsed(readFlag(FIELDS_COLLAPSED_KEY, stacked));
+  updateTabFades();
   setDefaultDateRange();
   buildCombobox('pod', 'pod');
   buildCombobox('container', 'container');
@@ -5165,16 +5931,12 @@ async function init() {
     status = await refreshStatus();
   } catch (err) {
     // The logs still load; the Pipeline tab shows the status as unavailable.
-    el('health').textContent = `Status unavailable: ${err.message}`;
+    setHealth('unknown', 'Status unavailable', `Status unavailable: ${err.message}`);
   }
   if (status) {
     applyAiStatus(status);
     state.actionsEnabled = status.actions_enabled === true;
-    if (status.last_successful_ingest_at) {
-      el('freshness').textContent = fmtFreshness(status.last_successful_ingest_at);
-    } else if (status.latest_record_timestamp) {
-      el('freshness').textContent = `Cached through ${formatTimestamp(status.latest_record_timestamp)}`;
-    }
+    renderFreshness();
   }
   updateExplainButton();
   await loadFacets();
@@ -5193,10 +5955,18 @@ function reloadLogs() {
   resetOlderLogsState();
   closeContext({ history: null });
   updateUrl('push');
-  return loadLogs(true).catch((err) => showLogsError(`Could not load logs: ${err.message}`));
+  return loadLogs().catch((err) => showLogsError(`Could not load logs: ${err.message}`));
 }
 
-el('apply').addEventListener('click', () => reloadLogs());
+// Search and dates apply on Enter (form submit) or Apply; dropdowns at once.
+el('filtersForm').addEventListener('submit', (event) => {
+  event.preventDefault();
+  reloadLogs();
+  closeFiltersDrawer(); // in the drawer, Apply also shows the results
+});
+for (const id of ['scope', 'namespace', 'severity_bucket']) {
+  el(id).addEventListener('change', () => reloadLogs());
+}
 // Typing an End time makes the range end there (no longer "now"). Editing
 // either bound drops exact bounds from a link or drilldown.
 el('end').addEventListener('change', () => {
@@ -5214,49 +5984,29 @@ el('start').addEventListener('change', () => {
   el('rangePreset').value = 'custom';
 });
 el('loadMore').addEventListener('click', () => {
-  openOlderLogsOverlay(true);
+  loadOlderLogsPage();
 });
-
-const olderLogsLoadMore = el('olderLogsLoadMore');
-if (olderLogsLoadMore) {
-  olderLogsLoadMore.addEventListener('click', () => {
-    loadOlderLogsPage().catch((err) => {
-      el('health').textContent = err.message;
-    });
-  });
-}
-
-const olderLogsClose = el('olderLogsClose');
-if (olderLogsClose) {
-  olderLogsClose.addEventListener('click', (event) => {
-    event.stopPropagation();
-    closeOlderLogsOverlay();
-  });
-}
-
-const olderLogsOverlay = el('olderLogsOverlay');
-if (olderLogsOverlay) {
-  olderLogsOverlay.addEventListener('click', (event) => {
-    if (event.target === olderLogsOverlay) {
-      handleOlderOverlayOutsideClick(event);
-    }
-  });
+// Infinite scroll: the next page loads when "Load older" scrolls into view,
+// but only after the reader has scrolled since the last page, so a list that
+// collapses to a few rows does not page through the whole range by itself.
+const markScrolled = () => { state.scrolledSincePage = true; };
+el('logListHost').addEventListener('scroll', markScrolled, { passive: true });
+window.addEventListener('scroll', markScrolled, { passive: true });
+if (typeof IntersectionObserver === 'function') { // without it the button still works
+  new IntersectionObserver((entries) => {
+    if (!entries.some((entry) => entry.isIntersecting) || !state.scrolledSincePage) return;
+    if (state.olderTrimmed || state.olderLoading || !state.nextCursor) return;
+    state.scrolledSincePage = false;
+    loadOlderLogsPage();
+  }, { rootMargin: '0px 0px 300px 0px' }).observe(el('loadMore'));
 }
 
 window.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
-  if (state.olderOverlayOpen) {
-    closeOlderLogsOverlay();
-  } else if (state.context.recordId !== null && state.activeTab === 'logs'
+  if (state.context.recordId !== null && state.activeTab === 'logs'
     && !el('actionConfirmModal').open && !(event.target instanceof HTMLInputElement)) {
     closeContext();
   }
-});
-el('todayShortcut').addEventListener('click', () => {
-  forgetHistogramZoom();
-  el('rangePreset').value = 'today';
-  setDefaultDateRange();
-  reloadLogs();
 });
 el('clearFilters').addEventListener('click', () => {
   el('scope').value = '';
@@ -5283,14 +6033,19 @@ el('securityShortcut').addEventListener('click', () => {
 });
 el('rangePreset').addEventListener('change', () => {
   const preset = RANGE_PRESETS[el('rangePreset').value];
-  if (!preset) return;
+  if (!preset) {
+    // "Custom range": go to the Start field (in the drawer on narrow screens).
+    if (isDrawerMode()) openFiltersDrawer();
+    else if (state.filtersCollapsed) el('filtersToggle').click();
+    el('start').focus();
+    return;
+  }
   forgetHistogramZoom();
   preset.apply();
   reloadLogs();
 });
-el('groupByRule').addEventListener('change', async () => {
-  state.groupByRule = el('groupByRule').checked;
-  state.expandedGroups.clear();
+el('collapseDuplicates').addEventListener('change', () => {
+  state.collapseDuplicates = el('collapseDuplicates').checked;
   renderAll();
 });
 el('refreshInsights').addEventListener('click', () => {
@@ -5300,9 +6055,7 @@ el('insightsStatusFilter').addEventListener('change', () => {
   loadInsights().catch((err) => showInsightsError(err.message));
 });
 el('refreshDashboard').addEventListener('click', () => {
-  loadDashboard().catch((err) => {
-    el('health').textContent = err.message;
-  });
+  loadDashboard().catch((err) => showToast(`Dashboard: ${err.message}`, { key: 'dashboard' }));
   loadPinnedCounts({ force: true });
 });
 document.addEventListener('click', async (event) => {
@@ -5315,7 +6068,7 @@ document.addEventListener('click', async (event) => {
     const value = dashboardAction.dataset.dashboardValue || '';
     const severity = dashboardAction.dataset.dashboardSeverity || '';
     drillDownFromDashboard(action, value, severity).catch((err) => {
-      el('health').textContent = err.message;
+      showToast(`Could not open these logs: ${err.message}`, { key: 'drilldown' });
     });
     return;
   }
@@ -5333,14 +6086,39 @@ document.addEventListener('click', async (event) => {
     reloadLogs();
   }
 });
-el('fieldSidebarToggle').addEventListener('click', () => {
-  const collapsed = el('logsBody').classList.toggle('fields-collapsed');
+// The Fields panel can be hidden (remembered), which also shortens the
+// keyboard path to the rows.
+function setFieldsCollapsed(collapsed) {
+  el('logsBody').classList.toggle('fields-collapsed', collapsed);
   const toggle = el('fieldSidebarToggle');
   toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
   toggle.textContent = collapsed ? '›' : '‹';
   toggle.title = collapsed ? 'Show fields' : 'Hide fields';
   toggle.setAttribute('aria-label', toggle.title);
   el('fieldSidebarBody').hidden = collapsed;
+}
+el('fieldSidebarToggle').addEventListener('click', () => {
+  const collapsed = !el('logsBody').classList.contains('fields-collapsed');
+  setFieldsCollapsed(collapsed);
+  writeFlag(FIELDS_COLLAPSED_KEY, collapsed);
+});
+// Arrow keys, Home and End move within one field's value list.
+el('fieldList').addEventListener('keydown', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('.field-value') : null;
+  const list = button ? button.closest('.field-values') : null;
+  if (!list) return;
+  const buttons = Array.from(list.querySelectorAll('.field-value'));
+  const index = buttons.indexOf(button);
+  let next = null;
+  if (event.key === 'ArrowDown' || event.key === 'ArrowRight') next = Math.min(buttons.length - 1, index + 1);
+  else if (event.key === 'ArrowUp' || event.key === 'ArrowLeft') next = Math.max(0, index - 1);
+  else if (event.key === 'Home') next = 0;
+  else if (event.key === 'End') next = buttons.length - 1;
+  if (next === null) return;
+  event.preventDefault();
+  button.tabIndex = -1;
+  buttons[next].tabIndex = 0;
+  buttons[next].focus();
 });
 el('fieldList').addEventListener('mousedown', (event) => {
   if (event.shiftKey) event.preventDefault(); // no text selection on Shift-click
@@ -5360,46 +6138,20 @@ el('fieldList').addEventListener('click', (event) => {
   event.preventDefault();
   applyFieldValue(button.dataset.field, button.dataset.value ?? '', event.altKey || event.shiftKey);
 });
-el('histogramBars').addEventListener('pointerdown', (event) => {
-  if (event.button !== 0) return;
-  const index = histogramIndexAt(event.clientX);
-  if (index === null) return;
-  event.preventDefault();
-  el('histogramBars').setPointerCapture(event.pointerId);
-  state.logPanels.drag = { from: index, to: index };
-  markHistogramSelection();
-});
-el('histogramBars').addEventListener('pointermove', (event) => {
-  const index = histogramIndexAt(event.clientX);
-  if (index === null) return;
-  const drag = state.logPanels.drag;
-  if (drag && drag.to !== index) {
-    drag.to = index;
-    markHistogramSelection();
-  }
-  showHistogramTooltip(index, event.clientX);
-});
-el('histogramBars').addEventListener('pointerup', () => {
-  const drag = state.logPanels.drag;
-  if (!drag) return;
-  state.logPanels.drag = null;
-  markHistogramSelection();
-  applyHistogramSelection(drag.from, drag.to);
-});
-el('histogramBars').addEventListener('pointercancel', () => {
-  state.logPanels.drag = null;
-  markHistogramSelection();
-});
-el('histogramBars').addEventListener('pointerleave', () => {
-  if (!state.logPanels.drag) hideHistogramTooltip();
-});
 el('histogramReset').addEventListener('click', () => resetHistogramRange());
+// Show the held-back rows: insert them and go back to the top of the list
+// (rows that are open stay open).
 el('newRowsBanner').addEventListener('click', () => {
-  el('newRowsBanner').classList.remove('show');
+  flushPendingTail();
+  el('logListHost').scrollTop = 0;
+  if (el('logListHost').getBoundingClientRect().top < 0) el('logListHost').scrollIntoView({ block: 'start' });
 });
+el('healthStatus').addEventListener('click', () => switchTab('pipeline'));
 el('live').addEventListener('change', () => {
+  renderFreshness();
   if (el('live').checked) startTailPolling(); else stopTailPolling();
 });
+el('investigateGoInsights').addEventListener('click', () => switchTab('insights'));
 el('openInActionableBtn').addEventListener('click', () => {
   switchTab('actionable');
 });
@@ -5417,7 +6169,7 @@ el('actionableRefreshBtn').addEventListener('click', async () => {
 });
 
 init().catch((err) => {
-  el('health').textContent = err.message;
+  showToast(`Logscope did not start correctly: ${err.message}`, { key: 'init' });
 });
 
 el('actionableSourceSelect').addEventListener('change', () => {

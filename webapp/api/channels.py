@@ -32,7 +32,6 @@ import re
 import socket
 import ssl
 import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,8 +47,6 @@ ALLOWED_HOSTS_ENV = "LOGSCOPE_ALERT_ALLOWED_HOSTS"
 CHANNEL_TYPES = ("mattermost", "slack", "webhook")
 ENV_CHANNEL_ID = 0
 SEND_TIMEOUT_SECS = 10
-SEND_ATTEMPTS = 5
-RETRY_BASE_SECS = 1.0
 SIGNATURE_HEADER = "X-Logscope-Signature"
 CHANNELS_MAX = 50
 CLEAR = "__clear__"
@@ -276,18 +273,17 @@ def render(channel_type: str, message: Message) -> dict[str, Any]:
 
 
 class Deliverer:
-    """Sends one message to one channel with retries (SEND_ATTEMPTS, backoff
-    RETRY_BASE_SECS × 2^n on transient failures). Returns None or the error
-    text of the last attempt."""
+    """Sends one message to one channel: a single attempt with a
+    SEND_TIMEOUT_SECS timeout. Retries belong to the caller's durable schedule
+    (alerts.RETRY_SCHEDULE_SECS), never to sleeps here, so a failing channel
+    holds the delivery thread for at most one timeout. Returns None or the
+    error text."""
 
-    def __init__(self, *, sleep: Callable[[float], None] = time.sleep, guarded: Callable[..., None] = post_guarded,
-                 trusted: Callable[..., None] = post_webhook, attempts: int = SEND_ATTEMPTS,
-                 base_delay: float = RETRY_BASE_SECS):
-        self._sleep = sleep
+    def __init__(self, *, guarded: Callable[..., None] = post_guarded, trusted: Callable[..., None] = post_webhook,
+                 timeout: float = SEND_TIMEOUT_SECS):
         self._guarded = guarded
         self._trusted = trusted
-        self.attempts = attempts
-        self.base_delay = base_delay
+        self.timeout = timeout
 
     def send(self, channel: Channel, message: Message) -> str | None:
         payload = render(channel.type, message)
@@ -295,25 +291,18 @@ class Deliverer:
         headers = {"Content-Type": "application/json", "User-Agent": "logscope-webapp/1.0"}
         if channel.type == "webhook" and channel.secret:
             headers[SIGNATURE_HEADER] = sign(channel.secret, body)
-        last = "not sent"
-        for attempt in range(1, self.attempts + 1):
-            try:
-                if channel.source == "env":
-                    self._trusted(channel.url, payload)
-                else:
-                    self._guarded(channel.url, body, headers)
-                return None
-            except DeliveryError as exc:
-                last = str(exc)
-                if not exc.transient:
-                    break
-            except Exception as exc:  # noqa: BLE001 - keep the URL out of messages
-                last = f"unexpected error ({type(exc).__name__})"
-                break
-            if attempt < self.attempts:
-                self._sleep(self.base_delay * 2 ** (attempt - 1))
-        logger.warning("Delivery to channel %s (%s) failed: %s", channel.id, channel.type, last)
-        return last[:300]
+        try:
+            if channel.source == "env":
+                self._trusted(channel.url, payload, timeout=self.timeout)
+            else:
+                self._guarded(channel.url, body, headers, timeout=self.timeout)
+            return None
+        except DeliveryError as exc:
+            error = str(exc)
+        except Exception as exc:  # noqa: BLE001 - keep the URL out of messages
+            error = f"unexpected error ({type(exc).__name__})"
+        logger.warning("Delivery to channel %s (%s) failed: %s", channel.id, channel.type, error)
+        return error[:300]
 
 
 def _clean_name(value: Any) -> str:

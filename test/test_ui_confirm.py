@@ -63,6 +63,10 @@ out.cancel = { pending: pending(), open: modal.open };
 arm(); fire('confirmExecuteBtn', 'click', {});
 out.execute = { pending: pending(), open: modal.open };
 out.removed = { analyzeLogsBtn: !listeners.has('actionableAnalyzeLogsBtn'), filters: run("'filters' in state") };
+run(`alertsState.channels = [{ id: 1, name: 'ops-hook' }, { id: 2, name: 'pager' }]`);
+out.deliveries = run(`alertDeliveryMarkup({ id: 7, notified: 'retrying', attempts: 2, retryable: true, deliveries: [
+  { channel_id: 1, state: 'sent', attempts: 1 },
+  { channel_id: 2, state: 'retrying', attempts: 2, next_attempt_at: '2026-10-21T06:01:00.000Z', last_error: 'HTTP 503' }] })`);
 process.stdout.write(JSON.stringify(out));
 """
 
@@ -81,3 +85,19 @@ def test_confirm_dialog_esc_and_backdrop_clear_the_pending_mutation(tmp_path):
     assert out["cancel"] == {"pending": None, "open": False}
     assert out["execute"] == {"pending": None, "open": False}
     assert out["removed"] == {"analyzeLogsBtn": True, "filters": False}   # dead UI code is gone
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is not installed")
+def test_alert_history_shows_delivery_per_channel(tmp_path):
+    harness = tmp_path / "harness.js"
+    harness.write_text(_HARNESS)
+    proc = subprocess.run(["node", str(harness), str(ROOT / "webapp" / "ui" / "app.js")], capture_output=True,
+                          text=True, timeout=60, env={**os.environ, "TZ": "UTC"})
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    html = json.loads(proc.stdout)["deliveries"]
+    assert html.count("<li>") == 2
+    sent, retrying = html.split("<li>")[1:]
+    assert "ops-hook" in sent and "alert-delivery-sent" in sent and "attempt" not in sent
+    assert "pager" in retrying and "alert-delivery-retrying" in retrying and "2 attempts" in retrying
+    assert "HTTP 503" in retrying and ">next " in retrying
+    assert 'data-event-id="7"' in html and "Retry now" in html

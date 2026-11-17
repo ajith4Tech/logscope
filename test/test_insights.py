@@ -84,6 +84,11 @@ def make_job(store, summarizer=None, **overrides):
         frequency_min_count=30,
         detect_per_pod=False,
         sample_timestamps_max=10,
+        # The cold-start grace and min-baseline-samples guards are exercised by
+        # their own tests (and the WP regression); switch them off here so the
+        # pre-existing detector tests keep testing the ratio logic in isolation.
+        cold_start_grace_s=0,
+        min_baseline_samples=0,
     )
     defaults.update(overrides)
     from dataclasses import replace

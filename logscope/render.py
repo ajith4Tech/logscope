@@ -16,6 +16,7 @@ except ImportError:
     sys.stderr.write("PyYAML is required: pip install -r requirements.txt\n")
     sys.exit(1)
 
+from .lineformat import line_format_problem, timestamp_format_problem
 from .resources import example_config, project_dir
 
 # Repository root in a source checkout; the working directory for a
@@ -532,6 +533,13 @@ def validate_cfg(cfg: dict) -> None:
         raise SystemExit("at least one sink must be enabled")
     format_to_vrl(cfg["format"]["line"])
     format_to_vrl(cfg["format"]["metrics"])
+    # The web app's parser reads the timestamp back as one whitespace-free
+    # token (lineformat.TIMESTAMP_PATTERN).
+    problem = timestamp_format_problem(str(cfg["format"]["timestamp"]))
+    for key in ("line", "metrics"):
+        problem = problem or line_format_problem(str(cfg["format"][key]), f"format.{key}")
+    if problem:
+        raise SystemExit(problem)
     _validate_falco(cfg)
 
 
@@ -787,17 +795,17 @@ def helm_values(cfg: dict, *, mode: str) -> str:
             "  - name: project-logs",
             "    mountPath: /data",
         ]
-    if mode == "agent":
-        volumes += [
-            "  - name: vector-data",
-            "    hostPath:",
-            f"      path: {cfg['paths']['checkpoint']}",
-            "      type: DirectoryOrCreate",
-        ]
-        mounts += [
-            "  - name: vector-data",
-            f"    mountPath: {cfg['paths']['checkpoint']}",
-        ]
+    # Checkpoints (data_dir = paths.checkpoint) in both kits: the vector/vector
+    # chart (0.57.0) mounts its own "data" volume at customConfig.data_dir,
+    # a hostPath at persistence.hostPath.path, so point that at the same host
+    # directory. A second volume mounted there would make the pod invalid
+    # (duplicate mountPath).
+    persistence = (
+        "persistence:\n"
+        "  hostPath:\n"
+        "    enabled: true\n"
+        f"    path: {yaml_str(cfg['paths']['checkpoint'])}\n"
+    )
 
     vol_yaml = "extraVolumes:\n" + "\n".join(volumes) + "\n" if volumes else "extraVolumes: []\n"
     mnt_yaml = "extraVolumeMounts:\n" + "\n".join(mounts) + "\n" if mounts else "extraVolumeMounts: []\n"
@@ -849,7 +857,7 @@ podAnnotations:
   prometheus.io/scrape: "true"
   prometheus.io/port: "8686"
 
-{env_block}{vol_yaml}{mnt_yaml}
+{env_block}{vol_yaml}{mnt_yaml}{persistence}
 customConfig:
 {custom}
 """

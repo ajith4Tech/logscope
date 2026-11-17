@@ -170,6 +170,43 @@ def test_vector_image_tag_is_pinned_to_the_chart():
         assert image["repository"] == R.VECTOR_IMAGE_REPO == chart["vector"]["image"]["repository"]
 
 
+def test_checkpoints_persist_through_the_charts_own_data_volume():
+    """data_dir is paths.checkpoint in both kits; the vector chart mounts its
+    "data" hostPath volume at data_dir, so the rendered values point that
+    volume at paths.checkpoint and add no second mount at the same path."""
+    import shutil
+    from copy import deepcopy
+
+    import yaml
+
+    cfg = deepcopy(R.load_config(TEST_CONFIG))
+    cfg["paths"]["checkpoint"] = "/var/lib/logscope-vector"
+    with tempfile.TemporaryDirectory() as td:
+        cfg_path = Path(td) / "config.yaml"
+        cfg_path.write_text(yaml.safe_dump(cfg))
+        rendered = render_kits(cfg_path)
+    for name in ("values-local.yaml", "values-agent.yaml"):
+        values = yaml.safe_load(rendered[name])
+        assert values["persistence"] == {"hostPath": {"enabled": True, "path": "/var/lib/logscope-vector"}}
+        assert values["customConfig"]["data_dir"] == "/var/lib/logscope-vector"
+        assert "/var/lib/logscope-vector" not in [m["mountPath"] for m in values["extraVolumeMounts"] or []]
+    chart = Path.home() / ".cache" / "helm" / "repository" / "vector-0.57.0.tgz"
+    if shutil.which("helm") is None or not chart.is_file():
+        return  # the upstream template check needs helm and the cached chart
+    for name in ("values-local.yaml", "values-agent.yaml"):
+        with tempfile.TemporaryDirectory() as td:
+            values = Path(td) / name
+            values.write_text(rendered[name])
+            out = subprocess.run(["helm", "template", "v", str(chart), "-f", str(values)], check=True,
+                                 capture_output=True, text=True).stdout
+        ds = next(d for d in yaml.safe_load_all(out) if d and d["kind"] == "DaemonSet")["spec"]["template"]["spec"]
+        mounts = [m["mountPath"] for m in ds["containers"][0]["volumeMounts"]]
+        assert len(mounts) == len(set(mounts)), mounts               # a duplicate mountPath is an invalid pod
+        data_mount = next(m for m in ds["containers"][0]["volumeMounts"] if m["name"] == "data")
+        data_volume = next(v for v in ds["volumes"] if v["name"] == "data")
+        assert data_mount["mountPath"] == data_volume["hostPath"]["path"] == "/var/lib/logscope-vector"
+
+
 if __name__ == "__main__":
     test_glob()
     test_line_format_default()
@@ -180,4 +217,5 @@ if __name__ == "__main__":
     test_klog_prefix_list_and_single_letter()
     test_falco_containers_config_and_validation()
     test_vector_image_tag_is_pinned_to_the_chart()
+    test_checkpoints_persist_through_the_charts_own_data_volume()
     print("ok")

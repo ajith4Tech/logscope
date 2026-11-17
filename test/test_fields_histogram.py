@@ -211,6 +211,28 @@ def test_histogram_picks_bucket_size_from_range(storage, hours, size):
     assert sum(b["total"] for b in out["buckets"]) == sum(1 for m, *_ in _FIXTURE if m < hours * 60)
 
 
+@pytest.mark.parametrize("hours, size", [(1, 60), (6, 600), (16.5, 1200), (7 * 24, 10800)])
+def test_histogram_target_buckets_picks_a_finer_size(storage, hours, size):
+    start = datetime(2026, 9, 7, 10, tzinfo=timezone.utc).timestamp()
+    before = datetime.fromtimestamp(start + hours * 3600, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = storage.query_histogram({"start": "2026-09-07T10:00:00Z", "before": before}, target_buckets=60)
+    assert out["bucket_secs"] == size
+    assert 30 <= len(out["buckets"]) <= 60 + 1
+    assert sum(b["total"] for b in out["buckets"]) == sum(1 for m, *_ in _FIXTURE if m < hours * 60)
+
+
+def test_histogram_tz_offset_aligns_buckets_to_local_time(storage):
+    # UTC+05:30: hourly buckets start at :30 UTC (local whole hours); counts are unchanged.
+    params = {"start": "2026-09-07T09:30:00Z", "before": "2026-09-08T09:30:00Z"}
+    local = storage.query_histogram(params, target_buckets=30, tz_offset_min=330)
+    assert local["bucket_secs"] == 3600
+    assert local["buckets"][0]["t"] == "2026-09-07T09:30:00Z"
+    assert all(b["t"].endswith(":30:00Z") for b in local["buckets"])
+    assert sum(b["total"] for b in local["buckets"]) == len(_FIXTURE)
+    utc = storage.query_histogram(params)
+    assert utc["buckets"][0]["t"] == "2026-09-07T09:00:00Z"   # default: UTC-aligned, as before
+
+
 def test_histogram_buckets_on_utc_epoch_not_strings(tmp_path):
     storage = LogStorage(tmp_path / "w.sqlite")
     base = {"severity_bucket": "info", "scope": "infra", "namespace": "n", "pod": "p", "container": "c",
@@ -284,6 +306,10 @@ def test_http_fields_and_histogram(server):
     status, hist = _get(server, "/api/histogram", {**_RANGE, "severity_bucket": "error"})
     assert status == 200 and len(hist["buckets"]) == 60
     assert sum(b["total"] for b in hist["buckets"]) == 4
+    status, hist = _get(server, "/api/histogram", {**_RANGE, "target_buckets": 30, "tz_offset_min": 330})
+    assert status == 200 and hist["bucket_secs"] == 120 and sum(b["total"] for b in hist["buckets"]) == 10
+    for bad in ({"target_buckets": "many"}, {"target_buckets": 5}, {"tz_offset_min": 900}):
+        assert _get(server, "/api/histogram", {**_RANGE, **bad})[0] == 400, bad
 
 
 def test_http_exclusions_accept_repeated_and_comma_separated_values(server):

@@ -19,7 +19,7 @@ if TYPE_CHECKING:  # importlib.abc.Traversable moved to importlib.resources.abc 
 # Repository root when running from a source checkout.
 _SOURCE_ROOT = Path(__file__).resolve().parents[1]
 
-UI_FILES = ("index.html", "app.js", "styles.css")
+UI_FILES = ("index.html", "app.js", "styles.css", "favicon.svg")
 
 
 def is_frozen() -> bool:
@@ -34,7 +34,7 @@ def bundle_root() -> Path:
 
 
 def ui_asset(name: str) -> Traversable:
-    """One of the web UI files (index.html, app.js, styles.css)."""
+    """One of the web UI files (index.html, app.js, styles.css, favicon.svg)."""
     if name not in UI_FILES:
         raise ValueError(f"unknown UI asset {name!r}")
     if is_frozen():

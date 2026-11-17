@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import queue
 import re
 import shutil
 import sqlite3
@@ -87,6 +88,46 @@ _LEGACY_RECORD_INDEXES = (
 # by an older version (see backfill_ts_step).
 TS_BACKFILL_BATCH = 5000
 
+# Hourly rollup: entries per (UTC hour, scope, namespace, pod, container,
+# severity), kept in the same transaction as every insert, prune and ts_epoch
+# backfill. Count-only queries without a text search read whole hours from it
+# and only the partial hours at a range's edges from records.
+ROLLUP_SECS = 3600
+_ROLLUP_SQL = (
+    "CREATE TABLE IF NOT EXISTS counts_hourly ("
+    "hour_epoch INTEGER NOT NULL, scope TEXT NOT NULL, namespace TEXT NOT NULL, pod TEXT NOT NULL, "
+    "container TEXT NOT NULL, severity TEXT NOT NULL, n INTEGER NOT NULL, "
+    "PRIMARY KEY (hour_epoch, scope, namespace, pod, container, severity)) WITHOUT ROWID"
+)
+# Planner statistics: a full ANALYZE (about 0.7 s per million rows, writer
+# lock only; the read pool keeps serving), rerun after this many new rows.
+# Sampled statistics (analysis_limit) were measured to mislead the planner
+# into skip-scans over the pod index that are several times slower.
+ANALYZE_AFTER_ROWS = 500_000
+# FTS5 automerge level (default 4): merge segments sooner, so the index
+# stays near-optimized without a full 'optimize' pass.
+FTS_AUTOMERGE = 8
+# Pages merged per locked step of the off-peak FTS merge (see fts_merge_step).
+FTS_MERGE_PAGES = 500
+# Record ids aggregated per locked step of the one-time rebuild of a
+# database written before the rollup existed (see rebuild_rollup_step).
+ROLLUP_REBUILD_BATCH = 50_000
+# records columns -> counts_hourly columns, for the filter fields.
+_ROLLUP_COLUMN = {"scope": "scope", "namespace": "namespace", "pod": "pod", "container": "container",
+                  "severity_bucket": "severity"}
+_HOUR_SQL = f"CAST(ts_epoch / {ROLLUP_SECS} AS INTEGER) * {ROLLUP_SECS}"
+_UPSERT_ROLLUP = (
+    "INSERT INTO counts_hourly (hour_epoch, scope, namespace, pod, container, severity, n) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (hour_epoch, scope, namespace, pod, container, severity) "
+    "DO UPDATE SET n = n + excluded.n"
+)
+
+
+def hour_of(epoch: float) -> int:
+    """The UTC hour an event time falls in (as epoch seconds); the same
+    value _HOUR_SQL computes in SQL."""
+    return int(epoch / ROLLUP_SECS) * ROLLUP_SECS
+
 # Filter fields: (record column, exclusion parameter). An exclusion parameter
 # holds values to leave out, e.g. xns=kube-system.
 FILTER_FIELDS = (
@@ -108,6 +149,10 @@ _PROGRESS_OPS = 1000
 HISTOGRAM_BUCKET_SECS = (60, 300, 900, 3600, 21600)
 HISTOGRAM_TARGET_BUCKETS = 60
 HISTOGRAM_MAX_BUCKETS = 1000
+# Sizes for a caller-chosen bar count (target_buckets): each at most twice the
+# previous one, so the count lands between half the target and the target.
+HISTOGRAM_FINE_BUCKET_SECS = (60, 120, 180, 300, 600, 900, 1200, 1800, 3600, 7200, 10800, 14400,
+                              21600, 43200, 86400)
 _HISTOGRAM_SEVERITIES = ("error", "warning", "info", "debug")
 
 _RECORD_COLUMNS = (
@@ -134,12 +179,54 @@ def default_cache_db_path() -> Path:
     return base / "logscope" / "cache.sqlite"
 
 
-def open_connection(db_path: Path) -> sqlite3.Connection:
-    """A connection to the app database with the shared busy timeout. Used for
-    connections owned by a single thread (e.g. the insights detector)."""
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
-    conn.row_factory = sqlite3.Row
+def count_objects_under(conn: sqlite3.Connection, prefix: str) -> tuple[int, int]:
+    """(ingested objects whose key starts with prefix, all other objects); a
+    key range, so the primary key index is used."""
+    total = int(conn.execute("SELECT COUNT(*) FROM ingested_objects").fetchone()[0])
+    under = int(conn.execute(
+        "SELECT COUNT(*) FROM ingested_objects WHERE key >= ? AND key < ?", (prefix, prefix + "\uffff")
+    ).fetchone()[0])
+    return under, total - under
+
+
+# Per-connection tuning, applied to every connection: page cache (KiB when
+# negative), memory-mapped reads (2 GiB, about SQLite's usual build limit),
+# and temp tables (sorts, GROUP BY) in temp files, i.e. the OS page cache.
+# temp_store = MEMORY was measured to stop concurrent readers from scaling
+# (4 threads: 33 vs 117 queries/s, most CPU in the kernel), so it is FILE.
+SQLITE_CACHE_KIB = 65536
+SQLITE_MMAP_BYTES = 2_147_418_112
+SQLITE_TEMP_STORE = "FILE"
+# Read-only connections serving GET requests (LOGSCOPE_SQLITE_READERS; 0 =
+# every query on the one shared connection, under its lock).
+READERS_ENV = "LOGSCOPE_SQLITE_READERS"
+DEFAULT_READERS = 4
+
+
+def tune_connection(conn: sqlite3.Connection) -> sqlite3.Connection:
+    conn.execute(f"PRAGMA cache_size = -{SQLITE_CACHE_KIB}")
+    conn.execute(f"PRAGMA mmap_size = {SQLITE_MMAP_BYTES}")
+    conn.execute(f"PRAGMA temp_store = {SQLITE_TEMP_STORE}")
     return conn
+
+
+def open_connection(db_path: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    """A connection to the app database with the shared busy timeout and
+    tuning. Used for connections owned by a single thread (e.g. the insights
+    detector) and for the read pool (read_only: the file opened mode=ro)."""
+    target, uri = (f"file:{Path(db_path).resolve()}?mode=ro", True) if read_only else (db_path, False)
+    conn = sqlite3.connect(target, uri=uri, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
+    conn.row_factory = sqlite3.Row
+    return tune_connection(conn)
+
+
+def _reader_count() -> int:
+    raw = os.environ.get(READERS_ENV, "").strip()
+    try:
+        return max(0, int(raw)) if raw else DEFAULT_READERS
+    except ValueError:
+        logger.warning("Ignoring non-integer %s=%r; using %d", READERS_ENV, raw, DEFAULT_READERS)
+        return DEFAULT_READERS
 
 
 _JOURNAL_MODES = frozenset({"wal", "delete", "truncate", "persist"})
@@ -184,6 +271,40 @@ def _locked(method):
             except BaseException:
                 _rollback_quietly(self._conn)
                 raise
+
+    return wrapper
+
+
+def _reading(method):
+    """Run a read-only method on a pooled read connection, inside one read
+    transaction (a single snapshot for all its statements), without the
+    writer's lock: with WAL, reads neither wait for nor block ingest. Without
+    a pool (LOGSCOPE_SQLITE_READERS=0 or a non-WAL journal) it runs on the
+    shared connection under the lock, as before. Nested calls reuse the
+    caller's connection."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if getattr(self._local, "conn", None) is not None:
+            return method(self, *args, **kwargs)
+        if self._pool is None:
+            with self._lock:
+                return method(self, *args, **kwargs)
+        generation, conn = self._pool.get()
+        self._local.conn = conn
+        try:
+            conn.execute("BEGIN")
+            return method(self, *args, **kwargs)
+        finally:
+            self._local.conn = None
+            try:
+                conn.rollback()  # read-only: ends the snapshot
+            except sqlite3.Error:
+                logger.exception("Ending a read transaction failed")
+            if generation != self._pool_generation:  # opened before new planner statistics
+                conn.close()
+                generation, conn = self._pool_generation, open_connection(self.db_path, read_only=True)
+            self._pool.put((generation, conn))
 
     return wrapper
 
@@ -312,9 +433,10 @@ class LogStorage:
         if not db_path.parent.exists():
             os.makedirs(db_path.parent, mode=0o700, exist_ok=True)  # cached log lines: owner only
         self.db_path = db_path
-        self._conn = sqlite3.connect(db_path, check_same_thread=False, timeout=SQLITE_BUSY_TIMEOUT_SECS)
-        self._conn.row_factory = sqlite3.Row
+        self._conn = open_connection(db_path)
         self._lock = threading.RLock()
+        self._local = threading.local()  # the read connection a _reading call runs on
+        self._pool: queue.LifoQueue | None = None
         self.fts_enabled = False
         # "external" | "migrating" (a legacy index from an older version still
         # serves search while the external one is backfilled) | "" when FTS5
@@ -325,10 +447,33 @@ class LogStorage:
         # Rows from an older version still without ts_epoch (see backfill_ts_step).
         self.ts_backfill_pending = False
         self.ts_backfill_error: str | None = None  # set by the server's backfill loop
+        # counts_hourly is complete (no rebuild pending); see rebuild_rollup_step.
+        self.rollup_ready = False
+        self.rollup_error: str | None = None  # set by the server's rebuild loop
+        self.use_rollup = True  # False forces the raw-row path (tests compare both)
+        self._rows_since_analyze = 0
+        self._has_stats = False
         self.journal_mode = ""
         with self._lock:
             self._configure(journal_mode)
             self._init_schema()
+        readers = _reader_count()
+        self._pool_generation = 0
+        if readers and self.journal_mode == "wal":
+            self._pool = queue.LifoQueue()
+            for _ in range(readers):
+                self._pool.put((0, open_connection(db_path, read_only=True)))
+
+    def _c(self) -> sqlite3.Connection:
+        """The connection for the running method: its pooled read connection
+        inside a _reading call, else the shared (writer) connection."""
+        return getattr(self._local, "conn", None) or self._conn
+
+    def close(self) -> None:
+        """Close the read pool and the shared connection."""
+        while self._pool is not None and not self._pool.empty():
+            self._pool.get_nowait()[1].close()
+        self._conn.close()
 
     def _configure(self, journal_mode: str) -> None:
         is_new = self._conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0] == 0
@@ -344,6 +489,12 @@ class LogStorage:
         if actual != requested:
             logger.warning("SQLite journal_mode %s requested but the database uses %s", requested, actual)
         self.journal_mode = actual
+        if actual == "wal":
+            # No fsync per commit (WAL stays consistent; a power loss can only
+            # drop the last commits). Objects are marked ingested after their
+            # rows commit, so anything lost is read from S3 again. Measured
+            # +25-30% ingest throughput.
+            self._conn.execute("PRAGMA synchronous = NORMAL")
 
     def _init_schema(self) -> None:
         cur = self._conn.cursor()
@@ -365,6 +516,7 @@ class LogStorage:
                 line_number INTEGER NOT NULL,
                 is_falco INTEGER NOT NULL DEFAULT 0,
                 ingested_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                http_meta TEXT,
                 UNIQUE(source_key, source_etag, line_number)
             )
             """
@@ -420,14 +572,148 @@ class LogStorage:
         if "ts_epoch" not in columns:
             # Older database: existing rows are filled in by backfill_ts_step.
             cur.execute("ALTER TABLE records ADD COLUMN ts_epoch REAL")
+        if "http_meta" not in columns:
+            # Access-log fields (method/path/status/client_ip/...) for rows that
+            # are HTTP access logs; NULL otherwise. Older rows stay NULL.
+            cur.execute("ALTER TABLE records ADD COLUMN http_meta TEXT")
         for name in _LEGACY_RECORD_INDEXES:
             cur.execute(f"DROP INDEX IF EXISTS {name}")
         for statement in _RECORD_INDEXES:
             cur.execute(statement)
         self.ts_backfill_pending = cur.execute(
             "SELECT 1 FROM records WHERE ts_epoch IS NULL LIMIT 1").fetchone() is not None
+        if self._table_sql("counts_hourly") is None:
+            cur.execute(_ROLLUP_SQL)
+            self._restart_rollup()
+        else:
+            self.rollup_ready = self._get_state("rollup_upper") is None
+            if not self._rollup_consistent():
+                self._restart_rollup()
+        self.rollup_ready = self._get_state("rollup_upper") is None
         self._init_fts(cur)
+        if self.fts_layout == "external":
+            cur.execute("INSERT INTO records_fts(records_fts, rank) VALUES ('automerge', ?)", (FTS_AUTOMERGE,))
+        self._has_stats = self._table_sql("sqlite_stat1") is not None
         self._conn.commit()
+
+    # -- hourly rollup ------------------------------------------------------------
+
+    def _rollup_bounds(self) -> tuple[int, int]:
+        """(done, upper) of a pending rebuild: rows with done < id <= upper are
+        not in the rollup yet. Rows above upper were added at insert."""
+        return int(self._get_state("rollup_done") or 0), int(self._get_state("rollup_upper") or 0)
+
+    def _restart_rollup(self) -> None:
+        """Empty the rollup and schedule a rebuild of every existing row."""
+        self._conn.execute("DELETE FROM counts_hourly")
+        self._conn.execute("DELETE FROM app_state WHERE name = 'rollup_max_id'")
+        self._conn.execute("DELETE FROM app_state WHERE name IN ('rollup_done', 'rollup_upper')")
+        upper = int(self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0])
+        if upper:  # rows written before the rollup: added in the background
+            self._set_state("rollup_upper", str(upper))
+            self._set_state("rollup_done", "0")
+        self.rollup_ready = not upper
+
+    def _rollup_consistent(self) -> bool:
+        """The rollup must count exactly the rows it claims to. A version
+        without it (a downgrade) inserts and prunes without updating it."""
+        counted, args = self._rollup_counted_sql()
+        rows = int(self._conn.execute(
+            f"SELECT COUNT(*) FROM records WHERE ts_epoch IS NOT NULL AND {counted}", args).fetchone()[0])
+        total = int(self._conn.execute("SELECT COALESCE(SUM(n), 0) FROM counts_hourly").fetchone()[0])
+        if rows != total:
+            logger.warning("Hourly rollup does not match the records (%d vs %d); rebuilding it", total, rows)
+        return rows == total
+
+    def _rollup_counted_sql(self) -> tuple[str, list[Any]]:
+        """A condition on records.id: the row's count is in the rollup."""
+        if self.rollup_ready:
+            return "1", []
+        done, upper = self._rollup_bounds()
+        return "(id <= ? OR id > ?)", [done, upper]
+
+    def _rollup_apply(self, deltas: dict[tuple, int]) -> None:
+        """Add (or, negative, remove) counts; rows that reach zero are deleted,
+        so the rollup holds exactly the groups that have records."""
+        if not deltas:
+            return
+        self._conn.executemany(_UPSERT_ROLLUP, [(*key, n) for key, n in deltas.items() if n])
+        gone = [key for key, n in deltas.items() if n < 0]
+        if gone:
+            self._conn.executemany(
+                "DELETE FROM counts_hourly WHERE hour_epoch = ? AND scope = ? AND namespace = ? AND pod = ? "
+                "AND container = ? AND severity = ? AND n <= 0", gone)
+
+    def _rollup_deltas(self, where: str, args: list[Any], sign: int) -> dict[tuple, int]:
+        """Counts of the matching records with a ts_epoch whose count is (or
+        is about to be) in the rollup, grouped by rollup key."""
+        counted, counted_args = self._rollup_counted_sql()
+        rows = self._conn.execute(
+            f"SELECT {_HOUR_SQL}, scope, namespace, pod, container, severity_bucket, COUNT(*) FROM records "
+            f"WHERE {where} AND ts_epoch IS NOT NULL AND {counted} GROUP BY 1, 2, 3, 4, 5, 6",
+            (*args, *counted_args)).fetchall()
+        return {tuple(row[:6]): sign * int(row[6]) for row in rows}
+
+    # -- maintenance ------------------------------------------------------------------
+
+    @_locked
+    def optimize(self, *, analyze: bool = False) -> None:
+        """PRAGMA optimize (cheap; re-analyzes only what the planner needs),
+        or a full ANALYZE (no statistics yet, or after large ingests)."""
+        self._conn.execute("ANALYZE" if analyze else "PRAGMA optimize")
+        self._conn.commit()
+        if analyze:
+            self._rows_since_analyze = 0
+            self._has_stats = True
+            # Open connections keep the statistics they loaded; the read
+            # pool replaces each connection as it comes back.
+            self._pool_generation += 1
+
+    @property
+    def analyze_due(self) -> bool:
+        return self._rows_since_analyze >= ANALYZE_AFTER_ROWS or not self._has_stats
+
+    @_locked
+    def fts_merge_step(self, pages: int = FTS_MERGE_PAGES) -> bool:
+        """One incremental FTS5 merge step; True when it found work. Repeated
+        until False it amounts to 'optimize' without holding the lock long."""
+        if not self.fts_enabled or self.fts_layout != "external":
+            return False
+        before = self._conn.total_changes
+        self._conn.execute("INSERT INTO records_fts(records_fts, rank) VALUES ('merge', ?)", (pages,))
+        self._conn.commit()
+        return self._conn.total_changes - before >= 2
+
+    @_locked
+    def rebuild_rollup_step(self, batch: int = ROLLUP_REBUILD_BATCH) -> bool:
+        """Add one id range of rows written before the rollup existed (or
+        before it was dropped). Returns True when the rollup is complete.
+        Each step commits, so a restart resumes; ingest, pruning and the
+        ts_epoch backfill keep it exact meanwhile (see _rollup_counted_sql)."""
+        if self.rollup_ready:
+            return True
+        done, upper = self._rollup_bounds()
+        hi = min(done + batch, upper)
+        rows = self._conn.execute(
+            f"SELECT {_HOUR_SQL}, scope, namespace, pod, container, severity_bucket, COUNT(*) FROM records "
+            "WHERE id > ? AND id <= ? AND ts_epoch IS NOT NULL GROUP BY 1, 2, 3, 4, 5, 6", (done, hi)).fetchall()
+        self._rollup_apply({tuple(row[:6]): int(row[6]) for row in rows})
+        if hi >= upper:
+            self._conn.execute("DELETE FROM app_state WHERE name IN ('rollup_done', 'rollup_upper')")
+            self._set_state("rollup_max_id", str(self._max_id()))
+            self.rollup_ready = True
+        else:
+            self._set_state("rollup_done", str(hi))
+        self._conn.commit()
+        if self.rollup_ready:
+            logger.info("Hourly rollup rebuilt")
+        return self.rollup_ready
+
+    def rollup_usable(self, params: dict[str, Any]) -> bool:
+        """Whether a count over these filters can come from the rollup: it is
+        complete, every row has its ts_epoch, and there is no text search."""
+        return (self.use_rollup and self.rollup_ready and not self.ts_backfill_pending
+                and not params.get("q"))
 
     @_locked
     def backfill_ts_step(self, batch: int = TS_BACKFILL_BATCH) -> int:
@@ -438,8 +724,8 @@ class LogStorage:
         gets its S3 object's time (else the row's ingest time) and is
         counted like one at ingest."""
         rows = self._conn.execute(
-            "SELECT id, timestamp, source_key, source_etag, ingested_at FROM records "
-            "WHERE ts_epoch IS NULL ORDER BY id LIMIT ?", (batch,)
+            "SELECT id, timestamp, source_key, source_etag, ingested_at, scope, namespace, pod, container, "
+            "severity_bucket FROM records WHERE ts_epoch IS NULL ORDER BY id LIMIT ?", (batch,)
         ).fetchall()
         if not rows:
             self.ts_backfill_pending = False
@@ -464,6 +750,18 @@ class LogStorage:
         self._conn.executemany("UPDATE records SET ts_epoch = ? WHERE id = ?", updates)
         if fallbacks:
             self._add_ts_fallbacks(fallbacks)
+        # Rows the rollup rebuild has already passed (it skipped them while
+        # they had no time) are counted now; later ones are counted by it.
+        done, upper = self._rollup_bounds()
+        by_id = {int(row["id"]): row for row in rows}
+        deltas: dict[tuple, int] = {}
+        for epoch, record_id in updates:
+            if self.rollup_ready or record_id <= done or record_id > upper:
+                row = by_id[record_id]
+                key = (hour_of(epoch), row["scope"], row["namespace"], row["pod"], row["container"],
+                       row["severity_bucket"])
+                deltas[key] = deltas.get(key, 0) + 1
+        self._rollup_apply(deltas)
         self._conn.commit()
         return len(updates)
 
@@ -472,7 +770,7 @@ class LogStorage:
         self._set_state("ts_fallback_count", str(current + count))
 
     def ts_backfill_remaining(self) -> int:
-        return int(self._conn.execute("SELECT COUNT(*) FROM records WHERE ts_epoch IS NULL").fetchone()[0])
+        return int(self._c().execute("SELECT COUNT(*) FROM records WHERE ts_epoch IS NULL").fetchone()[0])
 
     def _table_sql(self, name: str) -> str | None:
         row = self._conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)).fetchone()
@@ -655,7 +953,7 @@ class LogStorage:
         )
 
     def _get_state(self, name: str) -> str | None:
-        row = self._conn.execute("SELECT value FROM app_state WHERE name = ?", (name,)).fetchone()
+        row = self._c().execute("SELECT value FROM app_state WHERE name = ?", (name,)).fetchone()
         return str(row[0]) if row else None
 
     @_locked
@@ -749,15 +1047,15 @@ class LogStorage:
         ).fetchall()
         return [dict(row) for row in rows]
 
-    @_locked
+    @_reading
     def object_failure_summary(self) -> dict[str, Any]:
-        count = int(self._conn.execute("SELECT COUNT(*) FROM object_failures").fetchone()[0])
-        latest = self._conn.execute(
+        count = int(self._c().execute("SELECT COUNT(*) FROM object_failures").fetchone()[0])
+        latest = self._c().execute(
             "SELECT key, attempts, last_error, next_attempt_at FROM object_failures "
             "ORDER BY first_failed_at DESC LIMIT 1"
         ).fetchone()
         # One row per configured prefix at most (severity buckets x scopes).
-        by_prefix = self._conn.execute(
+        by_prefix = self._c().execute(
             "SELECT prefix, COUNT(*) AS count, MAX(attempts) AS max_attempts, MIN(next_attempt_at) AS next_attempt_at "
             "FROM object_failures GROUP BY prefix ORDER BY count DESC, prefix LIMIT ?",
             (_PREFIX_ERRORS_MAX,),
@@ -775,6 +1073,7 @@ class LogStorage:
         cur = self._conn.cursor()
         inserted = 0
         fallbacks = 0
+        rollup: dict[tuple, int] = {}
         for record in records:
             # make_record fills ts_epoch (the S3 object's time when the line's
             # timestamp does not parse, flagged ts_fallback); callers that
@@ -789,8 +1088,8 @@ class LogStorage:
                 """
                 INSERT OR IGNORE INTO records(
                     timestamp, ts_epoch, severity_bucket, scope, namespace, pod, container,
-                    message, raw_line, source_key, source_etag, line_number, is_falco, ingested_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    message, raw_line, source_key, source_etag, line_number, is_falco, ingested_at, http_meta
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record["timestamp"],
@@ -807,16 +1106,26 @@ class LogStorage:
                     int(record["line_number"]),
                     int(record["is_falco"]),
                     _utc_now(),
+                    record.get("http_meta"),
                 ),
             )
             if cur.rowcount:
                 inserted += 1
                 fallbacks += fallback
+                key = (hour_of(float(epoch)), record["scope"], record["namespace"], record["pod"],
+                       record["container"], record["severity_bucket"])
+                rollup[key] = rollup.get(key, 0) + 1
                 if self.fts_enabled:
                     self._fts_index_row(cur, int(cur.lastrowid), record["message"], record["raw_line"])
         if fallbacks:
             self._add_ts_fallbacks(fallbacks)
+        self._rollup_apply(rollup)  # new ids are always above a pending rebuild's range
+        if inserted:
+            # The newest id the rollup has counted: readers on other
+            # connections (Insights) check that no writer went around it.
+            self._set_state("rollup_max_id", str(int(cur.lastrowid)))
         self._conn.commit()
+        self._rows_since_analyze += inserted
         return inserted
 
     @_locked
@@ -853,7 +1162,7 @@ class LogStorage:
         """Reject malformed FTS5 query syntax as a client error, so real
         database failures are not mistaken for bad input."""
         try:
-            self._conn.execute("SELECT 1 FROM records_fts WHERE records_fts MATCH ? LIMIT 1", (q,)).fetchall()
+            self._c().execute("SELECT 1 FROM records_fts WHERE records_fts MATCH ? LIMIT 1", (q,)).fetchall()
         except sqlite3.OperationalError as exc:
             raise ValueError(f"Invalid search query: {exc}") from None
 
@@ -890,6 +1199,90 @@ class LogStorage:
             else:
                 self._phrase_search_clauses(str(q), clauses, args)
         return " AND ".join(clauses), args
+
+    # -- counts from the rollup ------------------------------------------------------
+
+    @staticmethod
+    def _rollup_filters(params: dict[str, Any], *, skip_field: str | None = None) -> tuple[str, list[Any]]:
+        """_build_filters' field filters on counts_hourly columns (no time, no search)."""
+        clauses = ["1 = 1"]
+        args: list[Any] = []
+        for field, exclude_key in FILTER_FIELDS:
+            column = _ROLLUP_COLUMN[field]
+            value = params.get(field)
+            if value and field != skip_field:
+                clauses.append(f"{column} = ?")
+                args.append(value)
+            excluded = params.get(exclude_key)
+            if excluded:
+                clauses.append(f"{column} NOT IN (SELECT value FROM json_each(?))")
+                args.append(json.dumps(list(excluded)))
+        return " AND ".join(clauses), args
+
+    @staticmethod
+    def _split_hours(params: dict[str, Any]) -> tuple[int | None, int | None, list[dict[str, Any]]] | None:
+        """A filter's time range as whole hours [h1, h2) (None: unbounded)
+        plus the partial hours at its edges as params for raw queries. None
+        when the range holds no whole hour."""
+        start = _param_epoch(params.get("start"))
+        end = _param_epoch(params.get("end"))        # inclusive
+        before = _param_epoch(params.get("before"))  # exclusive
+        uppers = [u for u in (end, before) if u is not None]
+        h1 = None if start is None else math.ceil(start / ROLLUP_SECS) * ROLLUP_SECS
+        h2 = None if not uppers else math.floor(min(uppers) / ROLLUP_SECS) * ROLLUP_SECS
+        if h1 is not None and h2 is not None and h1 >= h2:
+            return None
+        edges = []
+        base = {k: v for k, v in params.items() if k not in ("start", "end", "before")}
+        if start is not None and start < h1:
+            edges.append({**base, "start": start, "before": h1})
+        if h2 is not None and (before is None or h2 < before) and (end is None or h2 <= end):
+            edges.append({**base, "start": h2, **({"end": end} if end is not None else {}),
+                          **({"before": before} if before is not None else {})})
+        return h1, h2, edges
+
+    def _grouped_counts(self, params: dict[str, Any], keys: list[str], *, skip_field: str | None = None,
+                        bucket: tuple[int, int] | None = None) -> list[tuple] | None:
+        """Rows (bucket?, *keys, entry count) equal to grouping the filtered
+        records by those keys (and by bucket = (origin, size): the time
+        bucket index), with whole hours read from counts_hourly. None when
+        the rollup cannot serve these params (the caller runs its raw query).
+        Keys are filter field names; size must be a multiple of an hour."""
+        if not self.rollup_usable(params) or (bucket and bucket[1] % ROLLUP_SECS):
+            return None
+        split = self._split_hours(params)
+        if split is None:
+            return None
+        h1, h2, edges = split
+        names = [f"k{i}" for i in range(len(keys) + (1 if bucket else 0))]
+        parts: list[str] = []
+        args: list[Any] = []
+        bucket_args = list(bucket) if bucket else []
+        roll_cols = (["CAST((hour_epoch - ?) / ? AS INTEGER)"] if bucket else []) + [_ROLLUP_COLUMN[k] for k in keys]
+        where, where_args = self._rollup_filters(params, skip_field=skip_field)
+        if h1 is not None:
+            where += " AND hour_epoch >= ?"
+            where_args.append(h1)
+        if h2 is not None:
+            where += " AND hour_epoch < ?"
+            where_args.append(h2)
+        select = ", ".join(f"{c} AS {n}" for c, n in zip(roll_cols, names, strict=True))
+        parts.append(f"SELECT {select}, SUM(n) AS c FROM counts_hourly WHERE {where} GROUP BY {', '.join(names)}"
+                     if names else f"SELECT SUM(n) AS c FROM counts_hourly WHERE {where}")
+        args += bucket_args + where_args
+        raw_cols = (["CAST((ts_epoch - ?) / ? AS INTEGER)"] if bucket else []) + list(keys)
+        for edge in edges:
+            edge_where, edge_args = self._build_filters(edge, skip_field=skip_field)
+            select = ", ".join(f"{c} AS {n}" for c, n in zip(raw_cols, names, strict=True))
+            parts.append(f"SELECT {select}, COUNT(*) AS c FROM records WHERE {edge_where} GROUP BY {', '.join(names)}"
+                         if names else f"SELECT COUNT(*) AS c FROM records WHERE {edge_where}")
+            args += bucket_args + edge_args
+        union = " UNION ALL ".join(parts)
+        if not names:
+            return [(int(self._c().execute(f"SELECT COALESCE(SUM(c), 0) FROM ({union})", args).fetchone()[0]),)]
+        cols = ", ".join(names)
+        return [tuple(row) for row in self._c().execute(
+            f"SELECT {cols}, SUM(c) FROM ({union}) GROUP BY {cols} HAVING SUM(c) > 0", args)]
 
     _LIKE_SQL = "(LOWER(message) LIKE ? ESCAPE '\\' OR LOWER(raw_line) LIKE ? ESCAPE '\\')"
     _MATCH_SQL = "id {op} (SELECT rowid FROM records_fts WHERE records_fts MATCH ?)"
@@ -928,7 +1321,7 @@ class LogStorage:
                     clauses.append(negate + self._LIKE_SQL)
                     args.extend([_like_pattern(token)] * 2)
 
-    @_locked
+    @_reading
     def query_logs(self, params: dict[str, Any], *, limit: int, cursor: tuple[float, int] | None = None,
                    direction: str = "desc") -> dict[str, Any]:
         where_sql, args = self._build_filters(params)
@@ -940,7 +1333,7 @@ class LogStorage:
                 where_sql += " AND (ts_epoch > ? OR (ts_epoch = ? AND id > ?))"
             args.extend([epoch, epoch, record_id])
         order = "DESC" if direction == "desc" else "ASC"
-        rows = self._conn.execute(
+        rows = self._c().execute(
             f"""
             SELECT {_RECORD_COLUMNS}
             FROM records
@@ -961,9 +1354,9 @@ class LogStorage:
         return {"items": items, "next_cursor": next_cursor, "has_more": has_more, "max_id": self._max_id()}
 
     def _max_id(self) -> int:
-        return int(self._conn.execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0])
+        return int(self._c().execute("SELECT COALESCE(MAX(id), 0) FROM records").fetchone()[0])
 
-    @_locked
+    @_reading
     def query_tail(self, params: dict[str, Any], *, after_id: int | None, limit: int) -> dict[str, Any]:
         """Records ingested after `after_id` (row ids grow in ingest order), so
         objects that land late with older event timestamps still reach a live
@@ -979,7 +1372,7 @@ class LogStorage:
             # instead of waiting for ids to catch up with its old position.
             return {"items": [], "last_id": upper, "truncated": False, "reset": True}
         where_sql, args = self._build_filters(params)
-        rows = self._conn.execute(
+        rows = self._c().execute(
             f"""
             SELECT {_RECORD_COLUMNS}
             FROM records
@@ -1005,7 +1398,7 @@ class LogStorage:
     }
     _ALERT_GROUPS = {"none": "''", "namespace": "namespace", "pod": "pod"}
 
-    @_locked
+    @_reading
     def alert_metric(self, params: dict[str, Any], *, metric: str, group_by: str = "none", max_groups: int = 20,
                      lowest_first: bool = False, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[str, Any]:
         """One alert evaluation: the metric over the filtered entries (params
@@ -1018,14 +1411,16 @@ class LogStorage:
         order = "ASC" if lowest_first else "DESC"
         try:
             with self._time_limit(timeout_secs):
-                rows = self._conn.execute(
-                    f"""
-                    SELECT g, value, COUNT(*) OVER () FROM (
-                        SELECT {group} AS g, {expr} AS value FROM records WHERE {where_sql} GROUP BY g
-                    ) ORDER BY value {order}, g LIMIT ?
-                    """,
-                    (*args, max(1, int(max_groups))),
-                ).fetchall()
+                rows = self._alert_metric_rollup(params, metric, group_by, max_groups, lowest_first)
+                if rows is None:
+                    rows = self._c().execute(
+                        f"""
+                        SELECT g, value, COUNT(*) OVER () FROM (
+                            SELECT {group} AS g, {expr} AS value FROM records WHERE {where_sql} GROUP BY g
+                        ) ORDER BY value {order}, g LIMIT ?
+                        """,
+                        (*args, max(1, int(max_groups))),
+                    ).fetchall()
         except sqlite3.OperationalError as exc:
             if "interrupted" in str(exc):
                 raise TimeoutError("alert query timed out") from None
@@ -1036,7 +1431,29 @@ class LogStorage:
             groups = {"": 0.0}
         return {"groups": groups, "overflow": max(0, total - len(rows))}
 
-    @_locked
+    def _alert_metric_rollup(self, params: dict[str, Any], metric: str, group_by: str, max_groups: int,
+                             lowest_first: bool) -> list[tuple] | None:
+        """alert_metric's rows (group, value, groups in total) from the rollup
+        when the window holds whole hours, else None."""
+        keys = ([group_by] if group_by != "none" else []) + (["severity_bucket"] if metric == "error_count" else []) \
+            + (["pod"] if metric == "distinct_pods" else [])
+        grouped = self._grouped_counts(params, keys)
+        if grouped is None:
+            return None
+        values: dict[str, float] = {}
+        for row in grouped:
+            g = str(row[0]) if group_by != "none" else ""
+            n = int(row[-1])
+            if metric == "count" or not keys:
+                values[g] = values.get(g, 0) + n
+            elif metric == "error_count":
+                values[g] = values.get(g, 0) + (n if row[-2] == "error" else 0)
+            else:  # distinct_pods: one row per (group, pod) present
+                values[g] = values.get(g, 0) + 1
+        ordered = sorted(values.items(), key=lambda kv: (kv[1] if lowest_first else -kv[1], kv[0]))
+        return [(g, v, len(values)) for g, v in ordered[:max(1, int(max_groups))]]
+
+    @_reading
     def metric_series(self, params: dict[str, Any], *, start_epoch: int, end_epoch: int, bucket_secs: int,
                       pods: bool = False, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[int, Any]:
         """Histogram buckets for a backtest: {bucket index: (total, errors)}
@@ -1044,12 +1461,24 @@ class LogStorage:
         Same bucketing as query_histogram (epoch seconds, aligned to
         start_epoch). TimeoutError past timeout_secs."""
         base = {key: value for key, value in params.items() if key not in ("start", "end", "before")}
+        if start_epoch % ROLLUP_SECS == 0:  # whole-hour buckets: from the rollup
+            grouped = self._grouped_counts({**base, "start": start_epoch, "before": end_epoch},
+                                           ["pod" if pods else "severity_bucket"], bucket=(start_epoch, bucket_secs))
+            if grouped is not None:
+                series: dict[int, Any] = {}
+                for index, key, n in grouped:
+                    if pods:
+                        series.setdefault(int(index), set()).add(str(key))
+                    else:
+                        total, errors = series.get(int(index), (0, 0))
+                        series[int(index)] = (total + int(n), errors + (int(n) if key == "error" else 0))
+                return series
         where_sql, args = self._build_filters(base)
         select = "bucket, pod" if pods else "bucket, COUNT(*), COALESCE(SUM(severity_bucket = 'error'), 0)"
         group = "bucket, pod" if pods else "bucket"
         try:
             with self._time_limit(timeout_secs):
-                rows = self._conn.execute(
+                rows = self._c().execute(
                     f"""
                     SELECT {select} FROM (
                         SELECT CAST((ts_epoch - ?) / ? AS INTEGER) AS bucket, severity_bucket, pod FROM records
@@ -1086,29 +1515,29 @@ class LogStorage:
             return {}
         return value if isinstance(value, dict) else {}
 
-    @_locked
+    @_reading
     def prefix_progress(self) -> dict[str, dict[str, Any]]:
         """Per prefix: last listed key (cursor), latest complete listing, and
         the oldest object still failing (key, last_modified)."""
         out: dict[str, dict[str, Any]] = {}
         for prefix, at in self._prefix_listed().items():
             out.setdefault(prefix, {})["listed_ok_at"] = at
-        for row in self._conn.execute("SELECT prefix, last_key FROM prefix_state"):
+        for row in self._c().execute("SELECT prefix, last_key FROM prefix_state"):
             out.setdefault(str(row[0]), {})["cursor"] = str(row[1])
-        for row in self._conn.execute(
+        for row in self._c().execute(
             "SELECT prefix, MIN(key), MIN(last_modified) FROM object_failures GROUP BY prefix"
         ):
             out.setdefault(str(row[0]), {})["failing"] = {"key": str(row[1]), "last_modified": str(row[2])}
         return out
 
-    @_locked
+    @_reading
     def top_values(self, field: str, *, limit: int = FACET_VALUES_MAX, start: str | None = None) -> list[str]:
         """The most frequent non-empty values of one filter field, optionally
         only from entries at or after `start`."""
         if field not in dict(FILTER_FIELDS):
             raise ValueError(f"Unknown filter field {field!r}")
         where_sql, args = self._build_filters({"start": start} if start else {})
-        rows = self._conn.execute(
+        rows = self._c().execute(
             f"""
             SELECT {field} AS value, COUNT(*) AS count
             FROM records
@@ -1121,13 +1550,13 @@ class LogStorage:
         ).fetchall()
         return [str(row[0]) for row in rows]
 
-    @_locked
+    @_reading
     def query_facets(self, params: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
         where_sql, args = self._build_filters(params)
         fields = ["scope", "namespace", "pod", "container", "severity_bucket"]
         out: dict[str, list[dict[str, Any]]] = {}
         for field in fields:
-            rows = self._conn.execute(
+            rows = self._c().execute(
                 f"""
                 SELECT {field} AS value, COUNT(*) AS count
                 FROM records
@@ -1146,13 +1575,13 @@ class LogStorage:
         """Interrupt the queries run inside after timeout_secs; an interrupted
         query raises sqlite3.OperationalError ("interrupted")."""
         deadline = time.monotonic() + timeout_secs
-        self._conn.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, _PROGRESS_OPS)
+        self._c().set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, _PROGRESS_OPS)
         try:
             yield
         finally:
-            self._conn.set_progress_handler(None, 0)
+            self._c().set_progress_handler(None, 0)
 
-    @_locked
+    @_reading
     def query_fields(self, params: dict[str, Any], *, timeout_secs: float = FIELD_QUERY_TIMEOUT_SECS) -> dict[str, Any]:
         """Top values of each filter field under the current filters. A field's
         own equality filter is left out of its query, so its other values stay
@@ -1160,22 +1589,45 @@ class LogStorage:
         timeout_secs; a field that runs out reports partial with no values."""
         fields: dict[str, Any] = {}
         any_partial = False
-        for field, exclude_key in FILTER_FIELDS:
+        names = [field for field, _ in FILTER_FIELDS]
+        # From the rollup: one grouping by every field (equality filters left
+        # out, exclusions kept), then each field's counts under the other
+        # fields' equality filters, instead of one scan per field.
+        combos = None
+        if self.rollup_usable(params):
+            try:
+                with self._time_limit(timeout_secs * len(names)):
+                    combos = self._grouped_counts({k: v for k, v in params.items() if k not in names}, names)
+            except sqlite3.OperationalError as exc:
+                if "interrupted" not in str(exc):
+                    raise
+                combos = None
+        for position, (field, exclude_key) in enumerate(FILTER_FIELDS):
             where_sql, args = self._build_filters(params, skip_field=field)
             try:
                 with self._time_limit(timeout_secs):
-                    rows = self._conn.execute(
-                        f"""
-                        SELECT {field} AS value, COUNT(*) AS count,
-                               SUM(COUNT(*)) OVER () AS total, COUNT(*) OVER () AS distinct_count
-                        FROM records
-                        WHERE {where_sql}
-                        GROUP BY {field}
-                        ORDER BY count DESC, value ASC
-                        LIMIT ?
-                        """,
-                        (*args, FIELD_TOP_VALUES),
-                    ).fetchall()
+                    if combos is not None:  # whole hours from the rollup
+                        wanted = [(i, params[f]) for i, f in enumerate(names) if f != field and params.get(f)]
+                        counts: dict[str, int] = {}
+                        for row in combos:
+                            if all(row[i] == value for i, value in wanted):
+                                counts[row[position]] = counts.get(row[position], 0) + int(row[-1])
+                        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+                        total = sum(counts.values())
+                        rows = [(v, n, total, len(counts)) for v, n in ordered[:FIELD_TOP_VALUES]]
+                    else:
+                        rows = self._c().execute(
+                            f"""
+                            SELECT {field} AS value, COUNT(*) AS count,
+                                   SUM(COUNT(*)) OVER () AS total, COUNT(*) OVER () AS distinct_count
+                            FROM records
+                            WHERE {where_sql}
+                            GROUP BY {field}
+                            ORDER BY count DESC, value ASC
+                            LIMIT ?
+                            """,
+                            (*args, FIELD_TOP_VALUES),
+                        ).fetchall()
             except sqlite3.OperationalError as exc:
                 if "interrupted" not in str(exc):
                     raise
@@ -1193,14 +1645,21 @@ class LogStorage:
             }
         return {"fields": fields, "partial": any_partial}
 
-    @_locked
-    def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None) -> dict[str, Any]:
+    @_reading
+    def query_histogram(self, params: dict[str, Any], *, now: datetime | None = None,
+                        target_buckets: int | None = None, tz_offset_min: int | None = None) -> dict[str, Any]:
         """Entry counts per time bucket (total and per severity) over the
         filtered range, every bucket present. Buckets are aligned to the
         bucket size in UTC epoch seconds (ts_epoch), so offsets and
         fractional seconds land in the right bucket. Without a start the
         range begins at the oldest matching entry; without an end it stops
-        at now."""
+        at now.
+
+        target_buckets picks the bucket size from HISTOGRAM_FINE_BUCKET_SECS
+        (at most that many buckets) instead of the default sizes, and
+        tz_offset_min (minutes east of UTC) aligns buckets to that local
+        time instead of UTC. Both are optional; without them the result is
+        unchanged."""
         end_bound = _param_epoch(params.get("before"))
         if end_bound is None and params.get("end"):
             end_bound = _param_epoch(params.get("end")) + 1
@@ -1214,32 +1673,49 @@ class LogStorage:
         if start_bound is not None:
             start_epoch = math.floor(start_bound)
         else:
-            row = self._conn.execute(f"SELECT MIN(ts_epoch) FROM records WHERE {where_sql}", args).fetchone()
+            row = self._c().execute(f"SELECT MIN(ts_epoch) FROM records WHERE {where_sql}", args).fetchone()
             if row[0] is None:
                 return {"bucket_secs": HISTOGRAM_BUCKET_SECS[0], "buckets": [], "truncated": False}
             start_epoch = math.floor(row[0])
         span = max(1, end_epoch - start_epoch)
-        bucket_secs = next(
-            (size for size in HISTOGRAM_BUCKET_SECS if span / size <= HISTOGRAM_TARGET_BUCKETS),
-            HISTOGRAM_BUCKET_SECS[-1],
+        sizes, target = (
+            (HISTOGRAM_FINE_BUCKET_SECS, target_buckets) if target_buckets
+            else (HISTOGRAM_BUCKET_SECS, HISTOGRAM_TARGET_BUCKETS)
         )
-        origin = start_epoch - start_epoch % bucket_secs
+        bucket_secs = next((size for size in sizes if span / size <= target), sizes[-1])
+        shift = (tz_offset_min or 0) * 60
+        origin = start_epoch - (start_epoch + shift) % bucket_secs
         count = max(1, -(-(end_epoch - origin) // bucket_secs))
         truncated = count > HISTOGRAM_MAX_BUCKETS
         if truncated:  # keep the newest buckets
             origin += (count - HISTOGRAM_MAX_BUCKETS) * bucket_secs
             count = HISTOGRAM_MAX_BUCKETS
-        severity_sql = ", ".join(f"SUM(severity_bucket = '{sev}')" for sev in _HISTOGRAM_SEVERITIES)
-        rows = self._conn.execute(
-            f"""
-            SELECT CAST((ts_epoch - ?) / ? AS INTEGER) AS bucket, COUNT(*), {severity_sql}
-            FROM records
-            WHERE {where_sql} AND ts_epoch >= ? AND ts_epoch < ?
-            GROUP BY bucket
-            """,
-            (origin, bucket_secs, *args, max(origin, start_epoch), min(origin + count * bucket_secs, end_epoch)),
-        ).fetchall()
-        by_bucket = {int(row[0]): row for row in rows}
+        lo, hi = max(origin, start_epoch), min(origin + count * bucket_secs, end_epoch)
+        filters = {key: value for key, value in params.items() if key not in ("start", "end", "before")}
+        # The rollup has whole UTC hours: usable only when buckets start on one
+        # (a half-hour time zone offset moves them off it).
+        grouped = None if origin % ROLLUP_SECS else self._grouped_counts(
+            {**filters, "start": lo, "before": hi}, ["severity_bucket"], bucket=(origin, bucket_secs))
+        if grouped is not None:  # buckets of whole hours: from the rollup
+            pivot: dict[int, list[int]] = {}
+            for index, severity, n in grouped:
+                row = pivot.setdefault(int(index), [index, 0] + [0] * len(_HISTOGRAM_SEVERITIES))
+                row[1] += int(n)
+                if severity in _HISTOGRAM_SEVERITIES:
+                    row[2 + _HISTOGRAM_SEVERITIES.index(severity)] += int(n)
+            by_bucket = pivot
+        else:
+            severity_sql = ", ".join(f"SUM(severity_bucket = '{sev}')" for sev in _HISTOGRAM_SEVERITIES)
+            rows = self._c().execute(
+                f"""
+                SELECT CAST((ts_epoch - ?) / ? AS INTEGER) AS bucket, COUNT(*), {severity_sql}
+                FROM records
+                WHERE {where_sql} AND ts_epoch >= ? AND ts_epoch < ?
+                GROUP BY bucket
+                """,
+                (origin, bucket_secs, *args, lo, hi),
+            ).fetchall()
+            by_bucket = {int(row[0]): row for row in rows}
         buckets = []
         for index in range(count):
             row = by_bucket.get(index)
@@ -1252,12 +1728,71 @@ class LogStorage:
             buckets.append(entry)
         return {"bucket_secs": bucket_secs, "buckets": buckets, "truncated": truncated}
 
-    @_locked
+    def _dashboard_rollup(self, params: dict[str, Any], error_params: dict[str, Any],
+                          top_errors: Any) -> dict[str, Any] | None:
+        """query_dashboard from the rollup (whole hours) and raw edge rows;
+        None when the rollup cannot serve these params. top_errors() runs
+        only when the rollup is used (it needs messages: raw rows)."""
+        groups = self._grouped_counts(params, ["scope", "namespace", "pod", "severity_bucket"])
+        if groups is None:
+            return None
+        hourly = self._grouped_counts(params, ["severity_bucket"], bucket=(0, ROLLUP_SECS)) or []
+        timeline = [(index, n) for index, _sev, n in hourly]
+        if params.get("severity_bucket") in (None, "", "error"):
+            # The error view is the same rows restricted to error: no second scan.
+            errors = [(r[1], r[2], r[4]) for r in groups if r[3] == "error"]
+            error_timeline = [(index, n) for index, sev, n in hourly if sev == "error"]
+        else:
+            errors = self._grouped_counts(error_params, ["namespace", "pod"]) or []
+            error_timeline = self._grouped_counts(error_params, [], bucket=(0, ROLLUP_SECS)) or []
+
+        def top(counter: dict[str, int], limit: int | None = DASHBOARD_LIST_MAX) -> list[dict[str, Any]]:
+            ordered = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+            return [{"value": k, "count": v} for k, v in (ordered[:limit] if limit else ordered)]
+
+        def tally(rows: list[tuple], index: int) -> dict[str, int]:
+            out: dict[str, int] = {}
+            for row in rows:
+                out[row[index]] = out.get(row[index], 0) + int(row[-1])
+            return out
+
+        severity = tally(groups, 3)
+        total = sum(severity.values())
+        security = sum(int(r[-1]) for r in groups if r[0] == "security")
+        timeline_map: dict[str, dict[str, Any]] = {}
+        for rows, key in ((timeline, "total_logs"), (error_timeline, "error_logs")):
+            for index, n in rows:
+                bucket = datetime.fromtimestamp(int(index) * ROLLUP_SECS, timezone.utc).strftime("%Y-%m-%dT%H:00:00Z")
+                entry = timeline_map.setdefault(bucket, {"timestamp": bucket, "total_logs": 0, "error_logs": 0})
+                entry[key] += int(n)
+        return {
+            "summary": {
+                "total_logs": total,
+                **{f"{sev}_count": severity.get(sev, 0) for sev in ("error", "warning", "info", "debug", "metrics")},
+                "security_count": security,
+                "unique_namespaces": len(tally(groups, 1)),
+                "unique_pods": len(tally(groups, 2)),
+            },
+            "severity": top(severity, None),
+            "namespaces": top(tally(groups, 1)),
+            "error_namespaces": top(tally(errors, 0)),
+            "error_pods": top(tally(errors, 1)),
+            "top_errors": [{"value": row[0], "count": int(row[1] or 0)} for row in top_errors()],
+            "timeline": [timeline_map[key] for key in sorted(timeline_map)],
+        }
+
+    @_reading
     def query_dashboard(self, params: dict[str, Any]) -> dict[str, Any]:
         where_sql, args = self._build_filters(params)
-        error_where_sql, error_args = self._build_filters({**params, "severity_bucket": "error"})
+        error_params = {**params, "severity_bucket": "error"}
+        error_where_sql, error_args = self._build_filters(error_params)
+        if self.rollup_usable(params):
+            from_rollup = self._dashboard_rollup(params, error_params,
+                                                 lambda: self._top_errors(error_where_sql, error_args))
+            if from_rollup is not None:
+                return from_rollup
 
-        summary_row = self._conn.execute(
+        summary_row = self._c().execute(
             f"""
             SELECT
                 COUNT(*) AS total_logs,
@@ -1275,7 +1810,7 @@ class LogStorage:
             args,
         ).fetchone()
 
-        severity_rows = self._conn.execute(
+        severity_rows = self._c().execute(
             f"""
             SELECT severity_bucket AS value, COUNT(*) AS count
             FROM records
@@ -1286,7 +1821,7 @@ class LogStorage:
             args,
         ).fetchall()
 
-        namespace_rows = self._conn.execute(
+        namespace_rows = self._c().execute(
             f"""
             SELECT namespace AS value, COUNT(*) AS count
             FROM records
@@ -1298,7 +1833,7 @@ class LogStorage:
             (*args, DASHBOARD_LIST_MAX),
         ).fetchall()
 
-        error_namespace_rows = self._conn.execute(
+        error_namespace_rows = self._c().execute(
             f"""
             SELECT namespace AS value, COUNT(*) AS count
             FROM records
@@ -1310,7 +1845,7 @@ class LogStorage:
             (*error_args, DASHBOARD_LIST_MAX),
         ).fetchall()
 
-        error_pod_rows = self._conn.execute(
+        error_pod_rows = self._c().execute(
             f"""
             SELECT pod AS value, COUNT(*) AS count
             FROM records
@@ -1322,19 +1857,9 @@ class LogStorage:
             (*error_args, DASHBOARD_LIST_MAX),
         ).fetchall()
 
-        top_error_rows = self._conn.execute(
-            f"""
-            SELECT message AS value, COUNT(*) AS count
-            FROM records
-            WHERE {error_where_sql}
-            GROUP BY message
-            ORDER BY count DESC, value ASC
-            LIMIT 10
-            """,
-            error_args,
-        ).fetchall()
+        top_error_rows = self._top_errors(error_where_sql, error_args)
 
-        timeline_total_rows = self._conn.execute(
+        timeline_total_rows = self._c().execute(
             f"""
             SELECT strftime('%Y-%m-%dT%H:00:00Z', CAST(ts_epoch AS INTEGER), 'unixepoch') AS bucket,
                    COUNT(*) AS total_count
@@ -1346,7 +1871,7 @@ class LogStorage:
             args,
         ).fetchall()
 
-        timeline_error_rows = self._conn.execute(
+        timeline_error_rows = self._c().execute(
             f"""
             SELECT strftime('%Y-%m-%dT%H:00:00Z', CAST(ts_epoch AS INTEGER), 'unixepoch') AS bucket,
                    COUNT(*) AS error_count
@@ -1391,6 +1916,19 @@ class LogStorage:
             "timeline": [timeline_map[key] for key in sorted(timeline_map)],
         }
 
+    def _top_errors(self, where_sql: str, args: list[Any]) -> list[Any]:
+        return self._c().execute(
+            f"""
+            SELECT message AS value, COUNT(*) AS count
+            FROM records
+            WHERE {where_sql}
+            GROUP BY message
+            ORDER BY count DESC, value ASC
+            LIMIT 10
+            """,
+            args,
+        ).fetchall()
+
     def prune_records_before(self, cutoff: str | float, *, batch: int = PRUNE_BATCH) -> int:
         """Delete cached records (and their FTS rows) whose event time is
         before cutoff (epoch seconds or an ISO time), in batches that each
@@ -1421,6 +1959,7 @@ class LogStorage:
         if not ids:
             return 0
         ids_json = json.dumps(ids)
+        self._rollup_apply(self._rollup_deltas("id IN (SELECT value FROM json_each(?))", [ids_json], -1))
         if self.fts_enabled:
             self._fts_delete_ids(ids_json)
         self._conn.execute("DELETE FROM records WHERE id IN (SELECT value FROM json_each(?))", (ids_json,))
@@ -1438,7 +1977,7 @@ class LogStorage:
         if release:
             self._release_free_pages()
 
-    @_locked
+    @_reading
     def query_context(
         self,
         record_id: int,
@@ -1457,7 +1996,7 @@ class LogStorage:
         Severity and search filters are deliberately not applied: context
         shows what the workload logged around the selected entry.
         Returns None when the record does not exist."""
-        anchor_row = self._conn.execute(
+        anchor_row = self._c().execute(
             f"SELECT {_RECORD_COLUMNS} FROM records WHERE id = ?", (record_id,)
         ).fetchone()
         if anchor_row is None:
@@ -1494,7 +2033,7 @@ class LogStorage:
         if lower is not None:
             earlier_sql += " AND ts_epoch >= ?"
             earlier_args.append(lower)
-        earlier = self._conn.execute(
+        earlier = self._c().execute(
             earlier_sql + " ORDER BY ts_epoch DESC, id DESC LIMIT ?", (*earlier_args, lines_before + 1)
         ).fetchall() if lines_before else []
 
@@ -1504,7 +2043,7 @@ class LogStorage:
         if upper is not None:
             later_sql += " AND ts_epoch < ?"
             later_args.append(upper)
-        later = self._conn.execute(
+        later = self._c().execute(
             later_sql + " ORDER BY ts_epoch ASC, id ASC LIMIT ?", (*later_args, lines_after + 1)
         ).fetchall() if lines_after else []
 
@@ -1530,11 +2069,11 @@ class LogStorage:
             "lines_after": lines_after,
         }
 
-    @_locked
+    @_reading
     def get_record_by_id(self, record_id: int) -> dict[str, Any] | None:
         """Fetch a single record by its row id, for per-line explain.
         Re-derives from storage rather than trusting client-supplied text."""
-        row = self._conn.execute(
+        row = self._c().execute(
             """
             SELECT id, timestamp, severity_bucket, scope, namespace, pod, container,
                    message, raw_line, source_key, source_etag, line_number, is_falco
@@ -1565,20 +2104,25 @@ class LogStorage:
         finally:
             self._lock.release()
 
-    @_locked
+    @_reading
     def get_state(self, name: str) -> str | None:
         """One app_state value without get_status()'s full-table counts."""
         return self._get_state(name)
 
-    @_locked
+    @_reading
+    def object_counts(self, root: str) -> tuple[int, int]:
+        """(objects ingested under <root>security/, all other objects)."""
+        return count_objects_under(self._c(), root + "security/")
+
+    @_reading
     def get_status(self) -> dict[str, Any]:
         last_polled_at = self._get_state("last_polled_at")
         last_successful_ingest_at = self._get_state("last_successful_ingest_at")
         last_object_last_modified = self._get_state("last_object_last_modified")
         last_error = self._get_state("last_error")
-        total_records = int(self._conn.execute("SELECT COUNT(*) FROM records").fetchone()[0])
-        total_objects = int(self._conn.execute("SELECT COUNT(*) FROM ingested_objects").fetchone()[0])
-        latest = self._conn.execute(
+        total_records = int(self._c().execute("SELECT COUNT(*) FROM records").fetchone()[0])
+        total_objects = int(self._c().execute("SELECT COUNT(*) FROM ingested_objects").fetchone()[0])
+        latest = self._c().execute(
             "SELECT timestamp FROM records WHERE ts_epoch IS NOT NULL ORDER BY ts_epoch DESC LIMIT 1").fetchone()
         latest_record_timestamp = latest[0] if latest else None
         return {
@@ -1609,9 +2153,9 @@ class LogStorage:
     def _storage_status(self) -> dict[str, Any]:
         """Database size, free disk space and index-migration progress. Paths
         and sizes only; never row contents."""
-        page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
-        pages = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
-        free_pages = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+        page_size = int(self._c().execute("PRAGMA page_size").fetchone()[0])
+        pages = int(self._c().execute("PRAGMA page_count").fetchone()[0])
+        free_pages = int(self._c().execute("PRAGMA freelist_count").fetchone()[0])
         try:
             wal_bytes = os.path.getsize(f"{self.db_path}-wal")
         except OSError:
@@ -1635,10 +2179,13 @@ class LogStorage:
             )
         if self.fts_layout == "migrating":
             done, upper = self._fts_migration_bounds()
-            remaining = int(self._conn.execute(
+            remaining = int(self._c().execute(
                 "SELECT COUNT(*) FROM records WHERE id > ? AND id <= ?", (done, upper)
             ).fetchone()[0])
             out["fts_migration"] = {"rows_remaining": remaining, "last_error": self.fts_migration_error}
+        if not self.rollup_ready:
+            done, upper = self._rollup_bounds()
+            out["rollup_rebuild"] = {"ids_remaining": max(0, upper - done), "last_error": self.rollup_error}
         if self.ts_backfill_pending:
             # Until done, these rows are left out of time-filtered queries.
             out["ts_backfill"] = {"rows_remaining": self.ts_backfill_remaining(), "last_error": self.ts_backfill_error}

@@ -338,7 +338,7 @@ def test_disabled_features_answer_403(tmp_path, served, monkeypatch):
     server = served(app)
     flags = _request(server, "GET", "/api/status")[1]["ai_features"]
     assert flags == {"explain_line": True, "explain_filtered": True, "anomaly_auto_summary": False,
-                     "anomaly_manual_summary": True, "nl_filters": True}
+                     "anomaly_manual_summary": True, "nl_filters": True, "auto_triage": True}
     _put(server, {"flags": {"explain_line": False, "explain_filtered": False, "anomaly_manual_summary": False}})
     status, payload = _request(server, "POST", "/api/explain-line", body=json.dumps({"id": _ids(app)[0]}),
                                headers=JSON)

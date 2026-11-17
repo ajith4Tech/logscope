@@ -1,0 +1,657 @@
+# Web-attack signatures, loaded after signatures.yaml (see signatures.py).
+#
+# These match the HTTP access-log line that Logscope stores as the message
+# (Traefik/nginx/Apache: '<ip> - - [ts] "<method> <path> <proto>" <status>
+# <size> "<ref>" "<ua>"'), i.e. the parsed method/path/status/user-agent as
+# text. They answer "what kind of web attack is this traffic shaped like"
+# without an AI call; volume/severity still comes from the anomaly detectors.
+#
+# Each rule adds `confidence` (low|medium|high) and `attack_type` (a tag for
+# later web->runtime correlation). Steps are read-only "investigate" steps and
+# go through the same validator as the operational signatures. Rules are tried
+# in order after the operational ones; put the specific ones first.
+#
+# Deliberately conservative to avoid false positives on normal traffic: path
+# probes anchor to the quoted request line, the brute-force shape keys on the
+# failed-login status, and the markers (SQLi/XSS/traversal/Log4Shell) are
+# distinctive strings a normal request would not carry.
+
+rules:
+  # ── WordPress: specific CVE / enumeration shapes ─────────────────────────────
+  - id: wp-rest-content-injection
+    match:
+      message: '"(?:POST|PUT)\s+[^"]*(?:/wp-json/wp/v2/posts/\d+|rest_route=/wp/v2/posts/\d+)[^"]*[?&]id=\d'
+    severity: warning
+    confidence: high
+    attack_type: content-injection
+    title: WordPress REST API content injection (CVE-2017-1001000 shape)
+    explanation: >-
+      An unauthenticated POST/PUT to the REST posts endpoint with a type-juggling `id`
+      parameter (e.g. id=1abc) is the shape of CVE-2017-1001000, the WordPress 4.7.0/4.7.1
+      content-injection flaw that lets anyone edit a post. Check whether the target posts
+      were modified and which client sent it.
+    steps:
+      - title: Review the access log for this request and source
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the client IP, the exact REST request and whether it was repeated.
+        risk: read-only
+  - id: wp-author-enumeration
+    match:
+      message: '"GET\s+[^"]*[?&]author=\d'
+    severity: warning
+    confidence: medium
+    attack_type: enumeration
+    title: WordPress author/user enumeration (?author=N)
+    explanation: >-
+      Requests to ?author=<N> redirect to /author/<login>, leaking valid usernames. A sweep
+      over many author ids is reconnaissance before a brute-force attempt.
+    steps:
+      - title: Review the access log for the id sweep and source IPs
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A range of author ids from one client is enumeration, not normal browsing.
+        risk: read-only
+  - id: wp-rest-user-enumeration
+    match:
+      message: '"GET\s+[^"]*(?:/wp-json/wp/v2/users|rest_route=/wp/v2/users)'
+    severity: warning
+    confidence: medium
+    attack_type: enumeration
+    title: WordPress REST user enumeration (/wp-json/wp/v2/users)
+    explanation: >-
+      The REST users endpoint returns account slugs/names to anonymous callers on older or
+      misconfigured sites, used to harvest usernames for brute force.
+    steps:
+      - title: Check who called the users endpoint
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the client IP and whether the response leaked user data.
+        risk: read-only
+  - id: wp-login-bruteforce
+    match:
+      message: '"POST\s+[^"]*/wp-login\.php[^"]*"\s+200\b'
+    severity: warning
+    confidence: medium
+    attack_type: brute-force
+    title: WordPress login brute force (repeated failed POST /wp-login.php)
+    explanation: >-
+      WordPress returns HTTP 200 and re-renders the form on a failed login; a flood of
+      200-status POSTs to wp-login.php is credential brute forcing. A successful login
+      redirects (302) instead, so this does not match a normal sign-in.
+    steps:
+      - title: Review failed logins and their source IPs
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Many failed POSTs from one or few IPs confirm brute force.
+        risk: read-only
+  - id: wp-xmlrpc-abuse
+    match:
+      message: '"POST\s+[^"]*/xmlrpc\.php'
+    severity: warning
+    confidence: medium
+    attack_type: xmlrpc-abuse
+    title: WordPress XML-RPC abuse (xmlrpc.php)
+    explanation: >-
+      POSTs to xmlrpc.php are used for system.multicall credential brute forcing (hundreds
+      of logins in one request) and pingback-based SSRF/DDoS amplification. Legitimate
+      xmlrpc use is rare; disable it if unused.
+    steps:
+      - title: Review xmlrpc.php traffic volume and source
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A burst of xmlrpc POSTs from few IPs is multicall brute force.
+        risk: read-only
+  - id: wp-config-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*/wp-config\.php(?:\.(?:bak|old|save|orig|txt|swp)|~)'
+    severity: warning
+    confidence: high
+    attack_type: secret-probe
+    title: WordPress wp-config.php backup probe
+    explanation: >-
+      Requests for wp-config.php backups (wp-config.php.bak, ~, .save) try to read database
+      credentials left behind by editors. These files should never be web-served.
+    steps:
+      - title: Confirm no backup file is served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to any of these paths means credentials may have leaked.
+        risk: read-only
+  - id: wp-uploads-php-webshell
+    match:
+      message: '"(?:GET|POST)\s+[^"]*/wp-content/uploads/[^"]*\.ph(?:p\d?|tml)'
+    severity: error
+    confidence: high
+    attack_type: webshell
+    title: PHP execution under wp-content/uploads (web shell)
+    explanation: >-
+      The uploads directory should only hold media. A request for a .php/.phtml file there is
+      almost always a planted web shell being executed after an upload bypass.
+    steps:
+      - title: Review the uploaded path and its responses
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to a .php under uploads indicates code execution.
+        risk: read-only
+  - id: wp-plugin-revslider
+    match:
+      message: '"[^"]*/wp-content/plugins/revslider/'
+    severity: warning
+    confidence: medium
+    attack_type: plugin-exploit
+    title: RevSlider plugin probe (known LFI/upload CVEs)
+    explanation: >-
+      The RevSlider plugin has well-known arbitrary file download/upload CVEs; scanners probe
+      its paths to fingerprint and exploit vulnerable versions.
+    steps:
+      - title: Review the plugin paths requested
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows which plugin endpoints were hit and the responses.
+        risk: read-only
+  - id: wp-plugin-file-manager
+    match:
+      message: '"[^"]*/wp-content/plugins/wp-file-manager/'
+    severity: warning
+    confidence: medium
+    attack_type: plugin-exploit
+    title: wp-file-manager plugin probe (CVE-2020-25213 RCE)
+    explanation: >-
+      wp-file-manager's elFinder connector had an unauthenticated RCE (CVE-2020-25213);
+      requests to its paths are exploitation attempts.
+    steps:
+      - title: Review file-manager endpoint traffic
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: POSTs to the connector with upload commands are the exploit.
+        risk: read-only
+  - id: wp-admin-install-probe
+    match:
+      message: '"(?:GET|POST)\s+[^"]*/wp-admin/(?:install|setup-config)\.php'
+    severity: warning
+    confidence: low
+    attack_type: recon
+    title: WordPress installer probe
+    explanation: >-
+      Hitting the installer on a live site checks for a re-installable (hijackable) instance.
+      Normal only immediately after provisioning.
+    steps:
+      - title: Confirm the installer is not reachable
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 from install.php on a running site is a takeover risk.
+        risk: read-only
+
+  # ── Generic: SQL injection ───────────────────────────────────────────────────
+  - id: sqli-union-select
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:union[\s/*]+select|union%20select|union%2bselect)'
+    severity: warning
+    confidence: high
+    attack_type: sqli
+    title: SQL injection — UNION SELECT
+    explanation: >-
+      A UNION SELECT in the request is a classic SQL injection used to append attacker-chosen
+      columns to a query and exfiltrate data.
+    steps:
+      - title: Review the injected parameter and response size
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A large/altered response to the injected request means data may have leaked.
+        risk: read-only
+  - id: sqli-functions
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:information_schema|sleep\(\d|benchmark\(|pg_sleep\(|waitfor\s+delay|extractvalue\(|updatexml\()'
+    severity: warning
+    confidence: high
+    attack_type: sqli
+    title: SQL injection — probing functions (time-based / error-based)
+    explanation: >-
+      information_schema access, SLEEP()/BENCHMARK()/pg_sleep() timing, or extractvalue()/
+      updatexml() error payloads are SQL injection fingerprinting and extraction techniques.
+    steps:
+      - title: Review the injected request
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Repeated timing payloads indicate blind SQL injection.
+        risk: read-only
+  - id: sqli-boolean
+    match:
+      message: "\"(?:GET|POST|PUT)\\s+[^\"]*(?:'|%27)(?:\\s|%20|\\+)*(?:or|and)(?:\\s|%20|\\+)+[^\"]*?\\d+(?:\\s|%20|\\+)*=(?:\\s|%20|\\+)*\\d+"
+    severity: warning
+    confidence: medium
+    attack_type: sqli
+    title: SQL injection — boolean tautology
+    explanation: >-
+      A quoted OR/AND tautology (e.g. ' or 1=1) in a parameter is a boolean-based SQL injection
+      used to bypass filters or dump rows.
+    steps:
+      - title: Review the parameter and value
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the tautology payload and its response.
+        risk: read-only
+
+  # ── Generic: XSS ─────────────────────────────────────────────────────────────
+  - id: xss-script-tag
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:<script|%3cscript|%3Cscript|javascript:|%6a%61%76%61%73%63%72%69%70%74)'
+    severity: warning
+    confidence: high
+    attack_type: xss
+    title: Cross-site scripting — script/javascript payload
+    explanation: >-
+      A <script> tag or javascript: URL in the request is a reflected/stored XSS attempt to run
+      attacker code in a victim's browser.
+    steps:
+      - title: Review the reflected parameter
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Check whether the payload is echoed back unescaped.
+        risk: read-only
+  - id: xss-event-handler
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:onerror=|onload=|onmouseover=|onfocus=|%6fnerror)'
+    severity: warning
+    confidence: medium
+    attack_type: xss
+    title: Cross-site scripting — inline event handler
+    explanation: >-
+      Inline DOM event handlers (onerror=, onload=) injected into a parameter are an XSS vector
+      when a tag is reflected into the page.
+    steps:
+      - title: Review the parameter
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the injected handler and its context.
+        risk: read-only
+
+  # ── Generic: path traversal / LFI ───────────────────────────────────────────
+  - id: path-traversal-dotdot
+    match:
+      message: '"(?:GET|POST|HEAD)\s+[^"]*(?:\.\./|\.\.\\|%2e%2e%2f|%2e%2e/|\.\.%2f|%252e%252e)'
+    severity: warning
+    confidence: high
+    attack_type: path-traversal
+    title: Path traversal (../)
+    explanation: >-
+      ../ sequences (raw or URL/double encoded) try to escape the web root and read files
+      outside it (local file inclusion).
+    steps:
+      - title: Review the traversed path and response
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to a traversal path means a file was disclosed.
+        risk: read-only
+  - id: lfi-sensitive-files
+    match:
+      message: '"(?:GET|POST|HEAD)\s+[^"]*(?:/etc/passwd|/etc/shadow|/proc/self/environ|boot\.ini|win\.ini|/etc/hosts)'
+    severity: warning
+    confidence: high
+    attack_type: path-traversal
+    title: Local file inclusion — sensitive file target
+    explanation: >-
+      A request path pointing at /etc/passwd, /proc/self/environ or Windows ini files is a
+      local file inclusion attempt to read host secrets.
+    steps:
+      - title: Confirm the file was not served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 means a sensitive file was disclosed.
+        risk: read-only
+
+  # ── Generic: command injection ───────────────────────────────────────────────
+  - id: cmd-injection-shell
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:;|%3b|\||%7c|`|%60|\$\(|%24%28|&&|%26%26)\s*(?:id|whoami|uname|cat\s|ls\s|wget\s|curl\s|nc\s|bash\s|sh\s|ping\s)'
+    severity: error
+    confidence: medium
+    attack_type: command-injection
+    title: OS command injection
+    explanation: >-
+      A shell metacharacter (; | ` $( &&) followed by a command (id, whoami, wget, curl) in a
+      parameter is an OS command injection attempt.
+    steps:
+      - title: Review the injected command and response
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Output of the command in the response confirms execution.
+        risk: read-only
+
+  # ── Generic: Log4Shell / template injection ─────────────────────────────────
+  - id: log4shell-jndi
+    match:
+      message: '(?:\$\{jndi:|%24%7bjndi|%24%7Bjndi|\$\{\s*jndi|\$\{(?:lower|upper|env|sys|date):)'
+    severity: error
+    confidence: high
+    attack_type: log4shell
+    title: Log4Shell / JNDI lookup injection (CVE-2021-44228)
+    explanation: >-
+      A ${jndi:...} lookup (often in the User-Agent or a header reflected into logs, sometimes
+      obfuscated with ${lower:}) triggers Log4j to fetch and run remote code. Even a probe means
+      the sender is testing for CVE-2021-44228.
+    steps:
+      - title: Review where the JNDI string appeared
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the header/parameter carrying the lookup and any outbound fetch.
+        risk: read-only
+
+  # ── Generic: secret / config file probes ────────────────────────────────────
+  - id: dotenv-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*/\.env(?:\.[a-z]+)?(?:[?"]|\s)'
+    severity: warning
+    confidence: high
+    attack_type: secret-probe
+    title: .env file probe
+    explanation: >-
+      Requests for /.env try to read framework environment files that hold database passwords,
+      API keys and app secrets. These must never be web-served.
+    steps:
+      - title: Confirm .env is not served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to /.env means secrets leaked.
+        risk: read-only
+  - id: git-dir-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*/\.git/(?:config|HEAD|index)'
+    severity: warning
+    confidence: high
+    attack_type: secret-probe
+    title: Exposed .git directory probe
+    explanation: >-
+      /.git/config or /.git/HEAD requests try to download the source repository (and its
+      history/credentials) from a misconfigured deploy.
+    steps:
+      - title: Confirm the .git directory is not served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 means the repo can be reconstructed.
+        risk: read-only
+  - id: cloud-cred-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*(?:/\.aws/credentials|/\.ssh/(?:id_rsa|id_dsa|authorized_keys)|/\.docker/config\.json|/\.kube/config)'
+    severity: warning
+    confidence: high
+    attack_type: secret-probe
+    title: Cloud/SSH credential file probe
+    explanation: >-
+      Requests for ~/.aws/credentials, ~/.ssh keys, Docker or kube config target credential
+      files that grant access to cloud, hosts or the cluster.
+    steps:
+      - title: Confirm no credential file is served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to any of these paths is a serious leak.
+        risk: read-only
+  - id: backup-archive-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*\.(?:sql|sql\.gz|bak|old|zip|tar|tar\.gz|tgz|7z|rar|dump)(?:[?"]|\s)'
+    severity: info
+    confidence: low
+    attack_type: secret-probe
+    title: Backup/archive file probe
+    explanation: >-
+      Guessing backup/archive filenames (db.sql, backup.zip, www.tar.gz) tries to download whole
+      databases or source trees left in the web root.
+    steps:
+      - title: Review which archive names were tried
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 to any archive means data may have been downloaded.
+        risk: read-only
+  - id: phpinfo-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*/(?:phpinfo|info|test|i)\.php(?:[?"]|\s)'
+    severity: info
+    confidence: low
+    attack_type: recon
+    title: phpinfo()/info page probe
+    explanation: >-
+      Requests for phpinfo.php/info.php look for a left-behind diagnostic page that discloses
+      the full PHP configuration, paths and extensions.
+    steps:
+      - title: Confirm no info page is served
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 exposes environment details useful for further attacks.
+        risk: read-only
+  - id: webshell-common-names
+    match:
+      message: '"(?:GET|POST)\s+[^"]*/(?:c99|r57|shell|cmd|wso|b374k|webshell|backdoor|alfa|adminer)\.php'
+    severity: error
+    confidence: medium
+    attack_type: webshell
+    title: Known web shell / admin tool filename
+    explanation: >-
+      Requests for c99.php, r57.php, wso.php, adminer.php and similar look for (or use) a planted
+      web shell or an exposed database admin tool.
+    steps:
+      - title: Review the response to the shell path
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A 200 means a shell/admin tool is present and reachable.
+        risk: read-only
+
+  # ── Generic: scanner / tool user-agents ─────────────────────────────────────
+  - id: scanner-ua-sqlmap
+    match:
+      message: '"\s+\d{3}\s.*\bsqlmap\b'
+    severity: warning
+    confidence: high
+    attack_type: scanner
+    title: sqlmap scanner user-agent
+    explanation: >-
+      sqlmap is an automated SQL injection tool; its default user-agent in the logs means the
+      site is being actively tested for SQLi.
+    steps:
+      - title: Review what sqlmap requested
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the injected endpoints and whether any returned data.
+        risk: read-only
+  - id: scanner-ua-vuln-scanners
+    match:
+      message: '"\s+\d{3}\s.*\b(?:nikto|nuclei|wpscan|acunetix|nessus|qualys|openvas|w3af|arachni|skipfish|whatweb)\b'
+    severity: warning
+    confidence: high
+    attack_type: scanner
+    title: Vulnerability scanner user-agent
+    explanation: >-
+      A known vulnerability-scanner user-agent (nikto, nuclei, wpscan, acunetix, nessus...) is a
+      deliberate security scan, not normal traffic.
+    steps:
+      - title: Review the scanner's requests and findings
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: The paths hit reveal what the scanner probed.
+        risk: read-only
+  - id: scanner-ua-fuzzers
+    match:
+      message: '"\s+\d{3}\s.*\b(?:dirbuster|gobuster|feroxbuster|ffuf|wfuzz|dirsearch|masscan|zgrab|nmap)\b'
+    severity: info
+    confidence: medium
+    attack_type: scanner
+    title: Directory fuzzer / port scanner user-agent
+    explanation: >-
+      Content-discovery fuzzers (gobuster, ffuf, dirsearch) and network scanners (masscan, zgrab,
+      nmap) brute-force paths or fingerprint services.
+    steps:
+      - title: Review the fuzzing volume and 404 rate
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A burst of 404s to guessed paths from one client confirms fuzzing.
+        risk: read-only
+  - id: scanner-ua-libraries
+    match:
+      message: '"\s+\d{3}\s.*(?:libwww-perl|python-urllib|Go-http-client|Java/\d|zgrab)'
+    severity: info
+    confidence: low
+    attack_type: scanner
+    title: Scripted-client user-agent (possible bot/scraper)
+    explanation: >-
+      Bare scripting-library user-agents (libwww-perl, python-urllib, Go-http-client) are often
+      automated scanning or scraping rather than a browser. Low confidence on its own.
+    steps:
+      - title: Review the client's request pattern
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Correlate with 404 rate and paths to judge intent.
+        risk: read-only
+
+  # ── Generic: auth / method / abuse shapes ───────────────────────────────────
+  - id: http-401-403-flood
+    match:
+      message: '"(?:GET|POST|PUT|DELETE)\s+[^"]*"\s+40[13]\b'
+    severity: warning
+    confidence: low
+    attack_type: auth-probe
+    title: Repeated 401/403 (authorization probing)
+    explanation: >-
+      A 401/403 means the server refused the request. In volume this is credential stuffing or
+      probing for protected endpoints. Low confidence per line; the frequency anomaly carries it.
+    steps:
+      - title: Review the denied endpoints and sources
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Many denials from one client is probing.
+        risk: read-only
+  - id: http-suspicious-method
+    match:
+      message: '"(?:TRACE|TRACK|CONNECT|DEBUG|PROPFIND|SEARCH)\s'
+    severity: info
+    confidence: low
+    attack_type: recon
+    title: Unusual HTTP method
+    explanation: >-
+      TRACE/TRACK (XST), CONNECT (proxy abuse) and WebDAV methods (PROPFIND, SEARCH) are rarely
+      used by browsers and often indicate probing or misuse.
+    steps:
+      - title: Review which method and path was used
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the method and whether the server allowed it.
+        risk: read-only
+  - id: ssti-markers
+    match:
+      message: '"(?:GET|POST|PUT)\s+[^"]*(?:\{\{\s*\d+\s*[*+]\s*\d+|%7b%7b|\$\{\d+[*+]\d+\}|<%=)'
+    severity: warning
+    confidence: medium
+    attack_type: template-injection
+    title: Server-side template injection probe
+    explanation: >-
+      Arithmetic in template delimiters ({{7*7}}, ${7*7}, <%= %>) tests whether input is
+      evaluated server-side, the first step of SSTI leading to RCE.
+    steps:
+      - title: Review whether the expression was evaluated
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A reflected result (e.g. 49) confirms template evaluation.
+        risk: read-only
+  - id: crlf-injection
+    match:
+      message: '"(?:GET|POST)\s+[^"]*(?:%0d%0a|%0a%0d|\r\n)[^"]*(?:set-cookie|location:|content-length)'
+    severity: warning
+    confidence: medium
+    attack_type: crlf-injection
+    title: CRLF / HTTP response-splitting probe
+    explanation: >-
+      Encoded CR/LF (%0d%0a) followed by header names in a parameter attempts to inject response
+      headers (response splitting, cache poisoning).
+    steps:
+      - title: Review the injected header sequence
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the parameter carrying the CRLF payload.
+        risk: read-only
+  - id: ssrf-internal-target
+    match:
+      message: '"(?:GET|POST)\s+[^"]*[?&][a-z_]*(?:url|uri|host|dest|target|proxy|fetch|callback)=(?:https?%3a%2f%2f|https?://)?(?:127\.0\.0\.1|localhost|169\.254\.169\.254|\[::1\]|0\.0\.0\.0|metadata)'
+    severity: warning
+    confidence: medium
+    attack_type: ssrf
+    title: SSRF probe at internal/metadata address
+    explanation: >-
+      A url/host parameter pointing at localhost, 169.254.169.254 (cloud metadata) or ::1 is a
+      server-side request forgery attempt to reach internal services or steal instance credentials.
+      Checked before the open-redirect rule so an internal target is classed as SSRF.
+    steps:
+      - title: Review the SSRF target and response
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A response body from the internal target means SSRF succeeded.
+        risk: read-only
+  - id: open-redirect
+    match:
+      message: '"(?:GET)\s+[^"]*[?&](?:redirect|url|next|return|dest|continue|returnUrl)=(?:https?:|//|%2f%2f|%68%74%74%70)'
+    severity: info
+    confidence: low
+    attack_type: open-redirect
+    title: Open-redirect probe
+    explanation: >-
+      A redirect/url/next parameter pointing at an absolute external URL tests for an open
+      redirect used in phishing and OAuth token theft.
+    steps:
+      - title: Review the redirect target
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: An external target that the app honours is an open redirect.
+        risk: read-only
+  - id: shellshock
+    match:
+      message: '(?:\(\)\s*\{\s*:;\s*\}|%28%29\s*%7b|\(\)\s*\{\s*_;)'
+    severity: error
+    confidence: high
+    attack_type: command-injection
+    title: Shellshock (CVE-2014-6271) probe
+    explanation: >-
+      The () { :; }; function-definition prefix in a header or parameter exploits the Bash
+      Shellshock flaw to run commands via CGI.
+    steps:
+      - title: Review where the payload appeared and any command output
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Commands after the payload run on vulnerable CGI hosts.
+        risk: read-only
+  - id: struts-ognl
+    match:
+      message: '"(?:GET|POST)\s+[^"]*(?:%24%7b|\$\{)(?:#|%23)(?:_memberAccess|context\[|ognl)'
+    severity: error
+    confidence: high
+    attack_type: deserialization
+    title: Apache Struts OGNL injection
+    explanation: >-
+      OGNL expressions referencing #_memberAccess/#context are the shape of the Struts2 RCE CVEs
+      (e.g. CVE-2017-5638) sent via parameters or the Content-Type header.
+    steps:
+      - title: Review the OGNL payload
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the injected expression and response.
+        risk: read-only
+  - id: php-wrapper-lfi
+    match:
+      message: '"(?:GET|POST)\s+[^"]*(?:php://(?:filter|input)|data://|expect://|phar://)'
+    severity: warning
+    confidence: high
+    attack_type: path-traversal
+    title: PHP stream-wrapper LFI/RCE
+    explanation: >-
+      php://filter, php://input, data:// and phar:// wrappers in a parameter turn a local file
+      include into source disclosure or code execution.
+    steps:
+      - title: Review the wrapper payload
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the stream wrapper and the targeted resource.
+        risk: read-only
+  - id: xxe-probe
+    match:
+      message: '"(?:POST|PUT)\s+[^"]*(?:<!DOCTYPE|%3c!doctype|<!ENTITY|%3c!entity|SYSTEM\s+["'']file:)'
+    severity: warning
+    confidence: medium
+    attack_type: xxe
+    title: XML external entity (XXE) probe
+    explanation: >-
+      A DOCTYPE/ENTITY with a SYSTEM file: reference in an XML body is an XXE attempt to read
+      local files or reach internal services.
+    steps:
+      - title: Review the XML body entity
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the external entity declaration.
+        risk: read-only
+  - id: null-byte-injection
+    match:
+      message: '"(?:GET|POST)\s+[^"]*(?:%00|\x00)'
+    severity: warning
+    confidence: medium
+    attack_type: path-traversal
+    title: Null-byte injection
+    explanation: >-
+      A %00 null byte in a path/parameter truncates strings in older stacks to bypass extension
+      checks (e.g. shell.php%00.jpg) during file inclusion or upload.
+    steps:
+      - title: Review the null-byte request
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: Shows the truncation payload and target file.
+        risk: read-only
+  - id: admin-panel-probe
+    match:
+      message: '"(?:GET|HEAD)\s+[^"]*/(?:administrator|admin|phpmyadmin|pma|adminer|manager/html|solr/admin|wp-admin/?)(?:[?"/]|\s)'
+    severity: info
+    confidence: low
+    attack_type: recon
+    title: Admin panel discovery probe
+    explanation: >-
+      Scanning for admin panels (phpMyAdmin, Tomcat manager, Solr admin, /administrator) locates
+      management interfaces to brute-force. Low confidence; volume makes it meaningful.
+    steps:
+      - title: Review which admin paths were tried
+        command: kubectl -n {namespace} logs {pod} --tail 200
+        explanation: A sweep of admin paths from one client is discovery.
+        risk: read-only

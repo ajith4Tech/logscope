@@ -42,6 +42,15 @@ DEFAULT_INSIGHTS = {
     "sample_timestamps_max": 10,
     "min_baseline_hours": 24,
     "min_partial_window_minutes": 15,
+    # A namespace/pod's error_rate_spike and new_falco_rule are suppressed for
+    # this many seconds after that namespace/pod's first observed record, so a
+    # container's own start-up noise (DB-retry errors, entrypoint shells) is not
+    # mistaken for an anomaly. Suppressed detections are still recorded.
+    "cold_start_grace_s": 600,
+    # Fewest baseline occurrences of a group before a rate ratio is computed.
+    # Below it the baseline is "insufficient" rather than 0, so a first-ever
+    # burst is not treated as an infinite spike.
+    "min_baseline_samples": 5,
 }
 
 DEFAULT_AI = {
@@ -60,6 +69,11 @@ DEFAULT_AI = {
     # With anomaly_auto_summary on, only anomalies at or above this urgency
     # (see notify.anomaly_urgency) are summarized automatically.
     "auto_summary_min_urgency": "urgent",
+    # With the auto_triage feature on (default on), a rate/shift anomaly that
+    # transitions to firing at or above this urgency is triaged automatically
+    # (signatures -> cache -> AI), reusing the auto-summary worker. Falco
+    # novelty (new_falco_rule) is never auto-triaged.
+    "auto_triage_min_urgency": "high",
     # Extra signature rules (same format as webapp/api/signatures.yaml),
     # tried after the built-in ones.
     "signatures": [],
@@ -136,6 +150,9 @@ class InsightsConfig:
     # The current, still-open hour is evaluated once this many minutes of it
     # have passed; the previous complete hour is always evaluated.
     min_partial_window_minutes: float = 15
+    # See DEFAULT_INSIGHTS.
+    cold_start_grace_s: float = 600
+    min_baseline_samples: int = 5
 
 
 @dataclass(frozen=True)
@@ -155,6 +172,7 @@ class AiConfig:
     budgets: dict = field(default_factory=dict, compare=False)
     cache_ttl_hours: float = 168.0
     auto_summary_min_urgency: str = "urgent"
+    auto_triage_min_urgency: str = "high"
     signatures: tuple = field(default_factory=tuple, compare=False)
     # The resolved key (see ai_settings.AiSettings.effective); never from
     # config.yaml. Excluded from repr so it cannot reach a log line.
@@ -311,6 +329,9 @@ def load_app_config(config_path: Path) -> AppConfig:
     auto_urgency = str(ai.get("auto_summary_min_urgency") or "urgent").strip().lower()
     if auto_urgency not in URGENCY_ORDER:
         raise ValueError(f"webapp.ai.auto_summary_min_urgency must be one of {sorted(URGENCY_ORDER)}")
+    triage_urgency = str(ai.get("auto_triage_min_urgency") or "high").strip().lower()
+    if triage_urgency not in URGENCY_ORDER:
+        raise ValueError(f"webapp.ai.auto_triage_min_urgency must be one of {sorted(URGENCY_ORDER)}")
     if float(ai.get("cache_ttl_hours") or 0) < 0:
         raise ValueError("webapp.ai.cache_ttl_hours must be >= 0")
     if "api_key" in ai_raw:
@@ -373,6 +394,8 @@ def load_app_config(config_path: Path) -> AppConfig:
             sample_timestamps_max=int(insights["sample_timestamps_max"]),
             min_baseline_hours=float(insights["min_baseline_hours"]),
             min_partial_window_minutes=float(insights["min_partial_window_minutes"]),
+            cold_start_grace_s=float(insights["cold_start_grace_s"]),
+            min_baseline_samples=int(insights["min_baseline_samples"]),
         ),
         ai=AiConfig(
             provider=str(ai.get("provider", "openrouter")),
@@ -387,6 +410,7 @@ def load_app_config(config_path: Path) -> AppConfig:
             budgets=dict(ai.get("budgets") or {}),
             cache_ttl_hours=float(ai.get("cache_ttl_hours") if ai.get("cache_ttl_hours") is not None else 168),
             auto_summary_min_urgency=auto_urgency,
+            auto_triage_min_urgency=triage_urgency,
             signatures=tuple(ai.get("signatures") or ()),
         ),
         mattermost=MattermostConfig(
@@ -407,15 +431,39 @@ def load_app_config(config_path: Path) -> AppConfig:
     )
 
 
-def source_prefixes(cfg: AppConfig) -> list[dict[str, str]]:
+def prefix_root(cfg: AppConfig) -> str:
+    """The key prefix up to the severity segment, e.g. "k3s-logs/logs/"."""
     base = cfg.s3_key_prefix.split("{{ log_type }}", 1)[0]
     base = base.split("%Y", 1)[0]
-    if not base.endswith("/"):
-        base += "/"
+    return base if base.endswith("/") else base + "/"
 
+
+def source_prefixes(cfg: AppConfig) -> list[dict[str, str]]:
+    """Every prefix the web app lists. The security/ prefixes are always
+    included, whatever this config's falco.enabled says: Vector decides
+    whether Falco events are written (listing an empty prefix costs one
+    request per poll), and a mismatch is reported by falco_warnings."""
+    base = prefix_root(cfg)
     prefixes: list[dict[str, str]] = []
     for bucket in cfg.severity_buckets:
         prefixes.append({"bucket": bucket, "scope": "regular", "prefix": base + bucket + "/"})
-        if cfg.falco_namespace:
-            prefixes.append({"bucket": bucket, "scope": "security", "prefix": base + "security/" + bucket + "/"})
+        prefixes.append({"bucket": bucket, "scope": "security", "prefix": base + "security/" + bucket + "/"})
     return prefixes
+
+
+def falco_warnings(*, falco_enabled: bool, security_objects: int, other_objects: int, root: str,
+                   vector_falco: bool | None = None) -> list[str]:
+    """Where this config's falco.enabled disagrees with what Vector does:
+    the rendered Vector config (vector_falco, when known) or the objects
+    ingested so far (security/ ones vs the rest)."""
+    out: list[str] = []
+    if vector_falco is not None and vector_falco != falco_enabled:
+        out.append(f"falco.enabled is {str(falco_enabled).lower()} in this config but the rendered Vector config "
+                   f"has Falco routing {'on' if vector_falco else 'off'}: re-render (logscope render) or fix the config")
+    if not falco_enabled and security_objects:
+        out.append(f"Vector writes Falco events ({security_objects} objects under {root}security/) but falco.enabled "
+                   "is false in this config; they are ingested anyway. Set falco.enabled: true so both agree")
+    elif falco_enabled and not security_objects and other_objects:
+        out.append(f"falco.enabled is true but none of the {other_objects} objects ingested are under {root}security/:"
+                   " Vector may run with falco.enabled: false (or Falco has not reported anything yet)")
+    return out

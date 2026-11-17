@@ -39,7 +39,10 @@ Environment variables override YAML after load (`LOGSCOPE_CLUSTER_NAMESPACE`,
 
 Same wrapping for Prometheus `# HELP` / `# TYPE` / samples. Change
 `format.line` / `format.metrics` in config for a tagged layout later — that is a
-config edit, not a Vector rewrite.
+config edit, not a Vector rewrite. The web app reads the timestamp back as one
+token without whitespace, so `render` refuses a `format.timestamp` that could
+produce whitespace (a space, `%c`, `%e`, `%k`, `%l`, `%r`, `%v`, `%_…`) and a
+`format.line` that glues `{message}` to `{timestamp}`.
 
 ## Layout (file sink)
 
@@ -209,7 +212,11 @@ the mapped severity file under `logs/security/` (`error.log` / `warning.log` /
 `<key_prefix root>/security/<severity>/…` (the `falco_security_s3` sink); the
 main S3 sink leaves Falco events out. The web app reads Falco events from the
 `security/` prefix only (lines tagged ` scope=security` found in a regular
-prefix, written there by older versions, are skipped as duplicates).
+prefix, written there by older versions, are skipped as duplicates), and it
+always lists `security/`, whatever its own `falco.enabled` says. When that
+setting disagrees with what Vector does (objects under `security/`, or the
+rendered `deploy/vector.yaml`), `/api/status` (`config_warnings`) and
+`logscope selfcheck` say so.
 
 Non-Falco events are unchanged. Set `falco.enabled: false` to skip this path
 entirely; Falco-namespace logs then use normal classification.
@@ -294,6 +301,30 @@ line whose timestamp does not parse is placed at its S3 object's time and
 counted in `/api/status` (`timestamp_fallbacks`). A cache from an older
 version is backfilled in the background (`storage.ts_backfill` in
 `/api/status` while it runs).
+
+Reads run on a pool of read-only SQLite connections (WAL; 4 by default,
+`LOGSCOPE_SQLITE_READERS`, 0 = one shared connection), so they neither wait
+for nor block ingest. The cache commits with `synchronous = NORMAL` (no fsync
+per commit): a power loss can drop the last commits, which the next poll reads
+from S3 again, since an object is marked ingested only after its rows. Counts without a text search (histogram buckets of an
+hour or more, field stats, the dashboard, Insights baselines, alert windows
+and backtests in whole hours) come from an hourly rollup (`counts_hourly`,
+kept in the same transaction as every insert and prune) plus the raw rows of
+the partial hours at a range's edges; the results are identical to counting
+the rows. A cache from before the rollup builds it in the background
+(`storage.rollup_rebuild` in `/api/status`). Planner statistics are refreshed
+at start, hourly and after large ingests, and the full-text index is merged
+in small steps once a day between 02:00 and 05:00 UTC.
+
+`logscope db` finds the cache like the server: `--db`, else
+`LOGSCOPE_WEBAPP_DB_PATH`, else `webapp.backend.db_path` of `--config` (default:
+the server's default config, when present), else the default location
+above (`--state`: the state database, the same way).
+
+`make loadtest ROWS=N` (scripts/loadtest.py) builds a synthetic 7-day cache
+of N rows through the ingest code and times the endpoints, detection, alert
+evaluation, maintenance and a mixed read/ingest load; `pip install '.[test]'`
+adds moto for its S3 ingest test.
 
 ### API added since v0.3.0
 
@@ -457,8 +488,10 @@ only the web app uses this image. Deploying the chart is described in
 - Image pin: chart **0.57.0** → `timberio/vector:0.57.0-debian`, written as
   `image.tag` into both rendered values files (not in YAML config).
 - Checkpoints: Vector's `data_dir` is `paths.checkpoint` (default
-  `/var/lib/vector`) in both kits. `values-agent.yaml` always adds a hostPath
-  mount of it (`DirectoryOrCreate`), whatever `sinks.s3.enabled` says;
-  `values-local.yaml` adds none. First boot skips files older than 3600s
-  (`ignore_older_secs`, not in YAML).
+  `/var/lib/vector`) in both kits. The vector/vector chart mounts its own
+  `data` volume at `data_dir`, a hostPath at `persistence.hostPath.path`;
+  both rendered values files set that to `paths.checkpoint`, so checkpoints
+  survive restarts (a second mount at the same path would make the pod
+  invalid). First boot skips files older than 3600s (`ignore_older_secs`,
+  not in YAML).
 - Fluent Bit manifests: [`archive/fluent-bit/`](./archive/fluent-bit/) (reference only).
