@@ -132,6 +132,28 @@ DEFAULT_SECURITY = {
     "notify_channel_ids": [],
     # Per-source-IP behavior over access logs (behavioral.py); see DEFAULT_BEHAVIORAL.
     "behavioral": {},
+    # Trivy Operator vulnerability view (vulnscan.py); see DEFAULT_VULNSCAN.
+    "vulnscan": {},
+}
+
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+DEFAULT_VULNSCAN = {
+    # Off unless enabled: it runs kubectl (fixed read-only commands) and
+    # fetches CISA's KEV catalog over HTTPS.
+    "enabled": False,
+    # How often Trivy Operator's reports and the Ingresses are read.
+    "poll_interval_s": 1800,
+    # How often the CISA Known Exploited Vulnerabilities catalog is refreshed.
+    "kev_refresh_s": 86400,
+    "kev_url": KEV_URL,
+    # Security incidents and attack-tagged anomalies this recent count as
+    # an attack on a workload (risk scoring).
+    "correlation_lookback_s": 86400,
+    # "namespace/workload" or "namespace" entries treated as exposed even
+    # without an Ingress (NodePort, an external load balancer).
+    "exposed_workloads": [],
+    # Upper bound for one kubectl call.
+    "kubectl_timeout_s": 120,
 }
 
 DEFAULT_BEHAVIORAL = {
@@ -259,6 +281,49 @@ class BehavioralConfig:
 
 
 @dataclass(frozen=True)
+class VulnscanConfig:
+    """webapp.security.vulnscan (see DEFAULT_VULNSCAN)."""
+
+    enabled: bool = False
+    poll_interval_s: float = 1800
+    kev_refresh_s: float = 86400
+    kev_url: str = KEV_URL
+    correlation_lookback_s: float = 86400
+    exposed_workloads: tuple[str, ...] = ()
+    kubectl_timeout_s: float = 120
+
+
+def load_vulnscan(raw: Any) -> VulnscanConfig:
+    """webapp.security.vulnscan, validated (ValueError)."""
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("webapp.security.vulnscan must be a mapping")
+    values = {**DEFAULT_VULNSCAN, **(raw or {})}
+    name = "webapp.security.vulnscan"
+    unknown = sorted(set(values) - set(DEFAULT_VULNSCAN))
+    if unknown:
+        raise ValueError(f"{name}: unknown key {unknown[0]!r}")
+    for key, minimum in (("poll_interval_s", 60), ("kev_refresh_s", 3600), ("correlation_lookback_s", 0),
+                         ("kubectl_timeout_s", 5)):
+        if float(values[key]) < minimum:
+            raise ValueError(f"{name}.{key} must be >= {minimum}, got {values[key]!r}")
+    url = str(values["kev_url"] or "")
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"{name}.kev_url must be an https URL")
+    exposed = values["exposed_workloads"] or []
+    if not isinstance(exposed, list) or any(
+            not isinstance(e, str) or not e.strip() or e.count("/") > 1 or e.strip().startswith("/")
+            for e in exposed):
+        raise ValueError(f"{name}.exposed_workloads must list \"namespace\" or \"namespace/workload\" strings")
+    return VulnscanConfig(
+        enabled=bool(values["enabled"]), poll_interval_s=float(values["poll_interval_s"]),
+        kev_refresh_s=float(values["kev_refresh_s"]), kev_url=url,
+        correlation_lookback_s=float(values["correlation_lookback_s"]),
+        exposed_workloads=tuple(e.strip().strip("/") for e in exposed),
+        kubectl_timeout_s=float(values["kubectl_timeout_s"]),
+    )
+
+
+@dataclass(frozen=True)
 class SecurityConfig:
     """webapp.security (see DEFAULT_SECURITY)."""
 
@@ -269,6 +334,7 @@ class SecurityConfig:
     lookback_s: float = 86400
     notify_channel_ids: tuple[int, ...] = ()
     behavioral: BehavioralConfig = field(default_factory=BehavioralConfig)
+    vulnscan: VulnscanConfig = field(default_factory=VulnscanConfig)
 
 
 def load_behavioral(raw: Any) -> BehavioralConfig:
@@ -558,6 +624,7 @@ def load_app_config(config_path: Path) -> AppConfig:
             lookback_s=float(security["lookback_s"]),
             notify_channel_ids=tuple(sorted(set(notify_ids))),
             behavioral=load_behavioral(security.get("behavioral")),
+            vulnscan=load_vulnscan(security.get("vulnscan")),
         ),
     )
 

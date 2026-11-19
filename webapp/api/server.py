@@ -78,6 +78,8 @@ from .signatures import SignatureKB, load_rules
 from .state import SavedViews, StateDB, ViewError, ViewNotFound, default_state_db_path
 from .storage import FILTER_FIELDS, MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
 from .summary_worker import SummaryWorker
+from .vulnscan import TIERS as VULN_TIERS
+from .vulnscan import VulnScanner, VulnStore
 
 _MAX_BODY_BYTES = 1024 * 1024  # JSON bodies are tiny; refuse anything larger
 _PRUNE_INTERVAL_SECS = 3600
@@ -678,7 +680,14 @@ class LogscopeHandler(BaseHTTPRequestHandler):
     def _handle_security(self, method: str, path: str) -> bool:
         """/api/security/incidents[/<id>[/acknowledge|/resolve]]: reads are
         open (like alert reads); acknowledge and resolve need the admin token
-        on top of the Origin check every POST gets."""
+        on top of the Origin check every POST gets.
+        /api/security/vulnerabilities: read-only, open."""
+        if path.rstrip("/") == "/api/security/vulnerabilities":
+            if method != "GET":
+                self._send_json({"error": "Method not allowed"}, status=405)
+            else:
+                self._send_json(self.server.app.api_vulnerabilities(parse_qs(urlparse(self.path).query)))
+            return True
         parts = path.strip("/").split("/")
         if parts[:3] != ["api", "security", "incidents"] or len(parts) > 5:
             return False
@@ -1133,6 +1142,9 @@ class WebApp:
         # the insights job before correlation, on its own read connection.
         self.behavioral = BehavioralDetector(cfg, open_connection(cfg.webapp.db_path), self.anomaly_store)
         self.insights.behavioral = self.behavioral
+        # Trivy Operator reports + CISA KEV (vulnscan.py): fixed read-only
+        # kubectl commands on their own threads, off unless enabled.
+        self.vulnscan = VulnScanner(cfg, VulnStore(cfg.webapp.db_path))
         self.alerts.register_source(
             GROUP_PREFIX, channels=lambda event: self.incident_channel_ids() or "no channels",
             message=self._incident_event_message)
@@ -1179,6 +1191,7 @@ class WebApp:
             self.insights.start()
         self.summary_worker.start()
         self.incident_ai.start()
+        self.vulnscan.start()
         self.notifier.start()
         self.alerts.start()
 
@@ -1195,6 +1208,7 @@ class WebApp:
             self.insights.stop()
         self.summary_worker.stop()
         self.incident_ai.stop()
+        self.vulnscan.stop()
         self.notifier.stop()
         self.alerts.stop()
 
@@ -1361,7 +1375,7 @@ class WebApp:
         status["insights"] = self.insights.status()
         try:
             status["security"] = {**self.correlator.status(), "ai_last_error": self.incident_ai.last_error,
-                                   "behavioral": self.behavioral.status()}
+                                   "behavioral": self.behavioral.status(), "vulnscan": self.vulnscan.status()}
         except sqlite3.Error as exc:
             status["security"] = {"status_error": type(exc).__name__}
         try:
@@ -1442,6 +1456,28 @@ class WebApp:
             raise ValueError(f"'state' must be one of {list(INCIDENT_STATES)}")
         limit = _coerce_limit(_first(params, "limit"), 100, 500)
         return {"items": self.incidents.list(state=state, limit=limit), "counts": self.incidents.counts()}
+
+    def api_vulnerabilities(self, params: dict[str, list[str]]) -> dict:
+        """GET /api/security/vulnerabilities?tier=&namespace=&kev=&include_resolved=&limit="""
+        tier = _first(params, "tier")
+        if tier and tier not in VULN_TIERS:
+            raise ValueError(f"'tier' must be one of {list(VULN_TIERS)}")
+        namespace = _first(params, "namespace")
+        if namespace and (len(namespace) > 253 or not re.fullmatch(r"[a-z0-9]([-a-z0-9.]*[a-z0-9])?", namespace)):
+            raise ValueError("'namespace' is not a Kubernetes namespace name")
+        flags = {}
+        for name in ("kev", "include_resolved"):
+            raw = _first(params, name)
+            if raw is None or raw == "":
+                continue
+            if raw.lower() not in ("true", "false", "1", "0"):
+                raise ValueError(f"'{name}' must be true or false")
+            flags[name] = raw.lower() in ("true", "1")
+        limit = _coerce_limit(_first(params, "limit"), 200, 1000)
+        result = self.vulnscan.view(tier=tier, namespace=namespace, kev=flags.get("kev"),
+                                    include_resolved=flags.get("include_resolved", False), limit=limit)
+        result["enabled"] = bool(self.cfg.security.vulnscan.enabled)
+        return result
 
     def api_incident(self, incident_id: int) -> dict:
         return incident_detail(self.incidents, incident_id, anomalies=self.anomaly_store, storage=self.storage,
