@@ -1712,8 +1712,42 @@ function anomalyTypeLabel(type) {
     message_frequency: 'Frequency spike',
     new_falco_rule: 'New Falco rule',
     severity_shift: 'Severity shift',
+    web_behavioral: 'Web behavior',
   };
   return map[type] || type;
+}
+
+// web_behavioral (per source IP): subtype, client IP, paths and statuses.
+const BEHAVIOR_LABELS = { brute_force: 'Brute force', scanning: 'Scanning', flood: 'Flood' };
+
+function behaviorLabel(anomaly) {
+  const subtype = anomaly.evidence?.subtype || anomaly.attack_type || '';
+  return BEHAVIOR_LABELS[subtype] || String(subtype || 'Web behavior');
+}
+
+function behaviorStatusText(evidence) {
+  const counts = evidence?.status_counts;
+  if (!counts || typeof counts !== 'object') return '';
+  return ['401', '403', '404', '5xx'].filter((k) => Number(counts[k]) > 0)
+    .map((k) => `${k}: ${formatCount(Number(counts[k]))}`).join(' · ');
+}
+
+// One line for the card (set with textContent; the HTML variant escapes
+// every value, including the IP, which is never trusted to be well-formed).
+function behaviorSummaryParts(anomaly) {
+  const ev = anomaly.evidence || {};
+  const paths = Number(ev.distinct_paths);
+  const total = Number(ev.total_requests);
+  return [
+    `${behaviorLabel(anomaly)} from ${String(ev.client_ip || '?')}`,
+    Number.isFinite(total) ? `${formatCount(total)} requests` : '',
+    Number.isFinite(paths) ? `${formatCount(paths)} path${paths === 1 ? '' : 's'}` : '',
+    behaviorStatusText(ev),
+  ].filter(Boolean);
+}
+
+function behaviorSummaryHtml(anomaly) {
+  return behaviorSummaryParts(anomaly).map((part) => escapeHtml(part)).join(' · ');
 }
 
 // Pod and rule key of an anomaly (either may be empty).
@@ -1804,14 +1838,16 @@ function renderAnomalies() {
     node.dataset.anomalyId = String(anomaly.id);
 
     const typeBadge = node.querySelector('.anomaly-type-badge');
-    typeBadge.textContent = anomalyTypeLabel(anomaly.type);
+    typeBadge.textContent = anomaly.type === 'web_behavioral'
+      ? `Web ${behaviorLabel(anomaly).toLowerCase()}` : anomalyTypeLabel(anomaly.type);
     typeBadge.classList.add(`atype-${anomaly.type}`);
 
     // Where it happened; empty pod / severity are left out, not shown as "—".
     node.querySelector('.anomaly-title').textContent = anomaly.namespace || 'Cluster-wide';
     const templateSummary = anomaly.template_summary || {};
     const meta = anomaly.ai_meta || null;
-    const sourceText = anomalySourceText(anomaly);
+    const sourceText = anomaly.type === 'web_behavioral'
+      ? behaviorSummaryParts(anomaly).join(' · ') : anomalySourceText(anomaly);
     const snippet = node.querySelector('.anomaly-snippet');
     snippet.textContent = anomaly.ai_summary || sourceText || templateSummary.headline || '';
     snippet.title = snippet.textContent;
@@ -1955,6 +1991,20 @@ function fillAnomalyDetail(container, anomaly) {
   const source = [anomaly.namespace && `namespace: ${anomaly.namespace}`, anomaly.pod && `pod: ${anomaly.pod}`,
     anomaly.rule_key && `rule / pattern: ${anomaly.rule_key}`].filter(Boolean).join('\n');
   if (source) addDetailBlock(container, 'Source', source);
+  if (anomaly.type === 'web_behavioral') {
+    const behavior = document.createElement('div');
+    behavior.className = 'detail-block behavior-summary';
+    const paths = (evidence.top_paths || []).slice(0, 5).map((p) => `<li><code>${escapeHtml(p.path ?? '')}</code> `
+      + `<span class="subtle">× ${escapeHtml(formatCount(Number(p.count) || 0))}</span></li>`).join('');
+    behavior.innerHTML = `<div class="detail-label">Source IP behavior</div>
+      <p>${behaviorSummaryHtml(anomaly)}</p>
+      <p class="subtle">Client IP <code>${escapeHtml(evidence.client_ip ?? '?')}</code>
+        · confidence ${escapeHtml(anomaly.attack_confidence || 'n/a')}
+        · first seen ${escapeHtml(formatDateTime(evidence.first_seen))}
+        · last request ${escapeHtml(formatDateTime(evidence.last_seen))}</p>
+      ${paths ? `<div class="subtle">Top paths</div><ul class="behavior-paths">${paths}</ul>` : ''}`;
+    container.appendChild(behavior);
+  }
   if (anomaly.ai_summary) {
     const action = anomaly.ai_suggested_action ? `\n\n→ ${anomaly.ai_suggested_action}` : '';
     addDetailBlock(container, 'AI summary', `${anomaly.ai_summary}${action}`);

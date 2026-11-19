@@ -313,6 +313,76 @@ class AnomalyStore:
             )
             self._conn.commit()
 
+    # Evidence keys of a web_behavioral occurrence that stay as first recorded
+    # while it continues (when it started; the correlator's attack start).
+    _OCCURRENCE_KEYS = ("window_start", "first_seen", "sample_timestamps")
+
+    @_write
+    def record_behavioral(
+        self,
+        *,
+        namespace: str,
+        pod: str,
+        rule_key: str,
+        severity: str,
+        evidence: dict[str, Any],
+        attack_type: str,
+        attack_confidence: str,
+        now: datetime,
+        cooldown_s: float,
+    ) -> tuple[int, str]:
+        """Insert or continue one web_behavioral anomaly (behavioral.py).
+        Returns (id, "created" | "updated").
+
+        Check-then-update in one locked transaction, keyed on (type,
+        namespace, rule_key) only: the latest row for the key is updated while
+        its last_seen is within cooldown_s of `now` (the behavior continues:
+        same row, newer counts, its status kept); otherwise a new row opens.
+        Neither the pod (the busiest target pod can change) nor the UTC day
+        (an attack across midnight) splits an occurrence, and the UNIQUE
+        constraint is not relied on: detected_day holds the occurrence's start
+        time, so a fresh occurrence later the same day gets its own row.
+        attack_type / attack_confidence are set here, so the security-incident
+        correlator picks the row up unchanged."""
+        stamp = _utc_now_iso()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, evidence FROM anomalies WHERE type = 'web_behavioral' AND namespace = ? AND rule_key = ? "
+                "ORDER BY id DESC LIMIT 1", (namespace, rule_key)).fetchone()
+            if row is not None:
+                try:
+                    previous = json.loads(row["evidence"])
+                except (TypeError, ValueError):
+                    previous = {}
+                previous = previous if isinstance(previous, dict) else {}
+                last_seen = previous.get("last_seen")
+                try:
+                    quiet = (now - datetime.fromisoformat(str(last_seen).replace("Z", "+00:00"))).total_seconds()
+                except ValueError:
+                    quiet = None
+                if quiet is not None and quiet <= cooldown_s:
+                    merged = {**evidence, **{k: previous[k] for k in self._OCCURRENCE_KEYS if k in previous},
+                              "cycles": int(previous.get("cycles") or 1) + 1,
+                              "peak_requests": max(int(previous.get("peak_requests") or 0),
+                                                   int(evidence.get("total_requests") or 0))}
+                    self._conn.execute(
+                        "UPDATE anomalies SET evidence = ?, severity = ?, attack_confidence = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (json.dumps(merged, separators=(",", ":")), severity, attack_confidence, stamp, row["id"]))
+                    self._conn.commit()
+                    return int(row["id"]), "updated"
+            evidence = {**evidence, "cycles": 1, "peak_requests": int(evidence.get("total_requests") or 0)}
+            cur = self._conn.execute(
+                """
+                INSERT INTO anomalies (type, namespace, pod, rule_key, severity, evidence, detected_at, detected_day,
+                                       updated_at, status, attack_type, attack_confidence)
+                VALUES ('web_behavioral', ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                """,
+                (namespace, pod or "-", rule_key, severity, json.dumps(evidence, separators=(",", ":")), stamp,
+                 str(evidence.get("window_start") or stamp), stamp, attack_type, attack_confidence or None))
+            self._conn.commit()
+            return int(cur.lastrowid), "created"
+
     @_write
     def set_attack(self, anomaly_id: int, attack_type: str, confidence: str) -> None:
         """The anomaly's web-attack classification (see explain.classify_anomaly)."""
@@ -951,6 +1021,10 @@ class InsightsJob:
         # Free signature classification of every anomaly this run touched
         # (explain.classify_anomaly: persists attack_type for correlation).
         self.classifier = classifier
+        # Per-source-IP behavior (behavioral.BehavioralDetector), run after
+        # detection and before correlation, so a new web_behavioral anomaly is
+        # correlated in the same run; its failure never fails detection.
+        self.behavioral: Any = None
         # Web->runtime correlation (security.Correlator), run after detection on
         # the same cadence; its failure never fails detection.
         self.correlator = correlator
@@ -1024,6 +1098,11 @@ class InsightsJob:
         now = now or datetime.now(timezone.utc)
         counts = self.detect_once(now)
         self.future_dated_records = self.detector.future_record_count(now)
+        if self.behavioral is not None:
+            try:
+                counts.update(self.behavioral.run_once(now))
+            except Exception as exc:  # noqa: BLE001 - visible in /api/status (behavioral.last_error)
+                logger.warning("Behavioral detection failed (%s)", type(exc).__name__)
         if self.correlator is not None:
             try:
                 counts.update(self.correlator.run_once(now))

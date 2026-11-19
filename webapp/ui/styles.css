@@ -2079,6 +2079,22 @@ button.ghost:hover {
   color: var(--metrics);
 }
 
+.atype-web_behavioral {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.behavior-summary p {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.behavior-paths {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
 .anomaly-time {
   color: var(--muted);
 }

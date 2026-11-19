@@ -130,6 +130,30 @@ DEFAULT_SECURITY = {
     # Channels (ids from the Alerts tab) a new incident is sent to; empty =
     # the environment's Mattermost channel (id 0) when it is configured.
     "notify_channel_ids": [],
+    # Per-source-IP behavior over access logs (behavioral.py); see DEFAULT_BEHAVIORAL.
+    "behavioral": {},
+}
+
+DEFAULT_BEHAVIORAL = {
+    "enabled": True,
+    # Trailing window aggregated per (namespace, client_ip) on each insights run.
+    "window_s": 300,
+    # brute_force: one path requested at least this often, with this share of 401/403.
+    "brute_force_min_repeats": 50,
+    "brute_force_auth_fail_ratio": 0.7,
+    # scanning: at least this many distinct paths, with this share of 404
+    # (or a scanner signature already matched for this IP).
+    "scanning_min_paths": 20,
+    "scanning_not_found_ratio": 0.6,
+    # flood: this many requests within window_s, whatever the status.
+    "flood_requests": 300,
+    # While the behavior continues the open anomaly is updated; after this
+    # many quiet seconds a new occurrence opens a new anomaly.
+    "cooldown_s": 1800,
+    # Never evaluated: source IPs in these CIDRs, and requests whose
+    # User-Agent contains one of these strings (case-insensitive).
+    "trusted_cidrs": [],
+    "trusted_user_agents": [],
 }
 
 # Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
@@ -219,6 +243,22 @@ class AlertsConfig:
 
 
 @dataclass(frozen=True)
+class BehavioralConfig:
+    """webapp.security.behavioral (see DEFAULT_BEHAVIORAL)."""
+
+    enabled: bool = True
+    window_s: float = 300
+    brute_force_min_repeats: int = 50
+    brute_force_auth_fail_ratio: float = 0.7
+    scanning_min_paths: int = 20
+    scanning_not_found_ratio: float = 0.6
+    flood_requests: int = 300
+    cooldown_s: float = 1800
+    trusted_cidrs: tuple[str, ...] = ()
+    trusted_user_agents: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class SecurityConfig:
     """webapp.security (see DEFAULT_SECURITY)."""
 
@@ -228,6 +268,47 @@ class SecurityConfig:
     cold_start_grace_s: float | None = None
     lookback_s: float = 86400
     notify_channel_ids: tuple[int, ...] = ()
+    behavioral: BehavioralConfig = field(default_factory=BehavioralConfig)
+
+
+def load_behavioral(raw: Any) -> BehavioralConfig:
+    """webapp.security.behavioral, validated (ValueError)."""
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("webapp.security.behavioral must be a mapping")
+    values = {**DEFAULT_BEHAVIORAL, **(raw or {})}
+    unknown = sorted(set(values) - set(DEFAULT_BEHAVIORAL))
+    if unknown:
+        raise ValueError(f"webapp.security.behavioral: unknown key {unknown[0]!r}")
+    name = "webapp.security.behavioral"
+    for key, minimum in (("window_s", 30), ("brute_force_min_repeats", 1), ("scanning_min_paths", 1),
+                         ("flood_requests", 1), ("cooldown_s", 0)):
+        if float(values[key]) < minimum:
+            raise ValueError(f"{name}.{key} must be >= {minimum}, got {values[key]!r}")
+    for key in ("brute_force_auth_fail_ratio", "scanning_not_found_ratio"):
+        if not 0 <= float(values[key]) <= 1:
+            raise ValueError(f"{name}.{key} must be between 0 and 1, got {values[key]!r}")
+    import ipaddress
+
+    cidrs = values["trusted_cidrs"] or []
+    agents = values["trusted_user_agents"] or []
+    if not isinstance(cidrs, list) or not isinstance(agents, list):
+        raise ValueError(f"{name}.trusted_cidrs and trusted_user_agents must be lists")
+    for cidr in cidrs:
+        try:
+            ipaddress.ip_network(str(cidr), strict=False)
+        except ValueError:
+            raise ValueError(f"{name}.trusted_cidrs: {cidr!r} is not an IP network") from None
+    if any(not isinstance(a, str) or not a.strip() for a in agents):
+        raise ValueError(f"{name}.trusted_user_agents must be non-empty strings")
+    return BehavioralConfig(
+        enabled=bool(values["enabled"]), window_s=float(values["window_s"]),
+        brute_force_min_repeats=int(values["brute_force_min_repeats"]),
+        brute_force_auth_fail_ratio=float(values["brute_force_auth_fail_ratio"]),
+        scanning_min_paths=int(values["scanning_min_paths"]),
+        scanning_not_found_ratio=float(values["scanning_not_found_ratio"]),
+        flood_requests=int(values["flood_requests"]), cooldown_s=float(values["cooldown_s"]),
+        trusted_cidrs=tuple(str(c) for c in cidrs), trusted_user_agents=tuple(a.strip() for a in agents),
+    )
 
 
 @dataclass(frozen=True)
@@ -476,6 +557,7 @@ def load_app_config(config_path: Path) -> AppConfig:
                                 else float(security["cold_start_grace_s"])),
             lookback_s=float(security["lookback_s"]),
             notify_channel_ids=tuple(sorted(set(notify_ids))),
+            behavioral=load_behavioral(security.get("behavioral")),
         ),
     )
 

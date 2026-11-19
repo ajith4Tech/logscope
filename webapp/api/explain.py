@@ -185,7 +185,10 @@ def web_attack_of(rule: Signature | None) -> tuple[str, str]:
 def classify_anomaly(kb: SignatureKB, store: Any, anomaly: dict[str, Any]) -> tuple[str, str]:
     """Persist the anomaly's web-attack classification (anomalies.attack_type /
     attack_confidence) from its signature match, so correlation can query it.
-    Same match as anomaly_template_summary; free (no AI). Returns it."""
+    Same match as anomaly_template_summary; free (no AI). Returns it.
+    web_behavioral anomalies keep the subtype set at creation (behavioral.py)."""
+    if anomaly.get("type") == "web_behavioral":
+        return str(anomaly.get("attack_type") or ""), str(anomaly.get("attack_confidence") or "")
     attack_type, confidence = web_attack_of(anomaly_signature(kb, anomaly))
     if anomaly.get("id") is not None and (
             (anomaly.get("attack_type") or "") != attack_type
@@ -226,6 +229,13 @@ def anomaly_template_summary(kb: SignatureKB, anomaly: dict[str, Any]) -> dict[s
             headline = f"The severity mix in {where} changed."
     elif kind == "new_falco_rule":
         headline = (f"Falco rule seen for the first time in {days or 'several'} days: {count} event(s){span}.")
+    elif kind == "web_behavioral":
+        subtype = str(ev.get("subtype") or anomaly.get("attack_type") or "behavior").replace("_", " ")
+        statuses = ev.get("status_counts") if isinstance(ev.get("status_counts"), dict) else {}
+        breakdown = ", ".join(f"{k}: {v}" for k, v in statuses.items() if v and k != "other")
+        headline = (f"Web {subtype} from {ev.get('client_ip') or 'one client'} in {where}: "
+                    f"{ev.get('total_requests', count)} requests to {ev.get('distinct_paths', '?')} path(s)"
+                    + (f" ({breakdown})" if breakdown else "") + f" within {ev.get('observed_minutes', '?')} min.")
     else:
         headline = f"{kind or 'Anomaly'} in {where}."
     messages = [m for m in (ev.get("sample_messages") or []) if isinstance(m, str)]
@@ -243,7 +253,8 @@ def anomaly_template_summary(kb: SignatureKB, anomaly: dict[str, Any]) -> dict[s
                       if rule else None),
         # Also persisted on the anomaly (classify_anomaly) for web->runtime
         # correlation (security.py); empty when no web signature matched.
-        "attack_type": rule.attack_type if rule else "",
+        "attack_type": (str(anomaly.get("attack_type") or "") if kind == "web_behavioral"
+                        else (rule.attack_type if rule else "")),
     }
 
 

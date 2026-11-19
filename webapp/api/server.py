@@ -55,6 +55,7 @@ from .ai_summary import (
     summarize_anomaly,
 )
 from .alerts import AlertEngine, AlertRules, RuleError, backtest
+from .behavioral import BehavioralDetector
 from .channels import ENV_CHANNEL_ID, ChannelError, ChannelStore
 from .config import AppConfig, falco_warnings, load_app_config, prefix_root, source_prefixes
 from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, classify_anomaly, meta_of
@@ -1128,6 +1129,10 @@ class WebApp:
             cfg, self.incidents, open_connection(cfg.webapp.db_path), notify=self._notify_incident,
             ai_dispatch=self.incident_ai.enqueue, complete_until=self._complete_until)
         self.insights.correlator = self.correlator
+        # Per-source-IP brute force / scanning / flood (behavioral.py), run by
+        # the insights job before correlation, on its own read connection.
+        self.behavioral = BehavioralDetector(cfg, open_connection(cfg.webapp.db_path), self.anomaly_store)
+        self.insights.behavioral = self.behavioral
         self.alerts.register_source(
             GROUP_PREFIX, channels=lambda event: self.incident_channel_ids() or "no channels",
             message=self._incident_event_message)
@@ -1355,7 +1360,8 @@ class WebApp:
         status["actions_enabled"] = self.actions_enabled
         status["insights"] = self.insights.status()
         try:
-            status["security"] = {**self.correlator.status(), "ai_last_error": self.incident_ai.last_error}
+            status["security"] = {**self.correlator.status(), "ai_last_error": self.incident_ai.last_error,
+                                   "behavioral": self.behavioral.status()}
         except sqlite3.Error as exc:
             status["security"] = {"status_error": type(exc).__name__}
         try:

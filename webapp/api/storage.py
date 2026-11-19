@@ -79,6 +79,9 @@ _RECORD_INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_records_sev_epoch ON records(severity_bucket, ts_epoch)",
     "CREATE INDEX IF NOT EXISTS idx_records_scope_epoch ON records(scope, ts_epoch)",
     "CREATE INDEX IF NOT EXISTS idx_records_pod_epoch ON records(pod, ts_epoch)",
+    # Access-log rows only, by time: the per-source-IP window scan
+    # (behavioral.GROUP_SQL, "... AND http_meta IS NOT NULL") reads just these.
+    "CREATE INDEX IF NOT EXISTS idx_records_http_epoch ON records(ts_epoch) WHERE http_meta IS NOT NULL",
 )
 # Text-timestamp indexes of older versions; dropped at start.
 _LEGACY_RECORD_INDEXES = (
