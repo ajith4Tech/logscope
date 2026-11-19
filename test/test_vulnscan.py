@@ -473,3 +473,31 @@ def test_disabled_by_default_in_the_web_app(tmp_path, monkeypatch):
     assert app.vulnscan._threads == []  # noqa: SLF001
     assert app.status()["security"]["vulnscan"]["state"] == "never"
 
+
+# ─── UI escaping of external text ────────────────────────────────────────────
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_ui_escapes_trivy_and_kev_text(tmp_path):
+    item = {"cve_id": "CVE-1<b>", "severity": "CRITICAL", "is_kev": True, "namespace": "shop", "workload": "w<i>",
+            "container": "c", "title": "<img src=x onerror=alert(1)>", "package": "p\"><script>",
+            "installed_version": "1", "fixed_version": "2<svg>", "image": "i<u>", "primary_link": "javascript:alert(1)",
+            "kev": {"date_added": "2024", "short_description": "\"><script>alert(1)</script>"},
+            "risk": {"tier": "critical", "reasons": ["<b>r</b>"]}, "exposure": "ingress <x>",
+            "attacks": {"incidents": [{"id": "1 onclick=x"}], "anomalies": [{"id": 5, "type": "<t>"}]}}
+    script = tmp_path / "check.js"
+    script.write_text("""
+const fs = require('fs');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const grab = (name) => { const i = src.indexOf(name); let d = 0; for (let k = src.indexOf('{', i); k < src.length; k++) {
+  if (src[k] === '{') d++; else if (src[k] === '}') { d--; if (!d) return src.slice(i, k + 1); } } };
+const consts = src.slice(src.indexOf('const VULN_TIER_LABELS'), src.indexOf('\\n', src.indexOf('const VULN_TIER_LABELS')));
+eval(grab('function escapeHtml') + consts
+  + grab('function safeHttpsUrl') + grab('function vulnAttackLinks') + grab('function vulnRowMarkup')
+  + '; process.stdout.write(vulnRowMarkup(JSON.parse(process.argv[3])));');
+""")
+    out = subprocess.run(["node", str(script), str(ROOT / "webapp" / "ui" / "app.js"), json.dumps(item)],
+                         capture_output=True, text=True, check=True).stdout
+    for raw in ("<img", "<script>", "<svg>", "<b>", "<i>", "<u>", "<x>", "<t>", "javascript:", "onclick=x"):
+        assert raw not in out, raw
+    assert "&lt;img src=x onerror=alert(1)&gt;" in out and "KEV" in out

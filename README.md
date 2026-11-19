@@ -288,7 +288,7 @@ recently*: a security incident or an attack-tagged anomaly (web signature or
 `web_behavioral`) on a pod of the workload within `correlation_lookback_s`
 (86400).
 
-Served by
+Shown on the VulnScan tab (critical + high by default) and served by
 `GET /api/security/vulnerabilities?tier=&namespace=&kev=true|false`;
 `/api/status` → `security.vulnscan` reports the last poll, KEV freshness and
 a degraded state (`kubectl_missing`, `rbac_missing`, `crd_missing`, ...).

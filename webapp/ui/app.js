@@ -146,11 +146,12 @@ function dashboardContextText() {
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
-const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'alerts', 'pipeline', 'settings'];
+const TABS = ['dashboard', 'logs', 'insights', 'vulnscan', 'actionable', 'alerts', 'pipeline', 'settings'];
 const TAB_IDS = {
   dashboard: ['tabDashboard', 'panelDashboard'],
   logs: ['tabLogs', 'panelLogs'],
   insights: ['tabInsights', 'panelInsights'],
+  vulnscan: ['tabVulnscan', 'panelVulnscan'],
   actionable: ['tabActionable', 'panelActionable'],
   alerts: ['tabAlerts', 'panelAlerts'],
   pipeline: ['tabPipeline', 'panelPipeline'],
@@ -184,6 +185,9 @@ function switchTab(name, { history = 'push' } = {}) {
   if (name === 'dashboard') loadPinnedCounts();
   if (name === 'insights' && !state.insightsLoaded && !state.insightsLoading) {
     loadInsights().catch(() => {});
+  }
+  if (name === 'vulnscan' && !vulnsState.loaded && !vulnsState.loading) {
+    loadVulnerabilities().catch(() => {});
   }
   if (name === 'logs' && state.logPanels.stale) scheduleLogPanels();
   if (name === 'actionable') {
@@ -1701,6 +1705,139 @@ el('contextLimitRange').addEventListener('change', () => {
   state.context.limitToRange = el('contextLimitRange').checked;
   openContext(state.context.recordId, { history: 'replace' });
 });
+
+// ─── VulnScan tab (Trivy Operator + CISA KEV, risk at read time) ──────────
+// Text from Trivy and CISA is external and untrusted: every value goes
+// through escapeHtml, and only plain https links are rendered. The default
+// view is the critical and high tiers only (a cluster can have >10k open
+// low/medium findings); the API takes one tier per request, so "Critical +
+// high" is two requests merged. Each request returns at most VULN_PAGE rows.
+
+const VULN_PAGE = 200;
+const VULN_DEFAULT_TIER = 'critical,high';
+const VULN_TIER_CHOICES = ['critical,high', 'critical', 'high', 'medium', 'low', 'all'];
+const VULN_TIER_LABELS = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
+const VULN_NAMESPACE_RE = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
+const vulnsState = { requestId: 0, loaded: false, loading: false };
+
+function safeHttpsUrl(value) {
+  const text = String(value || '');
+  return /^https:\/\/[^\s"'<>]+$/.test(text) ? text : '';
+}
+
+function vulnAttackLinks(attacks) {
+  const links = [];
+  for (const inc of attacks?.incidents || []) {
+    const id = Number(inc.id);
+    if (Number.isFinite(id)) links.push(`<a href="?${escapeHtml(new URLSearchParams({ tab: 'insights', incident: String(id) }).toString())}">incident #${id}</a>`);
+  }
+  for (const an of attacks?.anomalies || []) {
+    const id = Number(an.id);
+    if (Number.isFinite(id)) links.push(`<a href="?${escapeHtml(new URLSearchParams({ tab: 'insights', anomaly: String(id) }).toString())}">${escapeHtml(an.attack_type || an.type || 'anomaly')} #${id}</a>`);
+  }
+  return links.join(', ');
+}
+
+function vulnRowMarkup(v) {
+  const tier = VULN_TIER_LABELS[v.risk?.tier] ? v.risk.tier : 'low';
+  const link = safeHttpsUrl(v.primary_link);
+  const cve = link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(v.cve_id)}</a>`
+    : escapeHtml(v.cve_id);
+  const fix = v.fixed_version ? `fix <code>${escapeHtml(v.fixed_version)}</code>` : '<span class="subtle">no fix yet</span>';
+  const kev = v.is_kev
+    ? `<span class="badge vuln-kev" title="${escapeHtml(`CISA KEV since ${v.kev?.date_added || '?'}: ${v.kev?.short_description || ''}`)}">KEV</span>` : '';
+  const attacks = vulnAttackLinks(v.attacks);
+  return `<article class="vuln-row vuln-${tier}">
+      <header class="incident-title">
+        <span class="badge vuln-tier">${escapeHtml(VULN_TIER_LABELS[tier])}</span>
+        <strong>${cve}</strong>
+        <span class="badge">${escapeHtml(v.severity)}</span>
+        ${kev}
+        <span class="subtle">${escapeHtml(`${v.namespace}/${v.workload}`)}${v.container ? ` · ${escapeHtml(v.container)}` : ''}</span>
+      </header>
+      <p class="vuln-title">${escapeHtml(v.title || '')}</p>
+      <p class="subtle"><code>${escapeHtml(v.package || '?')}</code> ${escapeHtml(v.installed_version || '')} · ${fix}
+        · image <code>${escapeHtml(v.image || '?')}</code></p>
+      <p class="subtle">${escapeHtml((v.risk?.reasons || []).join(' · ') || 'no risk signals')}${v.exposure ? ` · exposed via ${escapeHtml(v.exposure)}` : ''}${attacks ? ` · attacks: ${attacks}` : ''}</p>
+    </article>`;
+}
+
+function vulnFilters() {
+  const tier = VULN_TIER_CHOICES.includes(el('vulnsTier').value) ? el('vulnsTier').value : VULN_DEFAULT_TIER;
+  return {
+    tier,
+    namespace: el('vulnsNamespace').value.trim(),
+    kev: el('vulnsKev').checked,
+    resolved: el('vulnsResolved').checked,
+  };
+}
+
+async function loadVulnerabilities() {
+  const requestId = ++vulnsState.requestId;
+  const f = vulnFilters();
+  if (f.namespace && (f.namespace.length > 253 || !VULN_NAMESPACE_RE.test(f.namespace))) {
+    el('vulnsError').textContent = 'Namespace must be a Kubernetes namespace name (lowercase letters, digits, -).';
+    el('vulnsError').hidden = false;
+    return;
+  }
+  vulnsState.loading = true;
+  if (!vulnsState.loaded) el('vulnRows').replaceChildren(panelStateNode('loading', { layout: 'list', lines: 4 }));
+  const tiers = f.tier === 'all' ? [null] : f.tier.split(',');
+  try {
+    const responses = await Promise.all(tiers.map((tier) => {
+      const params = new URLSearchParams({ limit: String(VULN_PAGE) });
+      if (tier) params.set('tier', tier);
+      if (f.namespace) params.set('namespace', f.namespace);
+      if (f.kev) params.set('kev', 'true');
+      if (f.resolved) params.set('include_resolved', 'true');
+      return fetchJson(`/api/security/vulnerabilities?${params.toString()}`);
+    }));
+    if (requestId !== vulnsState.requestId) return;
+    vulnsState.loaded = true;
+    const first = responses[0] || {};
+    if (!first.enabled) {
+      el('vulnsCount').textContent = '';
+      el('vulnsState').textContent = 'The vulnerability view is off. Enable webapp.security.vulnscan (Helm: '
+        + 'security.vulnerabilityScanning.enabled) and install Trivy Operator; see the README.';
+      el('vulnsError').hidden = true;
+      el('vulnRows').innerHTML = '';
+      return;
+    }
+    const counts = first.counts || {};
+    const items = responses.flatMap((r) => (Array.isArray(r.items) ? r.items : []));
+    const total = responses.reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+    const tierCounts = ['critical', 'high', 'medium', 'low'].map((t) => `${formatCount(Number(counts[t]) || 0)} ${t}`).join(' · ');
+    el('vulnsCount').textContent = `${f.resolved ? 'Open and resolved' : 'Open'} findings: ${tierCounts}.`
+      + (items.length < total ? ` Showing the first ${formatCount(items.length)} of ${formatCount(total)} matching; narrow the filters to see others.` : '');
+    const kev = first.kev || {};
+    const notes = [];
+    if (first.state && first.state !== 'ok') notes.push(`Reports not readable (${first.state}); showing the last data read.`);
+    notes.push(kev.last_success_at ? `KEV catalog: ${Number(kev.entries) || 0} entries, updated ${formatDateTime(kev.last_success_at)}${kev.stale ? ' (stale)' : ''}.`
+      : 'KEV catalog not downloaded yet: nothing is flagged as known-exploited.');
+    el('vulnsState').textContent = notes.join(' ');
+    el('vulnsError').hidden = true;
+    el('vulnRows').innerHTML = items.length ? items.map(vulnRowMarkup).join('')
+      : '<p class="subtle">No findings match these filters.</p>';
+  } catch (err) {
+    if (requestId !== vulnsState.requestId) return;
+    el('vulnRows').innerHTML = '';
+    el('vulnsError').textContent = `Failed to load vulnerabilities: ${err.message}`;
+    el('vulnsError').hidden = false;
+  } finally {
+    if (requestId === vulnsState.requestId) vulnsState.loading = false;
+  }
+}
+
+function onVulnFilterChange() {
+  updateUrl('replace');
+  loadVulnerabilities().catch(() => {});
+}
+
+el('vulnsTier').addEventListener('change', onVulnFilterChange);
+el('vulnsKev').addEventListener('change', onVulnFilterChange);
+el('vulnsResolved').addEventListener('change', onVulnFilterChange);
+el('vulnsNamespace').addEventListener('change', onVulnFilterChange);
+el('refreshVulns').addEventListener('click', () => { loadVulnerabilities().catch(() => {}); });
 
 // ─── Insights tab ────────────────────────────────────────────────────────────
 
@@ -4207,6 +4344,8 @@ el('refreshPipeline').addEventListener('click', () => {
 //   rec     log entry id whose context is open (Logs)
 //   ctx     10 | 25 | 50 lines each side;  ctxall=1: context ignores the range
 //   anomaly anomaly id (expanded in Insights, or investigated in Actionable)
+//   tier    VulnScan risk tier: critical | high | medium | low | all  (critical+high when absent)
+//   vns     VulnScan namespace;  kev=1: KEV only;  resolved=1: include resolved
 //   line    log entry id investigated in Actionable
 //   view    open saved view id (its filters are the ones above; a difference
 //           marks the view as modified)
@@ -4250,7 +4389,8 @@ function parseUrlState(search) {
   } catch (_) {
     params = new URLSearchParams();
   }
-  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
+  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null,
+    vuln: { tier: VULN_DEFAULT_TIER, namespace: '', kev: false, resolved: false } };
   const tab = params.get('tab');
   if (TABS.includes(tab)) out.tab = tab;
   for (const [key, field, max] of URL_FILTERS) {
@@ -4278,6 +4418,13 @@ function parseUrlState(search) {
   out.anomaly = cleanId(params.get('anomaly'));
   out.line = cleanId(params.get('line'));
   out.view = cleanId(params.get('view'));
+  const tierParam = params.get('tier');
+  if (tierParam === 'critical+high' || tierParam === 'critical,high') out.vuln.tier = VULN_DEFAULT_TIER;
+  else if (VULN_TIER_CHOICES.includes(tierParam)) out.vuln.tier = tierParam;
+  const vns = cleanParam(params.get('vns'), 253);
+  if (vns && VULN_NAMESPACE_RE.test(vns)) out.vuln.namespace = vns;
+  out.vuln.kev = params.get('kev') === '1' || params.get('kev') === 'true';
+  out.vuln.resolved = params.get('resolved') === '1' || params.get('resolved') === 'true';
   return out;
 }
 
@@ -4315,6 +4462,13 @@ function buildUrlParams() {
   }
   if (state.activeTab === 'actionable' && state.actionable.sourceType === 'line' && state.actionable.lineItem) {
     params.set('line', String(state.actionable.lineItem.id));
+  }
+  if (state.activeTab === 'vulnscan') {
+    const f = vulnFilters();
+    if (f.tier !== VULN_DEFAULT_TIER) params.set('tier', f.tier);
+    if (f.namespace && VULN_NAMESPACE_RE.test(f.namespace)) params.set('vns', f.namespace);
+    if (f.kev) params.set('kev', '1');
+    if (f.resolved) params.set('resolved', '1');
   }
   return params;
 }
@@ -4383,6 +4537,13 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     state.context.lines = parsed.ctx;
     state.context.limitToRange = !parsed.ctxAll;
     state.focusAnomalyId = parsed.anomaly;
+    const vulnChanged = el('vulnsTier').value !== parsed.vuln.tier || el('vulnsNamespace').value.trim() !== parsed.vuln.namespace
+      || el('vulnsKev').checked !== parsed.vuln.kev || el('vulnsResolved').checked !== parsed.vuln.resolved;
+    el('vulnsTier').value = parsed.vuln.tier;
+    el('vulnsNamespace').value = parsed.vuln.namespace;
+    el('vulnsKev').checked = parsed.vuln.kev;
+    el('vulnsResolved').checked = parsed.vuln.resolved;
+    if (vulnChanged) vulnsState.loaded = false; // reloaded when the tab is shown
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });
