@@ -174,6 +174,27 @@ def anomaly_signature(kb: SignatureKB, anomaly: dict[str, Any]) -> Signature | N
     return None
 
 
+def web_attack_of(rule: Signature | None) -> tuple[str, str]:
+    """(attack_type, confidence) of a matched signature; ("", "") when no web
+    signature (one carrying an attack_type) matched."""
+    if rule is None or not rule.attack_type:
+        return "", ""
+    return rule.attack_type, rule.confidence or ""
+
+
+def classify_anomaly(kb: SignatureKB, store: Any, anomaly: dict[str, Any]) -> tuple[str, str]:
+    """Persist the anomaly's web-attack classification (anomalies.attack_type /
+    attack_confidence) from its signature match, so correlation can query it.
+    Same match as anomaly_template_summary; free (no AI). Returns it."""
+    attack_type, confidence = web_attack_of(anomaly_signature(kb, anomaly))
+    if anomaly.get("id") is not None and (
+            (anomaly.get("attack_type") or "") != attack_type
+            or (anomaly.get("attack_confidence") or "") != confidence):
+        store.set_attack(int(anomaly["id"]), attack_type, confidence)
+        anomaly["attack_type"], anomaly["attack_confidence"] = attack_type or None, confidence or None
+    return attack_type, confidence
+
+
 def anomaly_template_summary(kb: SignatureKB, anomaly: dict[str, Any]) -> dict[str, Any]:
     """The free summary shown before (or instead of) any AI call: what
     changed, counts against the baseline, top templates, matching signature."""
@@ -220,8 +241,8 @@ def anomaly_template_summary(kb: SignatureKB, anomaly: dict[str, Any]) -> dict[s
                        **({"confidence": rule.confidence} if rule.confidence else {}),
                        **({"attack_type": rule.attack_type} if rule.attack_type else {})}
                       if rule else None),
-        # Surfaced for later web->runtime correlation work; empty when no web
-        # signature matched.
+        # Also persisted on the anomaly (classify_anomaly) for web->runtime
+        # correlation (security.py); empty when no web signature matched.
         "attack_type": rule.attack_type if rule else "",
     }
 
@@ -410,4 +431,5 @@ def meta_of(response: dict[str, Any]) -> dict[str, Any]:
     return {k: response.get(k) for k in ("source", "tier", "generated_at", "cache_key", "signature") if response.get(k)}
 
 
-__all__ = ["Explainer", "anomaly_template_summary", "meta_of", "metered_feature", "FILTERED_SAMPLE_ROWS"]
+__all__ = ["Explainer", "anomaly_template_summary", "classify_anomaly", "meta_of", "metered_feature",
+           "web_attack_of", "FILTERED_SAMPLE_ROWS"]

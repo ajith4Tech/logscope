@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .config import URGENCY_ORDER
-from .explain import Explainer, anomaly_cache_key, decorate, meta_of
+from .explain import Explainer, anomaly_cache_key, classify_anomaly, decorate, meta_of
 from .notify import anomaly_urgency
 
 logger = logging.getLogger(__name__)
@@ -163,6 +163,11 @@ class SummaryWorker:
         self.store.save_ai_summary(int(anomaly["id"]), response.get("summary") or "",
                                    response.get("suggested_action") or "", response.get("steps"),
                                    meta=meta_of(response))
+        kb = getattr(self.explainer, "kb", None)
+        if kb is not None:
+            # The web signature's attack_type/confidence goes on the row too,
+            # not only into ai_meta (web->runtime correlation queries it).
+            classify_anomaly(kb, self.store, anomaly)
         self.summarized += 1
 
     def process(self, batch: list[dict[str, Any]]) -> None:

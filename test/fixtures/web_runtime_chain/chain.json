@@ -1,0 +1,86 @@
+{
+  "_comment": "Web -> runtime chain for security-incident correlation (test_security_incidents.py). Distinct from wp_attack_replay: the WordPress pod has been up since 09:05 (cold-start grace 600 s ends 09:15), a Wave-B-shaped wp-login brute force runs at 10:46, and a GENUINE Falco event follows a few minutes later. Detection runs at 'now' (the 10:00-11:00 hour is complete). 'message' is used verbatim; {i} and {ip} are replaced (no str.format, so Falco JSON braces are literal). Variants under 'falco' are inserted one at a time by the tests.",
+  "now": "2026-11-02T11:00:00Z",
+  "specs": [
+    {
+      "name": "history_marker",
+      "scope": "infra", "bucket": "info",
+      "namespace": "kube-system", "pod": "coredns-54996dc9b4-v64rb", "container": "coredns",
+      "count": 1, "start": "2026-10-31T08:00:00Z", "step_s": 1,
+      "message": "[INFO] ready"
+    },
+    {
+      "name": "mysql_startup",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "mysql-0", "container": "mysql",
+      "count": 3, "start": "2026-11-02T09:00:00Z", "step_s": 5,
+      "message": "[Note] mysqld: ready for connections ({i})"
+    },
+    {
+      "name": "wp_startup",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "wordpress",
+      "count": 3, "start": "2026-11-02T09:05:00Z", "step_s": 5,
+      "message": "WordPress ready to handle connections ({i})"
+    },
+    {
+      "name": "idle_baseline",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 20, "start": "2026-11-02T09:15:00Z", "step_s": 120,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:09:15:00 +0000] \"GET / HTTP/1.1\" 200 5120 \"-\" \"Mozilla/5.0 (baseline)\""
+    },
+    {
+      "name": "B_bruteforce",
+      "scope": "namespace", "bucket": "info",
+      "namespace": "sec-test", "pod": "wordpress-7d79967bc8-qjt4c", "container": "accesslog",
+      "count": 400, "start": "2026-11-02T10:46:00Z", "step_s": 0,
+      "message": "10.42.0.{ip} - - [02/Nov/2026:10:46:00 +0000] \"POST /wp-login.php HTTP/1.1\" 200 3598 \"-\" \"attack-probe/1.0\""
+    }
+  ],
+  "falco": {
+    "same_pod": [
+      {
+        "name": "falco_shell_same_pod",
+        "scope": "security", "bucket": "warning",
+        "namespace": "falco", "pod": "falco-vqfb4", "container": "falco",
+        "count": 1, "start": "2026-11-02T10:50:30Z", "step_s": 1,
+        "message": "{\"hostname\":\"k3s-node-1\",\"output\":\"A shell was spawned in a container with an attached terminal (user=www-data proc=sh)\",\"priority\":\"Warning\",\"rule\":\"Terminal shell in container\",\"source\":\"syscall\",\"output_fields\":{\"k8s.ns.name\":\"sec-test\",\"k8s.pod.name\":\"wordpress-7d79967bc8-qjt4c\",\"proc.cmdline\":\"sh -i\",\"user.name\":\"www-data\"}}"
+      }
+    ],
+    "other_pod": [
+      {
+        "name": "falco_shell_other_pod",
+        "scope": "security", "bucket": "info",
+        "namespace": "falco", "pod": "falco-vqfb4", "container": "falco",
+        "count": 1, "start": "2026-11-02T10:52:10Z", "step_s": 1,
+        "message": "Run shell untrusted: 10:52:10.123456789: Notice Shell spawned by untrusted binary (parent_exe=mysqld k8s.ns=sec-test k8s.pod=mysql-0)"
+      }
+    ],
+    "cold_start_pod": [
+      {
+        "name": "new_replica_startup",
+        "scope": "namespace", "bucket": "info",
+        "namespace": "sec-test", "pod": "wordpress-7d79967bc8-n3wpd", "container": "wordpress",
+        "count": 2, "start": "2026-11-02T10:48:00Z", "step_s": 5,
+        "message": "WordPress ready to handle connections ({i})"
+      },
+      {
+        "name": "falco_entrypoint_shell_new_replica",
+        "scope": "security", "bucket": "info",
+        "namespace": "falco", "pod": "falco-vqfb4", "container": "falco",
+        "count": 1, "start": "2026-11-02T10:50:00Z", "step_s": 1,
+        "message": "Run shell untrusted: 10:50:00.123456789: Notice Shell spawned by untrusted binary (parent_exe=docker-entrypoint k8s.ns=sec-test k8s.pod=wordpress-7d79967bc8-n3wpd)"
+      }
+    ],
+    "late_inside_window": [
+      {
+        "name": "falco_shell_ingested_late",
+        "scope": "security", "bucket": "warning",
+        "namespace": "falco", "pod": "falco-vqfb4", "container": "falco",
+        "count": 1, "start": "2026-11-02T11:05:00Z", "step_s": 1,
+        "message": "Run shell untrusted: 11:05:00.123456789: Notice Shell spawned by untrusted binary (parent_exe=apache2 k8s.ns=sec-test k8s.pod=wordpress-7d79967bc8-qjt4c)"
+      }
+    ]
+  }
+}

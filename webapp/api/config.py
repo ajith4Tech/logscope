@@ -115,6 +115,23 @@ DEFAULT_ALERTS = {
     "eval_tick_secs": 30,
 }
 
+DEFAULT_SECURITY = {
+    # Web -> runtime correlation (security.py): a web-attack anomaly followed
+    # by a Falco event in the same namespace becomes a security incident.
+    "correlation_enabled": True,
+    # Look this far past a web-attack anomaly's window end for a Falco event.
+    "correlation_window_s": 900,
+    # Falco events still inside the target pod's (or namespace's) cold-start
+    # grace are never a correlation match. None = webapp.insights.cold_start_grace_s.
+    "cold_start_grace_s": None,
+    # Web-attack anomalies whose window ended longer ago than this (plus the
+    # correlation window) are not correlated any more.
+    "lookback_s": 86400,
+    # Channels (ids from the Alerts tab) a new incident is sent to; empty =
+    # the environment's Mattermost channel (id 0) when it is configured.
+    "notify_channel_ids": [],
+}
+
 # Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
 # against min_urgency.
 URGENCY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
@@ -202,6 +219,18 @@ class AlertsConfig:
 
 
 @dataclass(frozen=True)
+class SecurityConfig:
+    """webapp.security (see DEFAULT_SECURITY)."""
+
+    correlation_enabled: bool = True
+    correlation_window_s: float = 900
+    # None = InsightsConfig.cold_start_grace_s (the existing guard).
+    cold_start_grace_s: float | None = None
+    lookback_s: float = 86400
+    notify_channel_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
 class AppConfig:
     s3_bucket: str
     s3_region: str
@@ -217,6 +246,7 @@ class AppConfig:
     ai: AiConfig
     mattermost: MattermostConfig
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -358,6 +388,17 @@ def load_app_config(config_path: Path) -> AppConfig:
     except Exception:
         raise ValueError(f"webapp.display_tz must be an IANA time zone name, got {display_tz!r}") from None
     public_url = str(webapp.get("public_url") or "").strip().rstrip("/") or link_base_url
+    security = dict(DEFAULT_SECURITY)
+    security.update(webapp.get("security") or {})
+    for key, minimum in (("correlation_window_s", 60), ("lookback_s", 3600)):
+        if float(security[key]) < minimum:
+            raise ValueError(f"webapp.security.{key} must be >= {minimum}, got {security[key]!r}")
+    if security["cold_start_grace_s"] is not None and float(security["cold_start_grace_s"]) < 0:
+        raise ValueError("webapp.security.cold_start_grace_s must be >= 0")
+    notify_ids = security.get("notify_channel_ids") or []
+    if not isinstance(notify_ids, list) or any(isinstance(i, bool) or not isinstance(i, int) or i < 0
+                                               for i in notify_ids):
+        raise ValueError("webapp.security.notify_channel_ids must be a list of channel ids")
     if public_url and not public_url.lower().startswith(("https://", "http://")):
         raise ValueError("webapp.public_url must start with https:// or http://")
 
@@ -427,6 +468,14 @@ def load_app_config(config_path: Path) -> AppConfig:
             watermark_margin_secs=int(alerts["watermark_margin_secs"]),
             s3_batch_timeout_secs=int(alerts["s3_batch_timeout_secs"]),
             eval_tick_secs=float(alerts["eval_tick_secs"]),
+        ),
+        security=SecurityConfig(
+            correlation_enabled=bool(security["correlation_enabled"]),
+            correlation_window_s=float(security["correlation_window_s"]),
+            cold_start_grace_s=(None if security["cold_start_grace_s"] is None
+                                else float(security["cold_start_grace_s"])),
+            lookback_s=float(security["lookback_s"]),
+            notify_channel_ids=tuple(sorted(set(notify_ids))),
         ),
     )
 

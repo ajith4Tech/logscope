@@ -163,6 +163,15 @@ class AnomalyStore:
             if "ai_meta" not in cols:
                 # {source: signature|cache|ai, tier, generated_at, cache_key}
                 cur.execute("ALTER TABLE anomalies ADD COLUMN ai_meta TEXT")
+            if "attack_type" not in cols:
+                # The matched web-attack signature's attack_type and confidence
+                # (low|medium|high), written by explain.classify_anomaly; NULL
+                # when no web signature matched. Older rows are not backfilled.
+                cur.execute("ALTER TABLE anomalies ADD COLUMN attack_type TEXT")
+            if "attack_confidence" not in cols:
+                cur.execute("ALTER TABLE anomalies ADD COLUMN attack_confidence TEXT")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_anomalies_attack ON anomalies(attack_type) "
+                        "WHERE attack_type IS NOT NULL")
             # Regenerate existing cached AI summaries that lack structured steps
             cur.execute(
                 "UPDATE anomalies SET ai_summarized_at = NULL "
@@ -241,7 +250,7 @@ class AnomalyStore:
                     """
                     UPDATE anomalies SET status='new', evidence=?, severity=?, updated_at=?,
                         ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL,
-                        ai_meta=NULL
+                        ai_meta=NULL, attack_type=NULL, attack_confidence=NULL
                     WHERE id=?
                     """,
                     (evidence_json, severity, now, anomaly_id),
@@ -253,7 +262,7 @@ class AnomalyStore:
                     """
                     UPDATE anomalies SET evidence=?, severity=?, updated_at=?,
                         ai_summary=NULL, ai_suggested_action=NULL, ai_steps=NULL, ai_summarized_at=NULL,
-                        ai_meta=NULL
+                        ai_meta=NULL, attack_type=NULL, attack_confidence=NULL
                     WHERE id=?
                     """,
                     (evidence_json, severity, now, anomaly_id),
@@ -303,6 +312,27 @@ class AnomalyStore:
                 (summary, action, steps_json, _utc_now_iso(), meta_json, anomaly_id),
             )
             self._conn.commit()
+
+    @_write
+    def set_attack(self, anomaly_id: int, attack_type: str, confidence: str) -> None:
+        """The anomaly's web-attack classification (see explain.classify_anomaly)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE anomalies SET attack_type=?, attack_confidence=? WHERE id=?",
+                (attack_type or None, confidence or None, anomaly_id),
+            )
+            self._conn.commit()
+
+    def anomalies_by_id(self, ids: list[int]) -> list[dict[str, Any]]:
+        """Raw rows (evidence as stored JSON text) for the given ids."""
+        if not ids:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM anomalies WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
+                (json.dumps(sorted(set(ids))),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def pending_ai_anomalies(self, limit: int) -> list[dict[str, Any]]:
         with self._lock:
@@ -913,9 +943,17 @@ class InsightsJob:
         store: AnomalyStore,
         summarizer: Callable[[dict[str, Any]], dict[str, str] | None] | None = None,
         dispatcher: Callable[[list[dict[str, Any]]], int] | None = None,
+        classifier: Callable[[dict[str, Any]], Any] | None = None,
+        correlator: Any = None,
     ):
         self.cfg = cfg
         self.store = store
+        # Free signature classification of every anomaly this run touched
+        # (explain.classify_anomaly: persists attack_type for correlation).
+        self.classifier = classifier
+        # Web->runtime correlation (security.Correlator), run after detection on
+        # the same cadence; its failure never fails detection.
+        self.correlator = correlator
         self.detector = InsightsDetector(records_conn, cfg.insights)
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -986,6 +1024,11 @@ class InsightsJob:
         now = now or datetime.now(timezone.utc)
         counts = self.detect_once(now)
         self.future_dated_records = self.detector.future_record_count(now)
+        if self.correlator is not None:
+            try:
+                counts.update(self.correlator.run_once(now))
+            except Exception as exc:  # noqa: BLE001 - visible in /api/status (security.last_error)
+                logger.warning("Security correlation failed (%s)", type(exc).__name__)
         if self._dispatcher is not None:
             counts["anomalies_queued"] = self.dispatch_pending()
         else:
@@ -1000,12 +1043,13 @@ class InsightsJob:
     def detect_once(self, now: datetime) -> dict[str, int]:
         counts = {"anomalies_created": 0, "anomalies_updated": 0, "anomalies_recurred": 0,
                   "anomalies_unchanged": 0, "anomalies_suppressed": 0}
+        touched: list[int] = []
         for anomaly in self.detector.detect_all(now):
             # The day of the window, not of the run: the previous hour checked
             # just after midnight belongs to the day before.
             day = str(anomaly["evidence"].get("window_start") or now.strftime("%Y-%m-%d"))[:10]
             status = "suppressed_cold_start" if anomaly.get("suppressed") else "new"
-            _, outcome = self.store.record_detection(
+            anomaly_id, outcome = self.store.record_detection(
                 type=anomaly["type"],
                 namespace=anomaly["namespace"],
                 pod=anomaly["pod"],
@@ -1016,6 +1060,14 @@ class InsightsJob:
                 status=status,
             )
             counts[f"anomalies_{outcome}"] += 1
+            if outcome != "unchanged":
+                touched.append(anomaly_id)
+        if self.classifier is not None and touched:
+            for row in self.store.anomalies_by_id(touched):
+                try:
+                    self.classifier(row)
+                except Exception as exc:  # noqa: BLE001 - classification never fails detection
+                    logger.warning("Classifying anomaly %s failed (%s)", row.get("id"), type(exc).__name__)
         return counts
 
     def dispatch_pending(self) -> int:

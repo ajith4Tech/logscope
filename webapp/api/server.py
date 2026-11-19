@@ -55,13 +55,24 @@ from .ai_summary import (
     summarize_anomaly,
 )
 from .alerts import AlertEngine, AlertRules, RuleError, backtest
-from .channels import ChannelError, ChannelStore
+from .channels import ENV_CHANNEL_ID, ChannelError, ChannelStore
 from .config import AppConfig, falco_warnings, load_app_config, prefix_root, source_prefixes
-from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, meta_of
+from .explain import FILTERED_SAMPLE_ROWS, Explainer, anomaly_template_summary, classify_anomaly, meta_of
 from .ingest import S3Ingestor, _key_time_format
 from .insights import AnomalyStore, InsightsJob
 from .nl_filters import NlFilterError, NlFilters
 from .notify import MattermostNotifier
+from .security import (
+    GROUP_PREFIX,
+    INCIDENT_STATES,
+    Correlator,
+    IncidentAi,
+    IncidentError,
+    IncidentStore,
+    clean_actor,
+    incident_detail,
+    incident_message,
+)
 from .signatures import SignatureKB, load_rules
 from .state import SavedViews, StateDB, ViewError, ViewNotFound, default_state_db_path
 from .storage import FILTER_FIELDS, MAX_SQLITE_INT, LogStorage, decode_cursor, open_connection
@@ -663,6 +674,46 @@ class LogscopeHandler(BaseHTTPRequestHandler):
             self._send_json(payload, status=exc.status)
         return True
 
+    def _handle_security(self, method: str, path: str) -> bool:
+        """/api/security/incidents[/<id>[/acknowledge|/resolve]]: reads are
+        open (like alert reads); acknowledge and resolve need the admin token
+        on top of the Origin check every POST gets."""
+        parts = path.strip("/").split("/")
+        if parts[:3] != ["api", "security", "incidents"] or len(parts) > 5:
+            return False
+        app = self.server.app
+        incident_id = None
+        if len(parts) >= 4:
+            try:
+                incident_id = _bounded_int(parts[3], "id")
+            except ValueError:
+                self._send_json({"error": "Not found"}, status=404)
+                return True
+        action = parts[4] if len(parts) == 5 else None
+        try:
+            if incident_id is None:
+                if method != "GET":
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                else:
+                    self._send_json(app.api_incidents(parse_qs(urlparse(self.path).query)))
+            elif action is None:
+                if method != "GET":
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                else:
+                    self._send_json({"incident": app.api_incident(incident_id)})
+            elif action in ("acknowledge", "resolve"):
+                if method != "POST":
+                    self._send_json({"error": "Method not allowed"}, status=405)
+                elif self._admin_authorized():
+                    by = clean_actor(self._read_body_json())
+                    self._send_json({"incident": app.incidents.transition(
+                        incident_id, action, by, datetime.now(timezone.utc))})
+            else:
+                self._send_json({"error": "Not found"}, status=404)
+        except IncidentError as exc:
+            self._send_json({"error": str(exc)}, status=exc.status)
+        return True
+
     def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
@@ -726,6 +777,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if self._handle_settings("GET", parsed.path):
             return
         if self._handle_alerts("GET", parsed.path):
+            return
+        if self._handle_security("GET", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -861,6 +914,8 @@ class LogscopeHandler(BaseHTTPRequestHandler):
         if self._handle_settings("POST", parsed.path):
             return
         if self._handle_alerts("POST", parsed.path):
+            return
+        if self._handle_security("POST", parsed.path):
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -1060,6 +1115,22 @@ class WebApp:
         self.summary_worker = SummaryWorker(
             self.explainer, self.anomaly_store, min_urgency=lambda: self.cfg.ai.auto_summary_min_urgency,
             triage_min_urgency=lambda: self.cfg.ai.auto_triage_min_urgency)
+        # Web -> runtime correlation (security.py): every anomaly the insights
+        # run touches gets its web-attack classification (free signature
+        # match), then the correlator runs on the same cadence (no new thread).
+        self.insights.classifier = lambda anomaly: classify_anomaly(self.signatures, self.anomaly_store, anomaly)
+        self.incidents = IncidentStore(cfg.webapp.db_path)
+        self.incident_ai = IncidentAi(
+            self.incidents, self.anomaly_store, kb=self.signatures, service=self.ai, settings=self.ai_settings,
+            cache=self.ai_cache, complete=lambda system, user, ai_cfg: complete_json(system, user, ai_cfg),
+            configured=lambda: self.ai_configured())
+        self.correlator = Correlator(
+            cfg, self.incidents, open_connection(cfg.webapp.db_path), notify=self._notify_incident,
+            ai_dispatch=self.incident_ai.enqueue, complete_until=self._complete_until)
+        self.insights.correlator = self.correlator
+        self.alerts.register_source(
+            GROUP_PREFIX, channels=lambda event: self.incident_channel_ids() or "no channels",
+            message=self._incident_event_message)
         # kubectl actions run with this process's credentials and the HTTP API
         # has no auth of its own, so they are opt-in: LOGSCOPE_ACTIONS_ENABLED=true.
         self.actions_enabled = _env_flag("LOGSCOPE_ACTIONS_ENABLED", False)
@@ -1102,6 +1173,7 @@ class WebApp:
         if self.cfg.insights.enabled:
             self.insights.start()
         self.summary_worker.start()
+        self.incident_ai.start()
         self.notifier.start()
         self.alerts.start()
 
@@ -1117,6 +1189,7 @@ class WebApp:
         if self.cfg.insights.enabled:
             self.insights.stop()
         self.summary_worker.stop()
+        self.incident_ai.stop()
         self.notifier.stop()
         self.alerts.stop()
 
@@ -1282,6 +1355,10 @@ class WebApp:
         status["actions_enabled"] = self.actions_enabled
         status["insights"] = self.insights.status()
         try:
+            status["security"] = {**self.correlator.status(), "ai_last_error": self.incident_ai.last_error}
+        except sqlite3.Error as exc:
+            status["security"] = {"status_error": type(exc).__name__}
+        try:
             # Alert windows end here, not at now (see alerts.compute_watermark).
             status["watermark"] = self.alerts.watermark()
             status["alerts"] = {"firing": self.alerts.firing_count(), "pipeline_stale": self.alerts.pipeline_firing(),
@@ -1321,6 +1398,49 @@ class WebApp:
         if self.notifier.configured:
             self.notifier.send_text(text)
 
+    # -- security incidents --------------------------------------------------------
+
+    def incident_channel_ids(self) -> list[int]:
+        """webapp.security.notify_channel_ids that exist, else the
+        environment channel when it is configured; [] = nowhere to send."""
+        known = self.alert_channels.ids()
+        configured = list(self.cfg.security.notify_channel_ids)
+        if configured:
+            ids = [c for c in configured if c in known]
+            if not ids:
+                logger.warning("None of webapp.security.notify_channel_ids exists; incidents are not sent")
+            return ids
+        return [ENV_CHANNEL_ID] if ENV_CHANNEL_ID in known else []
+
+    def _notify_incident(self, incident: dict) -> int | None:
+        """Queue a new incident's notification (durable alert delivery); None
+        when no channel is configured (the incident is still recorded)."""
+        if not self.incident_channel_ids():
+            return None
+        return self.alerts.notify_external(f"{GROUP_PREFIX}{incident['id']}",
+                                           detail=json.dumps({"incident_id": incident["id"]}))
+
+    def _incident_event_message(self, event: dict):
+        incident_id = int(str(event["group_key"])[len(GROUP_PREFIX):])
+        incident = self.incidents.get(incident_id) or {"id": incident_id}
+        return incident_message(incident, public_url=self.cfg.alerts.public_url, when=self.alerts._when)
+
+    def _complete_until(self, now: datetime) -> datetime | None:
+        """Data is complete up to the ingest watermark (as for alerts)."""
+        at = self.alerts.watermark(now).get("at")
+        return datetime.fromisoformat(str(at).replace("Z", "+00:00")) if at else None
+
+    def api_incidents(self, params: dict[str, list[str]]) -> dict:
+        state = _first(params, "state")
+        if state and state not in INCIDENT_STATES:
+            raise ValueError(f"'state' must be one of {list(INCIDENT_STATES)}")
+        limit = _coerce_limit(_first(params, "limit"), 100, 500)
+        return {"items": self.incidents.list(state=state, limit=limit), "counts": self.incidents.counts()}
+
+    def api_incident(self, incident_id: int) -> dict:
+        return incident_detail(self.incidents, incident_id, anomalies=self.anomaly_store, storage=self.storage,
+                               kb=self.signatures, public_url=self.cfg.alerts.public_url)
+
     def _dispatch_summaries(self, anomalies: list[dict]) -> int:
         """Insights' hand-off: queues anomalies for automatic summaries
         (anomaly_auto_summary on, urgency at or above the configured minimum)."""
@@ -1337,6 +1457,7 @@ class WebApp:
             self.anomaly_store.save_ai_summary(
                 anomaly_id, result["summary"], result.get("suggested_action", ""), result.get("steps"),
                 meta=meta_of(result))
+            classify_anomaly(self.signatures, self.anomaly_store, anomaly)
         return {**result, "id": anomaly_id}
 
     def api_ai_feedback(self, body: dict, client_id: str | None) -> dict:
@@ -1408,6 +1529,11 @@ class WebApp:
         for item in result["items"]:
             # Free: what changed, counts vs baseline, top templates, signature.
             item["template_summary"] = anomaly_template_summary(self.signatures, item)
+            # A web signature found here is persisted when not stored yet
+            # (an anomaly detected before attack_type existed is not backfilled
+            # otherwise); unchanged rows are not written.
+            if item["template_summary"].get("attack_type") and not item.get("attack_type"):
+                classify_anomaly(self.signatures, self.anomaly_store, item)
         return result
 
     def api_dashboard(self, params: dict[str, list[str]]) -> dict:
