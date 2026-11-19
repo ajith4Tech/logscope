@@ -2062,6 +2062,114 @@ function showInsightsError(message) {
   setPanelState(el('insightsEmpty'), 'error', { message, action: { label: 'Retry', onClick: () => loadInsights().catch(() => {}) } });
 }
 
+// ─── Security incidents (web attack -> Falco runtime event) ─────────────────
+// Open and acknowledged incidents above the anomaly list. Reads are open;
+// acknowledge / resolve send the Settings admin token (alertsRequest).
+
+const incidentsState = { items: [], requestId: 0, busy: new Set() };
+
+function incidentGap(seconds) {
+  const total = Math.round(Number(seconds));
+  if (!Number.isFinite(total)) return '?';
+  const minutes = Math.floor(Math.abs(total) / 60);
+  const secs = Math.abs(total) % 60;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  return minutes ? `${minutes} min ${secs} s` : `${secs} s`;
+}
+
+function incidentLogsHref(incident) {
+  const start = Date.parse(incident.web_started_at || '');
+  const end = Date.parse(incident.falco_ts || '');
+  const params = new URLSearchParams({ tab: 'logs' });
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    params.set('from', new Date(Math.min(start, end) - 60000).toISOString());
+    params.set('to', new Date(Math.max(start, end) + 60000).toISOString());
+  }
+  return `?${params.toString()}`;
+}
+
+function incidentCardMarkup(incident) {
+  const id = Number(incident.id);
+  const where = [incident.namespace, incident.pod].filter(Boolean).join(' / ');
+  const severity = incident.severity === 'critical' ? 'critical' : 'high';
+  const match = incident.confidence === 'high' ? 'same or adjacent pod' : 'same namespace, another pod';
+  const busy = incidentsState.busy.has(id);
+  const acked = incident.state === 'acknowledged';
+  const ai = incident.ai_summary
+    ? `<p class="incident-ai"><span class="source-badge source-${escapeHtml(incident.ai_meta?.source || 'ai')}">${escapeHtml(incident.ai_meta?.source === 'signature' ? 'Known pattern' : 'AI')}</span> ${escapeHtml(incident.ai_summary)}</p>`
+    : '';
+  return `<article class="incident-card incident-${severity}${acked ? ' incident-acked' : ''}" data-incident-id="${id}">
+      <header class="incident-title">
+        <span class="badge incident-sev">${escapeHtml(severity)}</span>
+        <strong>Security incident #${id}</strong>
+        <span class="subtle">${escapeHtml(where || '—')}</span>
+        ${acked ? `<span class="subtle">· acknowledged${incident.acknowledged_by ? ` by ${escapeHtml(incident.acknowledged_by)}` : ''}</span>` : ''}
+      </header>
+      <dl class="incident-facts">
+        <dt>Web attack</dt><dd><code>${escapeHtml(incident.attack_type || '—')}</code> <span class="subtle">(signature confidence ${escapeHtml(incident.attack_confidence || 'n/a')}) · ${escapeHtml(formatDateTime(incident.web_started_at))}</span></dd>
+        <dt>Falco rule</dt><dd><code>${escapeHtml(incident.falco_rule || '—')}</code> <span class="subtle">· ${escapeHtml(formatDateTime(incident.falco_ts))}</span></dd>
+        <dt>Correlation</dt><dd>${escapeHtml(incidentGap(incident.gap_s))} later · ${escapeHtml(incident.confidence || '')} (${escapeHtml(match)})</dd>
+      </dl>
+      ${ai}
+      <div class="incident-actions">
+        <a class="incident-link" href="${escapeHtml(incidentLogsHref(incident))}">Logs for both events</a>
+        ${acked ? '' : `<button type="button" class="ghost" data-incident-action="acknowledge"${busy ? ' disabled' : ''}>Acknowledge</button>`}
+        <button type="button" class="destructive-btn" data-incident-action="resolve"${busy ? ' disabled' : ''}>Resolve</button>
+      </div>
+    </article>`;
+}
+
+function renderIncidents() {
+  const section = el('incidentsSection');
+  const active = incidentsState.items.filter((i) => i.state === 'open' || i.state === 'acknowledged');
+  section.hidden = active.length === 0 && el('incidentsError').hidden;
+  const open = active.filter((i) => i.state === 'open').length;
+  el('incidentsCount').textContent = active.length ? `${open} open · ${active.length - open} acknowledged` : '';
+  el('incidentRows').innerHTML = active.map(incidentCardMarkup).join('');
+}
+
+async function loadIncidents() {
+  const requestId = ++incidentsState.requestId;
+  try {
+    const data = await fetchJson('/api/security/incidents?limit=100');
+    if (requestId !== incidentsState.requestId) return;
+    incidentsState.items = Array.isArray(data.items) ? data.items : [];
+    el('incidentsError').hidden = true;
+  } catch (err) {
+    if (requestId !== incidentsState.requestId) return;
+    el('incidentsError').textContent = `Failed to load security incidents: ${err.message}`;
+    el('incidentsError').hidden = false;
+  }
+  renderIncidents();
+}
+
+async function incidentAction(id, action) {
+  incidentsState.busy.add(id);
+  renderIncidents();
+  try {
+    const data = await alertsRequest(`/api/security/incidents/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST', body: {}, admin: true });
+    const updated = data.incident;
+    incidentsState.items = incidentsState.items.map((item) => (item.id === id && updated ? updated : item));
+  } catch (err) {
+    const message = err instanceof SettingsAuthError
+      ? 'Enter a valid admin token in Settings to acknowledge or resolve incidents.'
+      : `Could not ${action} incident #${id}: ${err.message}`;
+    showToast(message, { key: 'incident-action' });
+  } finally {
+    incidentsState.busy.delete(id);
+    renderIncidents();
+  }
+}
+
+el('incidentRows').addEventListener('click', (ev) => {
+  const button = ev.target instanceof Element ? ev.target.closest('[data-incident-action]') : null;
+  if (!button || button.disabled) return;
+  const card = button.closest('[data-incident-id]');
+  const id = Number(card?.dataset.incidentId);
+  if (Number.isFinite(id)) incidentAction(id, button.dataset.incidentAction).catch(() => {});
+});
+
 // Returns the in-flight load when one is running, so callers can await it.
 function loadInsights() {
   if (state.insightsLoading && state.insightsPromise) return state.insightsPromise;
@@ -2071,6 +2179,7 @@ function loadInsights() {
 
 async function fetchInsights() {
   const requestId = ++state.insightsRequestId;
+  loadIncidents().catch(() => {});
   state.insightsLoading = true;
   state.insightsLoaded = false;
   if (!state.anomalies.length) {

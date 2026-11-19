@@ -357,6 +357,15 @@
               <button id="refreshInsights" class="ghost">Refresh</button>
             </div>
           </div>
+          <section id="incidentsSection" class="incidents" aria-labelledby="incidentsTitle" hidden>
+            <div class="incidents-head">
+              <h3 id="incidentsTitle">Security incidents</h3>
+              <span id="incidentsCount" class="subtle"></span>
+            </div>
+            <p class="subtle incidents-help">A web attack followed by a Falco runtime event in the same namespace. Acknowledge and resolve need the admin token (Settings).</p>
+            <div id="incidentsError" class="views-error" hidden></div>
+            <div id="incidentRows" class="incident-rows"></div>
+          </section>
           <div id="insightsEmpty" class="panel-state-host" hidden></div>
           <div id="anomalyRows" class="anomaly-rows"></div>
         </div>

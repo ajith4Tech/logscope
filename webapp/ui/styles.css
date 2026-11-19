@@ -4316,3 +4316,83 @@ button.explain-meta-btn[aria-pressed="true"] {
     justify-self: stretch;
   }
 }
+
+/* ─── Security incidents (Insights tab) ─────────────────────────────────── */
+.incidents {
+  margin: 0 0 16px;
+}
+.incidents-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.incidents-head h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.incidents-help {
+  margin: 4px 0 8px;
+}
+.incident-rows {
+  display: grid;
+  gap: 8px;
+}
+.incident-card {
+  border: 1px solid var(--error-border);
+  border-left: 4px solid var(--error);
+  background: var(--error-bg);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.incident-card.incident-high {
+  border-left-color: var(--danger);
+}
+.incident-card.incident-acked {
+  opacity: 0.85;
+}
+.incident-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.incident-sev {
+  background: var(--danger);
+  color: var(--on-danger);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.incident-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 8px 0;
+}
+.incident-facts dt {
+  color: var(--muted, inherit);
+  font-weight: 600;
+}
+.incident-facts dd {
+  margin: 0;
+  min-width: 0;
+}
+.incident-ai {
+  margin: 6px 0;
+}
+.incident-link {
+  margin-right: auto;
+}
+.incident-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+@media (max-width: 600px) {
+  .incident-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
