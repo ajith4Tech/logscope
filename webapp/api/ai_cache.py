@@ -23,7 +23,7 @@ FRONT_TTL_SECS = 60.0
 SINGLE_FLIGHT_WAIT_SECS = 600.0
 _PRUNE_EVERY_SECS = 3600.0
 DROP_NET_DOWN = 2
-KINDS = ("line", "filtered", "anomaly", "nl_filters")
+KINDS = ("line", "filtered", "anomaly", "nl_filters", "incident")
 TIERS = ("fast", "deep")
 
 
