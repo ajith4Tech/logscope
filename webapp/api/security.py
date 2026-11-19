@@ -22,7 +22,13 @@ detection run, so no extra thread):
     high) is taken only once the window is complete, so a later same-pod
     event in the window still wins;
   * a window that completes (ingest watermark past its end) without a match
-    is recorded as checked and never re-opened.
+    is recorded as checked and never re-opened;
+  * except a web_behavioral occurrence (behavioral.py), which is updated in
+    place while the behavior continues: its check keeps a checked_until
+    point and is not final while the occurrence is open (quiet for less than
+    webapp.security.behavioral.cooldown_s since its last request). Each run
+    re-checks it from max(checked_until, attack start) to its horizon; once
+    it is closed and checked to its horizon the check becomes final.
 
 State is in the cache database next to the anomalies it links
 (security_incidents, security_correlation_checks); one incident per
@@ -117,6 +123,14 @@ _SCHEMA = (
     )
     """,
 )
+# Added after the table shipped (ALTERed in when missing): how far a
+# non-final check has searched (epoch seconds), and whether it is final.
+# Existing rows, and every one-shot (signature) check, are final.
+_CHECK_COLUMNS = (
+    ("checked_until", "ALTER TABLE security_correlation_checks ADD COLUMN checked_until REAL"),
+    ("final", "ALTER TABLE security_correlation_checks ADD COLUMN final INTEGER NOT NULL DEFAULT 1"),
+)
+BEHAVIORAL_TYPE = "web_behavioral"
 
 
 class IncidentError(Exception):
@@ -238,6 +252,10 @@ class IncidentStore:
         with self._lock:
             for statement in _SCHEMA:  # additive: an existing database gains the tables
                 self._conn.execute(statement)
+            columns = {r[1] for r in self._conn.execute("PRAGMA table_info(security_correlation_checks)")}
+            for name, statement in _CHECK_COLUMNS:
+                if name not in columns:
+                    self._conn.execute(statement)
             self._conn.commit()
 
     @property
@@ -306,11 +324,20 @@ class IncidentStore:
             return incident_id
 
     @_write
-    def record_no_match(self, anomaly_id: int, window_start: str, now: datetime) -> None:
+    def record_no_match(self, anomaly_id: int, window_start: str, now: datetime, *,
+                        checked_until: float | None = None, final: bool = True) -> None:
+        """A check without a match. final (the default, one-shot anomalies):
+        never correlated again. Not final (an open web_behavioral occurrence):
+        searched up to checked_until, re-checked from there on later runs."""
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO security_correlation_checks (anomaly_id, window_start, outcome, checked_at) "
-                "VALUES (?, ?, 'no_match', ?)", (anomaly_id, window_start, _iso(now)))
+                "INSERT INTO security_correlation_checks "
+                "(anomaly_id, window_start, outcome, checked_at, checked_until, final) "
+                "VALUES (?, ?, 'no_match', ?, ?, ?) "
+                "ON CONFLICT (anomaly_id, window_start) DO UPDATE SET checked_at = excluded.checked_at, "
+                "checked_until = MAX(COALESCE(checked_until, 0), COALESCE(excluded.checked_until, 0)), "
+                "final = excluded.final WHERE outcome = 'no_match' AND final = 0",
+                (anomaly_id, window_start, _iso(now), checked_until, int(final)))
             self._conn.commit()
 
     @_write
@@ -466,13 +493,15 @@ class Correlator:
         cutoff = _iso(now - timedelta(seconds=float(self.cfg.security.lookback_s) + self.window_s))
         return self._rows(
             """
-            SELECT a.* FROM anomalies a
+            SELECT a.*, c.checked_until AS correlation_checked_until FROM anomalies a
+            LEFT JOIN security_correlation_checks c
+              ON c.anomaly_id = a.id AND c.window_start = json_extract(a.evidence, '$.window_start')
             WHERE a.attack_type IS NOT NULL AND a.attack_type != ''
               AND a.status IN ('new', 'reviewed')
               AND json_extract(a.evidence, '$.window_end') >= ?
               AND NOT EXISTS (SELECT 1 FROM security_incidents i WHERE i.web_anomaly_id = a.id)
-              AND NOT EXISTS (SELECT 1 FROM security_correlation_checks c WHERE c.anomaly_id = a.id
-                              AND c.window_start = json_extract(a.evidence, '$.window_start'))
+              -- no check yet, or a non-final one (an open web_behavioral occurrence)
+              AND (c.anomaly_id IS NULL OR (c.outcome = 'no_match' AND c.final = 0))
             ORDER BY a.id LIMIT ?
             """, (cutoff, CANDIDATE_BATCH))
 
@@ -511,15 +540,49 @@ class Correlator:
             return "skipped"
         horizon = window_end + timedelta(seconds=self.window_s)
         window_complete = complete is not None and complete >= horizon
-        same, other = self._match(anomaly, namespace, started, horizon)
+        behavioral = anomaly.get("type") == BEHAVIORAL_TYPE
+        lower = started
+        if behavioral and anomaly.get("correlation_checked_until") is not None:
+            # Searched up to here on an earlier run: continue from there.
+            lower = max(started, datetime.fromtimestamp(float(anomaly["correlation_checked_until"]), timezone.utc))
+        same, other = self._match(anomaly, namespace, lower, horizon)
         record, high = (same, True) if same is not None else (other, False)
         if record is None or (not high and not window_complete):
-            if record is None and window_complete:
-                self.store.record_no_match(int(anomaly["id"]), window_start, now)
-                return "no_match"
-            return "waiting"  # an incomplete window: a (same-pod) match may still come
+            if not behavioral:
+                if record is None and window_complete:
+                    self.store.record_no_match(int(anomaly["id"]), window_start, now)
+                    return "no_match"
+                return "waiting"  # an incomplete window: a (same-pod) match may still come
+            return self._behavioral_progress(anomaly, evidence, window_start, now, complete, horizon,
+                                             lower, pending=record is not None)
         incident_id = self._open(anomaly, evidence, record, high, started, window_start, now)
         return "incident" if incident_id is not None else "exists"
+
+    def _occurrence_closed(self, evidence: dict[str, Any], now: datetime) -> bool:
+        """A web_behavioral occurrence is over once it has been quiet for
+        cooldown_s since its last request (as AnomalyStore.record_behavioral
+        decides: a later request then opens a new row)."""
+        last = _parse(evidence.get("last_seen")) or _parse(evidence.get("window_end"))
+        cooldown = float(self.cfg.security.behavioral.cooldown_s)
+        return last is None or (now - last).total_seconds() > cooldown
+
+    def _behavioral_progress(self, anomaly: dict[str, Any], evidence: dict[str, Any], window_start: str,
+                             now: datetime, complete: datetime | None, horizon: datetime, lower: datetime,
+                             *, pending: bool) -> str:
+        """No incident this run for an updating web_behavioral occurrence:
+        record how far it has been searched (to the watermark, at most its
+        horizon), and make the check final once the occurrence is closed and
+        searched to its horizon. A namespace-only match still waiting for its
+        window to complete (pending) holds the point where it is."""
+        if complete is None or pending:
+            return "waiting"
+        reached = min(complete, horizon)
+        final = complete >= horizon and self._occurrence_closed(evidence, now)
+        if reached <= lower and not final:
+            return "waiting"
+        self.store.record_no_match(int(anomaly["id"]), window_start, now,
+                                   checked_until=max(reached, lower).timestamp(), final=final)
+        return "no_match" if final else "checked"
 
     def _match(self, anomaly: dict[str, Any], namespace: str, start: datetime,
                end: datetime) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:

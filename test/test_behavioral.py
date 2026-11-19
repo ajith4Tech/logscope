@@ -429,3 +429,100 @@ def test_web_app_runs_it_on_the_insights_cycle_and_lists_it(tmp_path, monkeypatc
     assert listed[0]["attack_type"] == "scanning"  # not overwritten by the signature write-back
     assert app.status()["security"]["behavioral"]["last_counts"]["behavioral_created"] == 1
 
+
+# ─── correlation of a continuing (updated-in-place) occurrence ───────────────
+
+
+def _falco_same_pod(at: str, key: str) -> list[dict]:
+    hhmmss = at[11:19]
+    spec = {**_fixture()["falco_same_pod"], "start": at,
+            "plain": f"Run shell untrusted: {hhmmss}.123456789: Notice Shell spawned by untrusted binary "
+                     f"(parent_exe=apache2 k8s.ns=shop k8s.pod={WP_POD})"}
+    return _expand(spec, key=key)
+
+
+def _checks(db: Path) -> list[dict]:
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(r) for r in conn.execute("SELECT * FROM security_correlation_checks ORDER BY anomaly_id")]
+    finally:
+        conn.close()
+
+
+def test_continuing_occurrence_is_rechecked_after_a_no_match(tmp_path):
+    h = Harness(tmp_path, "brute_force")  # requests 10:56:00-10:58:57
+    h.run(NOW)
+    [brute] = h.behavioral_rows()
+    incidents = IncidentStore(h.db)
+    correlator = Correlator(h.cfg, incidents, h.storage._conn)
+    # First check after its correlation window (11:00 + 900 s) has passed: no Falco event.
+    assert correlator.run_once(NOW + timedelta(minutes=16))["incidents_created"] == 0
+    [check] = _checks(h.db)
+    assert check["anomaly_id"] == brute["id"] and check["outcome"] == "no_match"
+    assert check["final"] == 0  # the occurrence is still open (quiet < cooldown_s): not final
+    # The attack resumes 25 min later, inside cooldown_s (1800): the same row is updated.
+    resume = timedelta(minutes=25)
+    h.add("brute_force", shift=resume)  # 11:21:00-11:23:57
+    assert h.run(NOW + resume)["behavioral_updated"] == 1
+    assert [a["id"] for a in h.behavioral_rows()] == [brute["id"]]
+    # Then a shell in the same pod, after the second update.
+    h.storage.insert_records(_falco_same_pod("2026-11-02T11:30:00Z", "late-shell"))
+    counts = correlator.run_once(NOW + timedelta(minutes=31))
+    assert counts["incidents_created"] == 1
+    [incident] = incidents.list()
+    assert incident["web_anomaly_id"] == brute["id"] and incident["confidence"] == "high"
+    assert incident["falco_ts"] == "2026-11-02T11:30:00Z"
+
+
+def test_cooled_down_occurrence_gets_no_late_incident_from_an_old_falco_event(tmp_path):
+    h = Harness(tmp_path, "brute_force")
+    h.run(NOW)
+    incidents = IncidentStore(h.db)
+    correlator = Correlator(h.cfg, incidents, h.storage._conn)
+    correlator.run_once(NOW + timedelta(minutes=16))  # progress, not final: still within cooldown
+    # Quiet past cooldown_s (last request 10:58:57 + 1800 s): the occurrence is closed.
+    closed_at = NOW + timedelta(minutes=40)
+    assert correlator.run_once(closed_at)["correlation_no_match"] == 1
+    assert _checks(h.db)[0]["final"] == 1
+    # An old same-pod Falco event inside the original window, ingested late: no incident.
+    h.storage.insert_records(_falco_same_pod("2026-11-02T11:05:00Z", "old-shell"))
+    later = correlator.run_once(closed_at + timedelta(minutes=30))
+    assert later["incidents_created"] == 0 and later["correlation_checked"] == 0
+    assert incidents.list() == []
+
+
+def test_signature_tagged_anomalies_stay_one_shot(tmp_path):
+    """The non-behavioral path is unchanged: its first no-match on a complete
+    window is final, even while its row is still being refreshed."""
+    import test_security_incidents as chain
+
+    h = chain.Harness(tmp_path)  # wp-login brute force, a message_frequency anomaly (attack_type brute-force)
+    h.job.detect_once(chain.NOW)
+    web = h.web_anomaly()
+    assert web["type"] == "message_frequency" and web["attack_type"]
+    assert h.correlator.run_once(chain.AFTER_WINDOW)["correlation_no_match"] == 1
+    [check] = _checks(h.db)
+    assert check["final"] == 1 and check["checked_until"] is None
+    # Re-detection refreshes the row; a same-pod event inside its window then arrives late.
+    h.job.detect_once(chain.NOW + timedelta(minutes=5))
+    h.add("late_inside_window")
+    later = h.correlator.run_once(chain.AFTER_WINDOW + timedelta(hours=1))
+    assert later["correlation_checked"] == 0 and h.incidents.list() == []
+
+
+def test_existing_checks_table_gains_the_columns_and_old_rows_are_final(tmp_path):
+    db = tmp_path / "cache.sqlite"
+    LogStorage(db)
+    AnomalyStore(db)
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE security_correlation_checks (anomaly_id INTEGER NOT NULL, window_start TEXT NOT NULL, "
+                 "outcome TEXT NOT NULL CHECK (outcome IN ('incident', 'no_match')), checked_at TEXT NOT NULL, "
+                 "PRIMARY KEY (anomaly_id, window_start))")
+    conn.execute("INSERT INTO security_correlation_checks VALUES (7, 'w', 'no_match', 'x')")
+    conn.commit()
+    conn.close()
+    IncidentStore(db)
+    IncidentStore(db)  # idempotent
+    assert _checks(db) == [{"anomaly_id": 7, "window_start": "w", "outcome": "no_match", "checked_at": "x",
+                            "checked_until": None, "final": 1}]
