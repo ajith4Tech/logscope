@@ -475,6 +475,10 @@ class AlertEngine:
         self._started = clock()
         self._last_prune: datetime | None = None
         self._threads: list[threading.Thread] = []
+        # Rule-less notifications from other detectors (e.g. security
+        # incidents), by group_key prefix: (channel ids for an event, message).
+        self._sources: dict[str, tuple[Callable[[dict[str, Any]], list[int] | str],
+                                       Callable[[dict[str, Any]], Message]]] = {}
         self.last_tick_at: str | None = None
         self.last_error: str | None = None
         self.rebuild()
@@ -528,11 +532,15 @@ class AlertEngine:
                 "GROUP BY rule_id, group_key").fetchall()
         groups: dict[tuple[int | None, str], GroupState] = {}
         for row in rows:
+            if row["rule_id"] is None and row["group_key"] != PIPELINE_GROUP:
+                continue  # an external notification (notify_external): no evaluation state
             state = row["state"] if row["state"] in ("ok", "pending", "firing", "resolved") else "ok"
             groups[(row["rule_id"], row["group_key"])] = GroupState(
                 state=state, streak=int(row["streak"] or 0), value=row["value"], since=row["ts"],
                 last_window_end=_parse(row["window_end"]), last_result=state)
         for rule_id, group_key, ts in notified:
+            if rule_id is None and group_key != PIPELINE_GROUP:
+                continue
             groups.setdefault((rule_id, group_key), GroupState()).last_notified_at = _parse(ts)
         with self._lock:
             self._groups = groups
@@ -557,6 +565,35 @@ class AlertEngine:
         if notify:
             self._wake.set()
         return int(cur.lastrowid)
+
+    # -- external notifications ---------------------------------------------------------
+
+    def register_source(self, prefix: str, *, channels: Callable[[dict[str, Any]], list[int] | str],
+                        message: Callable[[dict[str, Any]], Message]) -> None:
+        """Rule-less notifications whose group_key starts with `prefix` go to
+        channels(event) (a list of ids, or why they cannot be sent) and are
+        rendered by message(event), through the same durable delivery."""
+        self._sources[prefix] = (channels, message)
+
+    def _source(self, group_key: str):
+        for prefix, source in self._sources.items():
+            if group_key.startswith(prefix):
+                return source
+        return None
+
+    def notify_external(self, group_key: str, *, detail: str | None = None) -> int:
+        """Queue one notification for a registered source, at most once per
+        group_key: a repeat (e.g. after a restart) returns the existing
+        event id instead of sending again."""
+        if group_key == PIPELINE_GROUP or self._source(group_key) is None:
+            raise ValueError(f"no notification source for {group_key!r}")
+        with self._db.lock:
+            row = self._db.conn.execute(
+                "SELECT id FROM alert_events WHERE rule_id IS NULL AND group_key = ? ORDER BY id LIMIT 1",
+                (group_key,)).fetchone()
+            if row is not None:
+                return int(row[0])
+            return self._event(None, group_key, "", "firing", notify=True, detail=detail)
 
     def prune(self) -> int:
         """Events older than KEEP_DAYS in batches, keeping the latest event of
@@ -773,7 +810,8 @@ class AlertEngine:
     def _event_channels(self, event: dict[str, Any]) -> list[int] | str:
         """The channel ids an event goes to, or why it cannot be sent."""
         if event["rule_id"] is None:
-            return [ENV_CHANNEL_ID]
+            source = self._source(str(event["group_key"] or ""))
+            return source[0](event) if source is not None else [ENV_CHANNEL_ID]
         try:
             rule = self.rules.get(event["rule_id"])
         except RuleError:
@@ -808,7 +846,8 @@ class AlertEngine:
                and (r["next_attempt_at"] is None or r["next_attempt_at"] <= iso_js(now))]
         if due:
             if event["rule_id"] is None:
-                message = self.pipeline_message(event)
+                source = self._source(str(event["group_key"] or ""))
+                message = source[1](event) if source is not None else self.pipeline_message(event)
             else:
                 # A retry does not ask the AI again: one metered call per notification.
                 message = self.message(self.rules.get(event["rule_id"]), event, ai=not event.get("attempts"))
