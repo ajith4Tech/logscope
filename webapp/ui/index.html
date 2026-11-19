@@ -43,6 +43,9 @@
             <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/></svg><span class="tab-label">Insights</span><span class="tab-label-short" aria-hidden="true">Insights</span>
             <span id="insightsBadge" class="tab-badge" hidden></span>
           </button>
+          <button id="tabVulnscan" class="tab" role="tab" aria-selected="false" aria-controls="panelVulnscan" tabindex="-1">
+            <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v5c0 4.5-3 8.2-7 10-4-1.8-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg><span class="tab-label">VulnScan</span><span class="tab-label-short" aria-hidden="true">Vulns</span>
+          </button>
           <button id="tabActionable" class="tab" role="tab" aria-selected="false" aria-controls="panelActionable" tabindex="-1">
             <svg class="tab-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10 6h10M10 12h10M10 18h10M4 6l1.2 1.2L7.5 5M4 12l1.2 1.2L7.5 11M4 18l1.2 1.2L7.5 17"/></svg><span class="tab-label">Investigate</span><span class="tab-label-short" aria-hidden="true">Investigate</span>
             <span id="actionableBadge" class="tab-badge" hidden></span>
@@ -357,6 +360,15 @@
               <button id="refreshInsights" class="ghost">Refresh</button>
             </div>
           </div>
+          <section id="incidentsSection" class="incidents" aria-labelledby="incidentsTitle" hidden>
+            <div class="incidents-head">
+              <h3 id="incidentsTitle">Security incidents</h3>
+              <span id="incidentsCount" class="subtle"></span>
+            </div>
+            <p class="subtle incidents-help">A web attack followed by a Falco runtime event in the same namespace. Acknowledge and resolve need the admin token (Settings).</p>
+            <div id="incidentsError" class="views-error" hidden></div>
+            <div id="incidentRows" class="incident-rows"></div>
+          </section>
           <div id="insightsEmpty" class="panel-state-host" hidden></div>
           <div id="anomalyRows" class="anomaly-rows"></div>
         </div>
@@ -453,6 +465,34 @@
         </div>
 
         <!-- Pipeline health panel -->
+        <div id="panelVulnscan" aria-labelledby="tabVulnscan" class="panel vulnscan-panel" role="tabpanel" hidden>
+          <div class="panel-head">
+            <h2>Vulnerabilities</h2>
+            <div class="vulnscan-toolbar">
+              <label class="inline-label">Risk
+                <select id="vulnsTier">
+                  <option value="critical,high" selected>Critical + high</option>
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                  <option value="all">All tiers</option>
+                </select>
+              </label>
+              <label class="inline-label">Namespace
+                <input id="vulnsNamespace" type="text" inputmode="text" autocomplete="off" spellcheck="false" placeholder="all" maxlength="253" size="14" />
+              </label>
+              <label class="inline-label"><input type="checkbox" id="vulnsKev" /> KEV only</label>
+              <label class="inline-label"><input type="checkbox" id="vulnsResolved" /> Include resolved</label>
+              <button id="refreshVulns" type="button" class="ghost">Refresh</button>
+            </div>
+          </div>
+          <p id="vulnsCount" class="subtle vulnscan-summary"></p>
+          <p id="vulnsState" class="subtle vulnscan-summary"></p>
+          <div id="vulnsError" class="views-error" hidden></div>
+          <div id="vulnRows" class="vuln-rows"></div>
+        </div>
+
         <div id="panelPipeline" aria-labelledby="tabPipeline" class="panel pipeline-panel" role="tabpanel" hidden>
           <div class="panel-head">
             <div>

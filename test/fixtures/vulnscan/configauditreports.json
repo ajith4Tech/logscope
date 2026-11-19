@@ -1,0 +1,28 @@
+{
+ "apiVersion": "v1",
+ "kind": "List",
+ "items": [
+  {
+   "apiVersion": "aquasecurity.github.io/v1alpha1",
+   "kind": "ConfigAuditReport",
+   "metadata": {
+    "name": "replicaset-wordpress-7d79967bc8",
+    "namespace": "shop",
+    "labels": {
+     "trivy-operator.resource.kind": "ReplicaSet",
+     "trivy-operator.resource.name": "wordpress-7d79967bc8",
+     "trivy-operator.resource.namespace": "shop"
+    }
+   },
+   "report": {
+    "summary": {
+     "criticalCount": 0,
+     "highCount": 2,
+     "mediumCount": 3,
+     "lowCount": 5
+    },
+    "checks": []
+   }
+  }
+ ]
+}

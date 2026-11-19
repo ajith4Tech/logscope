@@ -1,0 +1,40 @@
+{{- /*
+Read-only access for the vulnerability view (security.vulnerabilityScanning),
+independent of kubectl.enabled / rbac.* (the kubectl actions): get/list/watch
+on Trivy Operator's VulnerabilityReports and ConfigAuditReports
+(aquasecurity.github.io, as installed by trivy-operator chart 0.38.1) and on
+Ingresses, cluster-wide (reports live in every workload's namespace). Nothing
+else, and no write verb.
+*/ -}}
+{{- if .Values.security.vulnerabilityScanning.enabled }}
+{{- $name := printf "%s-%s-vulnscan" (include "logscope.namespace" .) .Release.Name | trunc 63 | trimSuffix "-" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [aquasecurity.github.io]
+    resources: [vulnerabilityreports, configauditreports]
+    verbs: [get, list, watch]
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "logscope.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "logscope.fullname" . }}
+    namespace: {{ include "logscope.namespace" . }}
+{{- end }}

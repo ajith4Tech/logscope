@@ -2079,6 +2079,22 @@ button.ghost:hover {
   color: var(--metrics);
 }
 
+.atype-web_behavioral {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.behavior-summary p {
+  margin: 4px 0;
+  overflow-wrap: anywhere;
+}
+
+.behavior-paths {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  overflow-wrap: anywhere;
+}
+
 .anomaly-time {
   color: var(--muted);
 }
@@ -4315,4 +4331,151 @@ button.explain-meta-btn[aria-pressed="true"] {
   .anomaly-actions {
     justify-self: stretch;
   }
+}
+
+/* ─── Security incidents (Insights tab) ─────────────────────────────────── */
+.incidents {
+  margin: 0 0 16px;
+}
+.incidents-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.incidents-head h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+.incidents-help {
+  margin: 4px 0 8px;
+}
+.incident-rows {
+  display: grid;
+  gap: 8px;
+}
+.incident-card {
+  border: 1px solid var(--error-border);
+  border-left: 4px solid var(--error);
+  background: var(--error-bg);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.incident-card.incident-high {
+  border-left-color: var(--danger);
+}
+.incident-card.incident-acked {
+  opacity: 0.85;
+}
+.incident-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.incident-sev {
+  background: var(--danger);
+  color: var(--on-danger);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.incident-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 8px 0;
+}
+.incident-facts dt {
+  color: var(--muted, inherit);
+  font-weight: 600;
+}
+.incident-facts dd {
+  margin: 0;
+  min-width: 0;
+}
+.incident-ai {
+  margin: 6px 0;
+}
+.incident-link {
+  margin-right: auto;
+}
+.incident-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+@media (max-width: 600px) {
+  .incident-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ─── VulnScan tab ───────────────────────────────────────────────────────── */
+.vulnscan-toolbar {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.vulnscan-toolbar input[type="text"] {
+  min-width: 0;
+  max-width: 14rem;
+}
+.vulnscan-summary {
+  margin: 4px 0;
+}
+.vuln-rows {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+.vuln-row .incident-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.vuln-row {
+  border: 1px solid var(--border-subtle);
+  border-left: 4px solid var(--muted);
+  border-radius: 8px;
+  padding: 8px 12px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.vuln-row p {
+  margin: 4px 0;
+}
+.vuln-row.vuln-critical {
+  border-left-color: var(--error);
+  background: var(--error-bg);
+}
+.vuln-row.vuln-high {
+  border-left-color: var(--warn);
+}
+.vuln-row.vuln-critical .vuln-tier {
+  background: var(--danger);
+  color: var(--on-danger);
+}
+.vuln-row.vuln-high .vuln-tier {
+  background: var(--warn-bg);
+  color: var(--warn);
+}
+@media (max-width: 600px) {
+  .vulnscan-panel .panel-head {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .vulnscan-toolbar {
+    gap: 8px 12px;
+  }
+}
+.vuln-kev {
+  background: var(--error-bg);
+  color: var(--error);
+  border: 1px solid var(--error-border);
 }

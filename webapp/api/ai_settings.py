@@ -63,7 +63,7 @@ SETTINGS_FIELDS = tuple(FIELD_ENV)
 CLEAR_KEY = "__clear__"
 
 FEATURES = ("explain_line", "explain_filtered", "anomaly_auto_summary", "anomaly_manual_summary", "nl_filters",
-            "auto_triage")
+            "auto_triage", "incident_correlation_ai")
 # Everything on by default except anomaly_auto_summary (which summarizes every
 # anomaly type and so is opt-in). auto_triage is a narrower, on-by-default
 # version: it triages only rate/shift anomalies that transition to firing at or
@@ -76,7 +76,10 @@ TEST_FEATURE = "settings_test"
 DEEP_FEATURE = "deep_analysis"
 # Optional AI summary in alert notifications (a per-rule opt-in, not a flag).
 ALERT_FEATURE = "alert_summary"
-BUDGET_FEATURES = FEATURES + (DEEP_FEATURE, ALERT_FEATURE)
+# The "what likely happened" paragraph on a new web->runtime security incident
+# (security.py), switched by the incident_correlation_ai flag (default on).
+INCIDENT_FEATURE = "incident_summary"
+BUDGET_FEATURES = FEATURES + (DEEP_FEATURE, ALERT_FEATURE, INCIDENT_FEATURE)
 TIERS = ("fast", "deep")
 OUTCOMES = ("ok", "error", "cache_hit", "budget_blocked", "signature")
 # Outcomes that reached the provider: they count against the budgets.

@@ -41,6 +41,12 @@
 {{- if .Values.kubectl.enabled }}true{{ end -}}
 {{- end -}}
 
+{{/* "true" when the pod needs a ServiceAccount token: kubectl actions, or the
+     read-only vulnerability view (its own ClusterRole, rbac-vulnscan.yaml). */}}
+{{- define "logscope.apiTokenNeeded" -}}
+{{- if or .Values.kubectl.enabled .Values.security.vulnerabilityScanning.enabled }}true{{ end -}}
+{{- end -}}
+
 {{- define "logscope.namespace" -}}
 {{- default .Release.Namespace .Values.namespace -}}
 {{- end -}}

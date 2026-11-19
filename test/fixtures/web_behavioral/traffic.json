@@ -1,0 +1,211 @@
+{
+  "_comment": "Per-source-IP behavior fixtures (test_behavioral.py). Access-log lines are expanded by the test through make_record (common log format: '<ip> - - [..] \"<METHOD> <path> HTTP/1.1\" <status> 123 \"-\" \"<ua>\"'). 'paths' and 'statuses' are cycled over 'count' requests; times are absolute, 'now' is the detection time (window 300 s -> 10:55:00-11:00:00). Documentation-range IPs only.",
+  "now": "2026-11-02T11:00:00Z",
+  "baseline": [
+    {
+      "name": "history_marker",
+      "namespace": "kube-system",
+      "pod": "coredns-0",
+      "container": "coredns",
+      "plain": "[INFO] ready",
+      "count": 1,
+      "start": "2026-10-31T08:00:00Z",
+      "step_s": 1
+    },
+    {
+      "name": "shop_startup",
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "container": "wordpress",
+      "plain": "WordPress ready to handle connections",
+      "count": 2,
+      "start": "2026-11-02T09:00:00Z",
+      "step_s": 5
+    },
+    {
+      "name": "blog_startup",
+      "namespace": "blog",
+      "pod": "ghost-0",
+      "container": "ghost",
+      "plain": "Ghost boot complete",
+      "count": 2,
+      "start": "2026-11-02T09:00:00Z",
+      "step_s": 5
+    }
+  ],
+  "traffic": {
+    "scanning": {
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "ip": "203.0.113.7",
+      "ua": "Mozilla/5.0 (compatible; probe)",
+      "method": "GET",
+      "paths": [
+        "/wp-content/plugins/revslider/readme.txt",
+        "/wp-content/plugins/wp-file-manager/readme.txt",
+        "/wp-content/plugins/duplicator/readme.txt",
+        "/wp-content/plugins/elementor/readme.txt",
+        "/wp-content/plugins/contact-form-7/readme.txt",
+        "/wp-content/plugins/woocommerce/readme.txt",
+        "/wp-content/plugins/wpforms-lite/readme.txt",
+        "/wp-content/plugins/akismet/readme.txt",
+        "/wp-content/plugins/jetpack/readme.txt",
+        "/wp-content/plugins/yoast-seo/readme.txt",
+        "/wp-content/plugins/all-in-one-seo-pack/readme.txt",
+        "/wp-content/plugins/litespeed-cache/readme.txt",
+        "/wp-content/plugins/wordfence/readme.txt",
+        "/wp-content/plugins/updraftplus/readme.txt",
+        "/wp-content/plugins/really-simple-ssl/readme.txt",
+        "/wp-content/plugins/classic-editor/readme.txt",
+        "/wp-content/plugins/wp-super-cache/readme.txt",
+        "/wp-content/plugins/w3-total-cache/readme.txt",
+        "/wp-content/plugins/redirection/readme.txt",
+        "/wp-content/plugins/mailchimp-for-wp/readme.txt",
+        "/wp-content/plugins/ninja-forms/readme.txt",
+        "/wp-content/plugins/gravityforms/readme.txt",
+        "/wp-content/plugins/backup-backup/readme.txt",
+        "/wp-content/plugins/file-manager-advanced/readme.txt",
+        "/wp-content/plugins/wp-statistics/readme.txt"
+      ],
+      "statuses": [
+        404
+      ],
+      "count": 25,
+      "start": "2026-11-02T10:56:00Z",
+      "step_s": 4
+    },
+    "brute_force": {
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "ip": "198.51.100.23",
+      "ua": "python-requests/2.31",
+      "method": "POST",
+      "paths": [
+        "/wp-login.php"
+      ],
+      "statuses": [
+        401,
+        401,
+        401,
+        401,
+        200
+      ],
+      "count": 60,
+      "start": "2026-11-02T10:56:00Z",
+      "step_s": 3
+    },
+    "flood": {
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "ip": "192.0.2.50",
+      "ua": "Go-http-client/1.1",
+      "method": "GET",
+      "paths": [
+        "/",
+        "/shop/",
+        "/cart/"
+      ],
+      "statuses": [
+        200,
+        200,
+        200,
+        304
+      ],
+      "count": 400,
+      "start": "2026-11-02T10:55:30Z",
+      "step_s": 0.5
+    },
+    "half_scan_shop": {
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "ip": "203.0.113.9",
+      "ua": "Mozilla/5.0",
+      "method": "GET",
+      "paths": [
+        "/wp-content/plugins/revslider/readme.txt",
+        "/wp-content/plugins/wp-file-manager/readme.txt",
+        "/wp-content/plugins/duplicator/readme.txt",
+        "/wp-content/plugins/elementor/readme.txt",
+        "/wp-content/plugins/contact-form-7/readme.txt",
+        "/wp-content/plugins/woocommerce/readme.txt",
+        "/wp-content/plugins/wpforms-lite/readme.txt",
+        "/wp-content/plugins/akismet/readme.txt",
+        "/wp-content/plugins/jetpack/readme.txt",
+        "/wp-content/plugins/yoast-seo/readme.txt",
+        "/wp-content/plugins/all-in-one-seo-pack/readme.txt",
+        "/wp-content/plugins/litespeed-cache/readme.txt"
+      ],
+      "statuses": [
+        404
+      ],
+      "count": 12,
+      "start": "2026-11-02T10:56:00Z",
+      "step_s": 5
+    },
+    "half_scan_blog": {
+      "namespace": "blog",
+      "pod": "ghost-0",
+      "ip": "203.0.113.9",
+      "ua": "Mozilla/5.0",
+      "method": "GET",
+      "paths": [
+        "/wp-content/plugins/wordfence/readme.txt",
+        "/wp-content/plugins/updraftplus/readme.txt",
+        "/wp-content/plugins/really-simple-ssl/readme.txt",
+        "/wp-content/plugins/classic-editor/readme.txt",
+        "/wp-content/plugins/wp-super-cache/readme.txt",
+        "/wp-content/plugins/w3-total-cache/readme.txt",
+        "/wp-content/plugins/redirection/readme.txt",
+        "/wp-content/plugins/mailchimp-for-wp/readme.txt",
+        "/wp-content/plugins/ninja-forms/readme.txt",
+        "/wp-content/plugins/gravityforms/readme.txt",
+        "/wp-content/plugins/backup-backup/readme.txt",
+        "/wp-content/plugins/file-manager-advanced/readme.txt"
+      ],
+      "statuses": [
+        404
+      ],
+      "count": 12,
+      "start": "2026-11-02T10:56:00Z",
+      "step_s": 5
+    },
+    "half_scan_shop_other_ip": {
+      "namespace": "shop",
+      "pod": "wordpress-7d79967bc8-qjt4c",
+      "ip": "203.0.113.10",
+      "ua": "Mozilla/5.0",
+      "method": "GET",
+      "paths": [
+        "/wp-content/plugins/wordfence/readme.txt",
+        "/wp-content/plugins/updraftplus/readme.txt",
+        "/wp-content/plugins/really-simple-ssl/readme.txt",
+        "/wp-content/plugins/classic-editor/readme.txt",
+        "/wp-content/plugins/wp-super-cache/readme.txt",
+        "/wp-content/plugins/w3-total-cache/readme.txt",
+        "/wp-content/plugins/redirection/readme.txt",
+        "/wp-content/plugins/mailchimp-for-wp/readme.txt",
+        "/wp-content/plugins/ninja-forms/readme.txt",
+        "/wp-content/plugins/gravityforms/readme.txt",
+        "/wp-content/plugins/backup-backup/readme.txt",
+        "/wp-content/plugins/file-manager-advanced/readme.txt"
+      ],
+      "statuses": [
+        404
+      ],
+      "count": 12,
+      "start": "2026-11-02T10:56:00Z",
+      "step_s": 5
+    }
+  },
+  "falco_same_pod": {
+    "name": "falco_shell",
+    "namespace": "falco",
+    "pod": "falco-vqfb4",
+    "container": "falco",
+    "scope": "security",
+    "plain": "Run shell untrusted: 11:03:00.123456789: Notice Shell spawned by untrusted binary (parent_exe=apache2 k8s.ns=shop k8s.pod=wordpress-7d79967bc8-qjt4c)",
+    "count": 1,
+    "start": "2026-11-02T11:03:00Z",
+    "step_s": 1
+  }
+}

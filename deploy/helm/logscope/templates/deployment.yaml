@@ -26,8 +26,9 @@ spec:
         checksum/credentials: {{ include "logscope.webapp.credentialsChecksum" . }}
     spec:
       serviceAccountName: {{ include "logscope.fullname" . }}
-      # Only kubectl actions (kubectl.enabled) need an API token.
-      automountServiceAccountToken: {{ include "logscope.kubectlEnabled" . | eq "true" }}
+      # An API token only for kubectl actions (kubectl.enabled) or the
+      # read-only vulnerability view (security.vulnerabilityScanning.enabled).
+      automountServiceAccountToken: {{ include "logscope.apiTokenNeeded" . | eq "true" }}
       terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true

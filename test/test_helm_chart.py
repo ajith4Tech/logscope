@@ -435,3 +435,38 @@ def test_alert_values_reach_config_and_env():
     default_env = {e["name"] for e in _find(default_docs, "Deployment", "logscope-webapp")
                    ["spec"]["template"]["spec"]["containers"][0]["env"]}
     assert "LOGSCOPE_ALERT_ALLOWED_HOSTS" not in default_env
+
+
+def _vulnscan_objects(docs):
+    return [d for d in docs if d["kind"] in ("ClusterRole", "ClusterRoleBinding") and "vulnscan" in d["metadata"]["name"]]
+
+
+def test_vulnerability_view_off_by_default():
+    docs, _ = _helm(BASE)
+    assert _vulnscan_objects(docs) == []
+    pod = _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]
+    assert pod["automountServiceAccountToken"] is False
+    config = yaml.safe_load(_find(docs, "ConfigMap", "logscope-webapp-config")["data"]["config.yaml"])
+    assert config["webapp"]["security"]["vulnscan"]["enabled"] is False
+
+
+def test_vulnerability_view_has_its_own_read_only_cluster_role():
+    docs, _ = _helm(_merge(BASE, {"security": {"vulnerabilityScanning": {
+        "enabled": True, "exposedWorkloads": ["shop/wordpress"]}}}))
+    role = _find(docs, "ClusterRole", "logging-logscope-vulnscan")
+    assert role["rules"] == [
+        {"apiGroups": ["aquasecurity.github.io"], "resources": ["vulnerabilityreports", "configauditreports"],
+         "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses"], "verbs": ["get", "list", "watch"]},
+    ]
+    binding = _find(docs, "ClusterRoleBinding", "logging-logscope-vulnscan")
+    assert binding["roleRef"]["name"] == "logging-logscope-vulnscan"
+    assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "logscope-webapp", "namespace": "logging"}]
+    pod = _find(docs, "Deployment", "logscope-webapp")["spec"]["template"]["spec"]
+    env = {e["name"]: e.get("value") for e in pod["containers"][0]["env"]}
+    # The token is mounted for it, but kubectl actions stay off and no action Role appears.
+    assert pod["automountServiceAccountToken"] is True and env["LOGSCOPE_ACTIONS_ENABLED"] == "false"
+    assert not [d for d in docs if d["kind"] in ("Role", "RoleBinding")]
+    config = yaml.safe_load(_find(docs, "ConfigMap", "logscope-webapp-config")["data"]["config.yaml"])
+    assert config["webapp"]["security"]["vulnscan"] == {"enabled": True, "poll_interval_s": 1800,
+                                                        "kev_refresh_s": 86400, "exposed_workloads": ["shop/wordpress"]}

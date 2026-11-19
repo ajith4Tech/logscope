@@ -341,6 +341,15 @@ TAG=$(make -s version | sed 's/^v//')
   (`rbac.readOnly.create` / `rbac.rollout.create`, namespaced, listed in
   `rbac.namespaces`). The HTTP API has no authentication, so whoever reaches
   the web app can run what those Roles allow.
+- **Vulnerability view** (`security.vulnerabilityScanning.enabled`, off by
+  default) also needs an image with kubectl, plus Trivy Operator installed
+  separately (repository README, "Vulnerability scanning"). It creates its own
+  ClusterRole `<namespace>-<release>-vulnscan` with `get`/`list`/`watch` on
+  `vulnerabilityreports` and `configauditreports` (`aquasecurity.github.io`)
+  and `ingresses` (`networking.k8s.io`) only, binds it to this release's
+  ServiceAccount and mounts the SA token. It does not depend on, or enable,
+  `kubectl.enabled` or the action Roles; the web app runs only three fixed
+  `kubectl get ... -A -o json` commands with it.
 
 Vector (`docker.io/timberio/vector`) and Falco keep pulling their upstream
 images from public registries, as they do today.

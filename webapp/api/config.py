@@ -115,6 +115,69 @@ DEFAULT_ALERTS = {
     "eval_tick_secs": 30,
 }
 
+DEFAULT_SECURITY = {
+    # Web -> runtime correlation (security.py): a web-attack anomaly followed
+    # by a Falco event in the same namespace becomes a security incident.
+    "correlation_enabled": True,
+    # Look this far past a web-attack anomaly's window end for a Falco event.
+    "correlation_window_s": 900,
+    # Falco events still inside the target pod's (or namespace's) cold-start
+    # grace are never a correlation match. None = webapp.insights.cold_start_grace_s.
+    "cold_start_grace_s": None,
+    # Web-attack anomalies whose window ended longer ago than this (plus the
+    # correlation window) are not correlated any more.
+    "lookback_s": 86400,
+    # Channels (ids from the Alerts tab) a new incident is sent to; empty =
+    # the environment's Mattermost channel (id 0) when it is configured.
+    "notify_channel_ids": [],
+    # Per-source-IP behavior over access logs (behavioral.py); see DEFAULT_BEHAVIORAL.
+    "behavioral": {},
+    # Trivy Operator vulnerability view (vulnscan.py); see DEFAULT_VULNSCAN.
+    "vulnscan": {},
+}
+
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+DEFAULT_VULNSCAN = {
+    # Off unless enabled: it runs kubectl (fixed read-only commands) and
+    # fetches CISA's KEV catalog over HTTPS.
+    "enabled": False,
+    # How often Trivy Operator's reports and the Ingresses are read.
+    "poll_interval_s": 1800,
+    # How often the CISA Known Exploited Vulnerabilities catalog is refreshed.
+    "kev_refresh_s": 86400,
+    "kev_url": KEV_URL,
+    # Security incidents and attack-tagged anomalies this recent count as
+    # an attack on a workload (risk scoring).
+    "correlation_lookback_s": 86400,
+    # "namespace/workload" or "namespace" entries treated as exposed even
+    # without an Ingress (NodePort, an external load balancer).
+    "exposed_workloads": [],
+    # Upper bound for one kubectl call.
+    "kubectl_timeout_s": 120,
+}
+
+DEFAULT_BEHAVIORAL = {
+    "enabled": True,
+    # Trailing window aggregated per (namespace, client_ip) on each insights run.
+    "window_s": 300,
+    # brute_force: one path requested at least this often, with this share of 401/403.
+    "brute_force_min_repeats": 50,
+    "brute_force_auth_fail_ratio": 0.7,
+    # scanning: at least this many distinct paths, with this share of 404
+    # (or a scanner signature already matched for this IP).
+    "scanning_min_paths": 20,
+    "scanning_not_found_ratio": 0.6,
+    # flood: this many requests within window_s, whatever the status.
+    "flood_requests": 300,
+    # While the behavior continues the open anomaly is updated; after this
+    # many quiet seconds a new occurrence opens a new anomaly.
+    "cooldown_s": 1800,
+    # Never evaluated: source IPs in these CIDRs, and requests whose
+    # User-Agent contains one of these strings (case-insensitive).
+    "trusted_cidrs": [],
+    "trusted_user_agents": [],
+}
+
 # Ordering used to compare an anomaly's urgency (see notify.anomaly_urgency)
 # against min_urgency.
 URGENCY_ORDER = {"low": 0, "medium": 1, "high": 2, "urgent": 3}
@@ -202,6 +265,119 @@ class AlertsConfig:
 
 
 @dataclass(frozen=True)
+class BehavioralConfig:
+    """webapp.security.behavioral (see DEFAULT_BEHAVIORAL)."""
+
+    enabled: bool = True
+    window_s: float = 300
+    brute_force_min_repeats: int = 50
+    brute_force_auth_fail_ratio: float = 0.7
+    scanning_min_paths: int = 20
+    scanning_not_found_ratio: float = 0.6
+    flood_requests: int = 300
+    cooldown_s: float = 1800
+    trusted_cidrs: tuple[str, ...] = ()
+    trusted_user_agents: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VulnscanConfig:
+    """webapp.security.vulnscan (see DEFAULT_VULNSCAN)."""
+
+    enabled: bool = False
+    poll_interval_s: float = 1800
+    kev_refresh_s: float = 86400
+    kev_url: str = KEV_URL
+    correlation_lookback_s: float = 86400
+    exposed_workloads: tuple[str, ...] = ()
+    kubectl_timeout_s: float = 120
+
+
+def load_vulnscan(raw: Any) -> VulnscanConfig:
+    """webapp.security.vulnscan, validated (ValueError)."""
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("webapp.security.vulnscan must be a mapping")
+    values = {**DEFAULT_VULNSCAN, **(raw or {})}
+    name = "webapp.security.vulnscan"
+    unknown = sorted(set(values) - set(DEFAULT_VULNSCAN))
+    if unknown:
+        raise ValueError(f"{name}: unknown key {unknown[0]!r}")
+    for key, minimum in (("poll_interval_s", 60), ("kev_refresh_s", 3600), ("correlation_lookback_s", 0),
+                         ("kubectl_timeout_s", 5)):
+        if float(values[key]) < minimum:
+            raise ValueError(f"{name}.{key} must be >= {minimum}, got {values[key]!r}")
+    url = str(values["kev_url"] or "")
+    if not url.lower().startswith("https://"):
+        raise ValueError(f"{name}.kev_url must be an https URL")
+    exposed = values["exposed_workloads"] or []
+    if not isinstance(exposed, list) or any(
+            not isinstance(e, str) or not e.strip() or e.count("/") > 1 or e.strip().startswith("/")
+            for e in exposed):
+        raise ValueError(f"{name}.exposed_workloads must list \"namespace\" or \"namespace/workload\" strings")
+    return VulnscanConfig(
+        enabled=bool(values["enabled"]), poll_interval_s=float(values["poll_interval_s"]),
+        kev_refresh_s=float(values["kev_refresh_s"]), kev_url=url,
+        correlation_lookback_s=float(values["correlation_lookback_s"]),
+        exposed_workloads=tuple(e.strip().strip("/") for e in exposed),
+        kubectl_timeout_s=float(values["kubectl_timeout_s"]),
+    )
+
+
+@dataclass(frozen=True)
+class SecurityConfig:
+    """webapp.security (see DEFAULT_SECURITY)."""
+
+    correlation_enabled: bool = True
+    correlation_window_s: float = 900
+    # None = InsightsConfig.cold_start_grace_s (the existing guard).
+    cold_start_grace_s: float | None = None
+    lookback_s: float = 86400
+    notify_channel_ids: tuple[int, ...] = ()
+    behavioral: BehavioralConfig = field(default_factory=BehavioralConfig)
+    vulnscan: VulnscanConfig = field(default_factory=VulnscanConfig)
+
+
+def load_behavioral(raw: Any) -> BehavioralConfig:
+    """webapp.security.behavioral, validated (ValueError)."""
+    if raw is not None and not isinstance(raw, dict):
+        raise ValueError("webapp.security.behavioral must be a mapping")
+    values = {**DEFAULT_BEHAVIORAL, **(raw or {})}
+    unknown = sorted(set(values) - set(DEFAULT_BEHAVIORAL))
+    if unknown:
+        raise ValueError(f"webapp.security.behavioral: unknown key {unknown[0]!r}")
+    name = "webapp.security.behavioral"
+    for key, minimum in (("window_s", 30), ("brute_force_min_repeats", 1), ("scanning_min_paths", 1),
+                         ("flood_requests", 1), ("cooldown_s", 0)):
+        if float(values[key]) < minimum:
+            raise ValueError(f"{name}.{key} must be >= {minimum}, got {values[key]!r}")
+    for key in ("brute_force_auth_fail_ratio", "scanning_not_found_ratio"):
+        if not 0 <= float(values[key]) <= 1:
+            raise ValueError(f"{name}.{key} must be between 0 and 1, got {values[key]!r}")
+    import ipaddress
+
+    cidrs = values["trusted_cidrs"] or []
+    agents = values["trusted_user_agents"] or []
+    if not isinstance(cidrs, list) or not isinstance(agents, list):
+        raise ValueError(f"{name}.trusted_cidrs and trusted_user_agents must be lists")
+    for cidr in cidrs:
+        try:
+            ipaddress.ip_network(str(cidr), strict=False)
+        except ValueError:
+            raise ValueError(f"{name}.trusted_cidrs: {cidr!r} is not an IP network") from None
+    if any(not isinstance(a, str) or not a.strip() for a in agents):
+        raise ValueError(f"{name}.trusted_user_agents must be non-empty strings")
+    return BehavioralConfig(
+        enabled=bool(values["enabled"]), window_s=float(values["window_s"]),
+        brute_force_min_repeats=int(values["brute_force_min_repeats"]),
+        brute_force_auth_fail_ratio=float(values["brute_force_auth_fail_ratio"]),
+        scanning_min_paths=int(values["scanning_min_paths"]),
+        scanning_not_found_ratio=float(values["scanning_not_found_ratio"]),
+        flood_requests=int(values["flood_requests"]), cooldown_s=float(values["cooldown_s"]),
+        trusted_cidrs=tuple(str(c) for c in cidrs), trusted_user_agents=tuple(a.strip() for a in agents),
+    )
+
+
+@dataclass(frozen=True)
 class AppConfig:
     s3_bucket: str
     s3_region: str
@@ -217,6 +393,7 @@ class AppConfig:
     ai: AiConfig
     mattermost: MattermostConfig
     alerts: AlertsConfig = field(default_factory=AlertsConfig)
+    security: SecurityConfig = field(default_factory=SecurityConfig)
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
@@ -358,6 +535,17 @@ def load_app_config(config_path: Path) -> AppConfig:
     except Exception:
         raise ValueError(f"webapp.display_tz must be an IANA time zone name, got {display_tz!r}") from None
     public_url = str(webapp.get("public_url") or "").strip().rstrip("/") or link_base_url
+    security = dict(DEFAULT_SECURITY)
+    security.update(webapp.get("security") or {})
+    for key, minimum in (("correlation_window_s", 60), ("lookback_s", 3600)):
+        if float(security[key]) < minimum:
+            raise ValueError(f"webapp.security.{key} must be >= {minimum}, got {security[key]!r}")
+    if security["cold_start_grace_s"] is not None and float(security["cold_start_grace_s"]) < 0:
+        raise ValueError("webapp.security.cold_start_grace_s must be >= 0")
+    notify_ids = security.get("notify_channel_ids") or []
+    if not isinstance(notify_ids, list) or any(isinstance(i, bool) or not isinstance(i, int) or i < 0
+                                               for i in notify_ids):
+        raise ValueError("webapp.security.notify_channel_ids must be a list of channel ids")
     if public_url and not public_url.lower().startswith(("https://", "http://")):
         raise ValueError("webapp.public_url must start with https:// or http://")
 
@@ -427,6 +615,16 @@ def load_app_config(config_path: Path) -> AppConfig:
             watermark_margin_secs=int(alerts["watermark_margin_secs"]),
             s3_batch_timeout_secs=int(alerts["s3_batch_timeout_secs"]),
             eval_tick_secs=float(alerts["eval_tick_secs"]),
+        ),
+        security=SecurityConfig(
+            correlation_enabled=bool(security["correlation_enabled"]),
+            correlation_window_s=float(security["correlation_window_s"]),
+            cold_start_grace_s=(None if security["cold_start_grace_s"] is None
+                                else float(security["cold_start_grace_s"])),
+            lookback_s=float(security["lookback_s"]),
+            notify_channel_ids=tuple(sorted(set(notify_ids))),
+            behavioral=load_behavioral(security.get("behavioral")),
+            vulnscan=load_vulnscan(security.get("vulnscan")),
         ),
     )
 

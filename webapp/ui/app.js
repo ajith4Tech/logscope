@@ -146,11 +146,12 @@ function dashboardContextText() {
 
 // ─── Tab switching ───────────────────────────────────────────────────────────
 
-const TABS = ['dashboard', 'logs', 'insights', 'actionable', 'alerts', 'pipeline', 'settings'];
+const TABS = ['dashboard', 'logs', 'insights', 'vulnscan', 'actionable', 'alerts', 'pipeline', 'settings'];
 const TAB_IDS = {
   dashboard: ['tabDashboard', 'panelDashboard'],
   logs: ['tabLogs', 'panelLogs'],
   insights: ['tabInsights', 'panelInsights'],
+  vulnscan: ['tabVulnscan', 'panelVulnscan'],
   actionable: ['tabActionable', 'panelActionable'],
   alerts: ['tabAlerts', 'panelAlerts'],
   pipeline: ['tabPipeline', 'panelPipeline'],
@@ -184,6 +185,9 @@ function switchTab(name, { history = 'push' } = {}) {
   if (name === 'dashboard') loadPinnedCounts();
   if (name === 'insights' && !state.insightsLoaded && !state.insightsLoading) {
     loadInsights().catch(() => {});
+  }
+  if (name === 'vulnscan' && !vulnsState.loaded && !vulnsState.loading) {
+    loadVulnerabilities().catch(() => {});
   }
   if (name === 'logs' && state.logPanels.stale) scheduleLogPanels();
   if (name === 'actionable') {
@@ -1702,6 +1706,139 @@ el('contextLimitRange').addEventListener('change', () => {
   openContext(state.context.recordId, { history: 'replace' });
 });
 
+// ─── VulnScan tab (Trivy Operator + CISA KEV, risk at read time) ──────────
+// Text from Trivy and CISA is external and untrusted: every value goes
+// through escapeHtml, and only plain https links are rendered. The default
+// view is the critical and high tiers only (a cluster can have >10k open
+// low/medium findings); the API takes one tier per request, so "Critical +
+// high" is two requests merged. Each request returns at most VULN_PAGE rows.
+
+const VULN_PAGE = 200;
+const VULN_DEFAULT_TIER = 'critical,high';
+const VULN_TIER_CHOICES = ['critical,high', 'critical', 'high', 'medium', 'low', 'all'];
+const VULN_TIER_LABELS = { critical: 'Critical', high: 'High', medium: 'Medium', low: 'Low' };
+const VULN_NAMESPACE_RE = /^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/;
+const vulnsState = { requestId: 0, loaded: false, loading: false };
+
+function safeHttpsUrl(value) {
+  const text = String(value || '');
+  return /^https:\/\/[^\s"'<>]+$/.test(text) ? text : '';
+}
+
+function vulnAttackLinks(attacks) {
+  const links = [];
+  for (const inc of attacks?.incidents || []) {
+    const id = Number(inc.id);
+    if (Number.isFinite(id)) links.push(`<a href="?${escapeHtml(new URLSearchParams({ tab: 'insights', incident: String(id) }).toString())}">incident #${id}</a>`);
+  }
+  for (const an of attacks?.anomalies || []) {
+    const id = Number(an.id);
+    if (Number.isFinite(id)) links.push(`<a href="?${escapeHtml(new URLSearchParams({ tab: 'insights', anomaly: String(id) }).toString())}">${escapeHtml(an.attack_type || an.type || 'anomaly')} #${id}</a>`);
+  }
+  return links.join(', ');
+}
+
+function vulnRowMarkup(v) {
+  const tier = VULN_TIER_LABELS[v.risk?.tier] ? v.risk.tier : 'low';
+  const link = safeHttpsUrl(v.primary_link);
+  const cve = link ? `<a href="${escapeHtml(link)}" target="_blank" rel="noopener noreferrer">${escapeHtml(v.cve_id)}</a>`
+    : escapeHtml(v.cve_id);
+  const fix = v.fixed_version ? `fix <code>${escapeHtml(v.fixed_version)}</code>` : '<span class="subtle">no fix yet</span>';
+  const kev = v.is_kev
+    ? `<span class="badge vuln-kev" title="${escapeHtml(`CISA KEV since ${v.kev?.date_added || '?'}: ${v.kev?.short_description || ''}`)}">KEV</span>` : '';
+  const attacks = vulnAttackLinks(v.attacks);
+  return `<article class="vuln-row vuln-${tier}">
+      <header class="incident-title">
+        <span class="badge vuln-tier">${escapeHtml(VULN_TIER_LABELS[tier])}</span>
+        <strong>${cve}</strong>
+        <span class="badge">${escapeHtml(v.severity)}</span>
+        ${kev}
+        <span class="subtle">${escapeHtml(`${v.namespace}/${v.workload}`)}${v.container ? ` · ${escapeHtml(v.container)}` : ''}</span>
+      </header>
+      <p class="vuln-title">${escapeHtml(v.title || '')}</p>
+      <p class="subtle"><code>${escapeHtml(v.package || '?')}</code> ${escapeHtml(v.installed_version || '')} · ${fix}
+        · image <code>${escapeHtml(v.image || '?')}</code></p>
+      <p class="subtle">${escapeHtml((v.risk?.reasons || []).join(' · ') || 'no risk signals')}${v.exposure ? ` · exposed via ${escapeHtml(v.exposure)}` : ''}${attacks ? ` · attacks: ${attacks}` : ''}</p>
+    </article>`;
+}
+
+function vulnFilters() {
+  const tier = VULN_TIER_CHOICES.includes(el('vulnsTier').value) ? el('vulnsTier').value : VULN_DEFAULT_TIER;
+  return {
+    tier,
+    namespace: el('vulnsNamespace').value.trim(),
+    kev: el('vulnsKev').checked,
+    resolved: el('vulnsResolved').checked,
+  };
+}
+
+async function loadVulnerabilities() {
+  const requestId = ++vulnsState.requestId;
+  const f = vulnFilters();
+  if (f.namespace && (f.namespace.length > 253 || !VULN_NAMESPACE_RE.test(f.namespace))) {
+    el('vulnsError').textContent = 'Namespace must be a Kubernetes namespace name (lowercase letters, digits, -).';
+    el('vulnsError').hidden = false;
+    return;
+  }
+  vulnsState.loading = true;
+  if (!vulnsState.loaded) el('vulnRows').replaceChildren(panelStateNode('loading', { layout: 'list', lines: 4 }));
+  const tiers = f.tier === 'all' ? [null] : f.tier.split(',');
+  try {
+    const responses = await Promise.all(tiers.map((tier) => {
+      const params = new URLSearchParams({ limit: String(VULN_PAGE) });
+      if (tier) params.set('tier', tier);
+      if (f.namespace) params.set('namespace', f.namespace);
+      if (f.kev) params.set('kev', 'true');
+      if (f.resolved) params.set('include_resolved', 'true');
+      return fetchJson(`/api/security/vulnerabilities?${params.toString()}`);
+    }));
+    if (requestId !== vulnsState.requestId) return;
+    vulnsState.loaded = true;
+    const first = responses[0] || {};
+    if (!first.enabled) {
+      el('vulnsCount').textContent = '';
+      el('vulnsState').textContent = 'The vulnerability view is off. Enable webapp.security.vulnscan (Helm: '
+        + 'security.vulnerabilityScanning.enabled) and install Trivy Operator; see the README.';
+      el('vulnsError').hidden = true;
+      el('vulnRows').innerHTML = '';
+      return;
+    }
+    const counts = first.counts || {};
+    const items = responses.flatMap((r) => (Array.isArray(r.items) ? r.items : []));
+    const total = responses.reduce((sum, r) => sum + (Number(r.total) || 0), 0);
+    const tierCounts = ['critical', 'high', 'medium', 'low'].map((t) => `${formatCount(Number(counts[t]) || 0)} ${t}`).join(' · ');
+    el('vulnsCount').textContent = `${f.resolved ? 'Open and resolved' : 'Open'} findings: ${tierCounts}.`
+      + (items.length < total ? ` Showing the first ${formatCount(items.length)} of ${formatCount(total)} matching; narrow the filters to see others.` : '');
+    const kev = first.kev || {};
+    const notes = [];
+    if (first.state && first.state !== 'ok') notes.push(`Reports not readable (${first.state}); showing the last data read.`);
+    notes.push(kev.last_success_at ? `KEV catalog: ${Number(kev.entries) || 0} entries, updated ${formatDateTime(kev.last_success_at)}${kev.stale ? ' (stale)' : ''}.`
+      : 'KEV catalog not downloaded yet: nothing is flagged as known-exploited.');
+    el('vulnsState').textContent = notes.join(' ');
+    el('vulnsError').hidden = true;
+    el('vulnRows').innerHTML = items.length ? items.map(vulnRowMarkup).join('')
+      : '<p class="subtle">No findings match these filters.</p>';
+  } catch (err) {
+    if (requestId !== vulnsState.requestId) return;
+    el('vulnRows').innerHTML = '';
+    el('vulnsError').textContent = `Failed to load vulnerabilities: ${err.message}`;
+    el('vulnsError').hidden = false;
+  } finally {
+    if (requestId === vulnsState.requestId) vulnsState.loading = false;
+  }
+}
+
+function onVulnFilterChange() {
+  updateUrl('replace');
+  loadVulnerabilities().catch(() => {});
+}
+
+el('vulnsTier').addEventListener('change', onVulnFilterChange);
+el('vulnsKev').addEventListener('change', onVulnFilterChange);
+el('vulnsResolved').addEventListener('change', onVulnFilterChange);
+el('vulnsNamespace').addEventListener('change', onVulnFilterChange);
+el('refreshVulns').addEventListener('click', () => { loadVulnerabilities().catch(() => {}); });
+
 // ─── Insights tab ────────────────────────────────────────────────────────────
 
 const STATUS_LABELS = { new: 'New', reviewed: 'Reviewed', dismissed: 'Dismissed' };
@@ -1712,8 +1849,42 @@ function anomalyTypeLabel(type) {
     message_frequency: 'Frequency spike',
     new_falco_rule: 'New Falco rule',
     severity_shift: 'Severity shift',
+    web_behavioral: 'Web behavior',
   };
   return map[type] || type;
+}
+
+// web_behavioral (per source IP): subtype, client IP, paths and statuses.
+const BEHAVIOR_LABELS = { brute_force: 'Brute force', scanning: 'Scanning', flood: 'Flood' };
+
+function behaviorLabel(anomaly) {
+  const subtype = anomaly.evidence?.subtype || anomaly.attack_type || '';
+  return BEHAVIOR_LABELS[subtype] || String(subtype || 'Web behavior');
+}
+
+function behaviorStatusText(evidence) {
+  const counts = evidence?.status_counts;
+  if (!counts || typeof counts !== 'object') return '';
+  return ['401', '403', '404', '5xx'].filter((k) => Number(counts[k]) > 0)
+    .map((k) => `${k}: ${formatCount(Number(counts[k]))}`).join(' · ');
+}
+
+// One line for the card (set with textContent; the HTML variant escapes
+// every value, including the IP, which is never trusted to be well-formed).
+function behaviorSummaryParts(anomaly) {
+  const ev = anomaly.evidence || {};
+  const paths = Number(ev.distinct_paths);
+  const total = Number(ev.total_requests);
+  return [
+    `${behaviorLabel(anomaly)} from ${String(ev.client_ip || '?')}`,
+    Number.isFinite(total) ? `${formatCount(total)} requests` : '',
+    Number.isFinite(paths) ? `${formatCount(paths)} path${paths === 1 ? '' : 's'}` : '',
+    behaviorStatusText(ev),
+  ].filter(Boolean);
+}
+
+function behaviorSummaryHtml(anomaly) {
+  return behaviorSummaryParts(anomaly).map((part) => escapeHtml(part)).join(' · ');
 }
 
 // Pod and rule key of an anomaly (either may be empty).
@@ -1804,14 +1975,16 @@ function renderAnomalies() {
     node.dataset.anomalyId = String(anomaly.id);
 
     const typeBadge = node.querySelector('.anomaly-type-badge');
-    typeBadge.textContent = anomalyTypeLabel(anomaly.type);
+    typeBadge.textContent = anomaly.type === 'web_behavioral'
+      ? `Web ${behaviorLabel(anomaly).toLowerCase()}` : anomalyTypeLabel(anomaly.type);
     typeBadge.classList.add(`atype-${anomaly.type}`);
 
     // Where it happened; empty pod / severity are left out, not shown as "—".
     node.querySelector('.anomaly-title').textContent = anomaly.namespace || 'Cluster-wide';
     const templateSummary = anomaly.template_summary || {};
     const meta = anomaly.ai_meta || null;
-    const sourceText = anomalySourceText(anomaly);
+    const sourceText = anomaly.type === 'web_behavioral'
+      ? behaviorSummaryParts(anomaly).join(' · ') : anomalySourceText(anomaly);
     const snippet = node.querySelector('.anomaly-snippet');
     snippet.textContent = anomaly.ai_summary || sourceText || templateSummary.headline || '';
     snippet.title = snippet.textContent;
@@ -1955,6 +2128,20 @@ function fillAnomalyDetail(container, anomaly) {
   const source = [anomaly.namespace && `namespace: ${anomaly.namespace}`, anomaly.pod && `pod: ${anomaly.pod}`,
     anomaly.rule_key && `rule / pattern: ${anomaly.rule_key}`].filter(Boolean).join('\n');
   if (source) addDetailBlock(container, 'Source', source);
+  if (anomaly.type === 'web_behavioral') {
+    const behavior = document.createElement('div');
+    behavior.className = 'detail-block behavior-summary';
+    const paths = (evidence.top_paths || []).slice(0, 5).map((p) => `<li><code>${escapeHtml(p.path ?? '')}</code> `
+      + `<span class="subtle">× ${escapeHtml(formatCount(Number(p.count) || 0))}</span></li>`).join('');
+    behavior.innerHTML = `<div class="detail-label">Source IP behavior</div>
+      <p>${behaviorSummaryHtml(anomaly)}</p>
+      <p class="subtle">Client IP <code>${escapeHtml(evidence.client_ip ?? '?')}</code>
+        · confidence ${escapeHtml(anomaly.attack_confidence || 'n/a')}
+        · first seen ${escapeHtml(formatDateTime(evidence.first_seen))}
+        · last request ${escapeHtml(formatDateTime(evidence.last_seen))}</p>
+      ${paths ? `<div class="subtle">Top paths</div><ul class="behavior-paths">${paths}</ul>` : ''}`;
+    container.appendChild(behavior);
+  }
   if (anomaly.ai_summary) {
     const action = anomaly.ai_suggested_action ? `\n\n→ ${anomaly.ai_suggested_action}` : '';
     addDetailBlock(container, 'AI summary', `${anomaly.ai_summary}${action}`);
@@ -2062,6 +2249,114 @@ function showInsightsError(message) {
   setPanelState(el('insightsEmpty'), 'error', { message, action: { label: 'Retry', onClick: () => loadInsights().catch(() => {}) } });
 }
 
+// ─── Security incidents (web attack -> Falco runtime event) ─────────────────
+// Open and acknowledged incidents above the anomaly list. Reads are open;
+// acknowledge / resolve send the Settings admin token (alertsRequest).
+
+const incidentsState = { items: [], requestId: 0, busy: new Set() };
+
+function incidentGap(seconds) {
+  const total = Math.round(Number(seconds));
+  if (!Number.isFinite(total)) return '?';
+  const minutes = Math.floor(Math.abs(total) / 60);
+  const secs = Math.abs(total) % 60;
+  if (minutes >= 60) return `${Math.floor(minutes / 60)} h ${minutes % 60} min`;
+  return minutes ? `${minutes} min ${secs} s` : `${secs} s`;
+}
+
+function incidentLogsHref(incident) {
+  const start = Date.parse(incident.web_started_at || '');
+  const end = Date.parse(incident.falco_ts || '');
+  const params = new URLSearchParams({ tab: 'logs' });
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    params.set('from', new Date(Math.min(start, end) - 60000).toISOString());
+    params.set('to', new Date(Math.max(start, end) + 60000).toISOString());
+  }
+  return `?${params.toString()}`;
+}
+
+function incidentCardMarkup(incident) {
+  const id = Number(incident.id);
+  const where = [incident.namespace, incident.pod].filter(Boolean).join(' / ');
+  const severity = incident.severity === 'critical' ? 'critical' : 'high';
+  const match = incident.confidence === 'high' ? 'same or adjacent pod' : 'same namespace, another pod';
+  const busy = incidentsState.busy.has(id);
+  const acked = incident.state === 'acknowledged';
+  const ai = incident.ai_summary
+    ? `<p class="incident-ai"><span class="source-badge source-${escapeHtml(incident.ai_meta?.source || 'ai')}">${escapeHtml(incident.ai_meta?.source === 'signature' ? 'Known pattern' : 'AI')}</span> ${escapeHtml(incident.ai_summary)}</p>`
+    : '';
+  return `<article class="incident-card incident-${severity}${acked ? ' incident-acked' : ''}" data-incident-id="${id}">
+      <header class="incident-title">
+        <span class="badge incident-sev">${escapeHtml(severity)}</span>
+        <strong>Security incident #${id}</strong>
+        <span class="subtle">${escapeHtml(where || '—')}</span>
+        ${acked ? `<span class="subtle">· acknowledged${incident.acknowledged_by ? ` by ${escapeHtml(incident.acknowledged_by)}` : ''}</span>` : ''}
+      </header>
+      <dl class="incident-facts">
+        <dt>Web attack</dt><dd><code>${escapeHtml(incident.attack_type || '—')}</code> <span class="subtle">(signature confidence ${escapeHtml(incident.attack_confidence || 'n/a')}) · ${escapeHtml(formatDateTime(incident.web_started_at))}</span></dd>
+        <dt>Falco rule</dt><dd><code>${escapeHtml(incident.falco_rule || '—')}</code> <span class="subtle">· ${escapeHtml(formatDateTime(incident.falco_ts))}</span></dd>
+        <dt>Correlation</dt><dd>${escapeHtml(incidentGap(incident.gap_s))} later · ${escapeHtml(incident.confidence || '')} (${escapeHtml(match)})</dd>
+      </dl>
+      ${ai}
+      <div class="incident-actions">
+        <a class="incident-link" href="${escapeHtml(incidentLogsHref(incident))}">Logs for both events</a>
+        ${acked ? '' : `<button type="button" class="ghost" data-incident-action="acknowledge"${busy ? ' disabled' : ''}>Acknowledge</button>`}
+        <button type="button" class="destructive-btn" data-incident-action="resolve"${busy ? ' disabled' : ''}>Resolve</button>
+      </div>
+    </article>`;
+}
+
+function renderIncidents() {
+  const section = el('incidentsSection');
+  const active = incidentsState.items.filter((i) => i.state === 'open' || i.state === 'acknowledged');
+  section.hidden = active.length === 0 && el('incidentsError').hidden;
+  const open = active.filter((i) => i.state === 'open').length;
+  el('incidentsCount').textContent = active.length ? `${open} open · ${active.length - open} acknowledged` : '';
+  el('incidentRows').innerHTML = active.map(incidentCardMarkup).join('');
+}
+
+async function loadIncidents() {
+  const requestId = ++incidentsState.requestId;
+  try {
+    const data = await fetchJson('/api/security/incidents?limit=100');
+    if (requestId !== incidentsState.requestId) return;
+    incidentsState.items = Array.isArray(data.items) ? data.items : [];
+    el('incidentsError').hidden = true;
+  } catch (err) {
+    if (requestId !== incidentsState.requestId) return;
+    el('incidentsError').textContent = `Failed to load security incidents: ${err.message}`;
+    el('incidentsError').hidden = false;
+  }
+  renderIncidents();
+}
+
+async function incidentAction(id, action) {
+  incidentsState.busy.add(id);
+  renderIncidents();
+  try {
+    const data = await alertsRequest(`/api/security/incidents/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST', body: {}, admin: true });
+    const updated = data.incident;
+    incidentsState.items = incidentsState.items.map((item) => (item.id === id && updated ? updated : item));
+  } catch (err) {
+    const message = err instanceof SettingsAuthError
+      ? 'Enter a valid admin token in Settings to acknowledge or resolve incidents.'
+      : `Could not ${action} incident #${id}: ${err.message}`;
+    showToast(message, { key: 'incident-action' });
+  } finally {
+    incidentsState.busy.delete(id);
+    renderIncidents();
+  }
+}
+
+el('incidentRows').addEventListener('click', (ev) => {
+  const button = ev.target instanceof Element ? ev.target.closest('[data-incident-action]') : null;
+  if (!button || button.disabled) return;
+  const card = button.closest('[data-incident-id]');
+  const id = Number(card?.dataset.incidentId);
+  if (Number.isFinite(id)) incidentAction(id, button.dataset.incidentAction).catch(() => {});
+});
+
 // Returns the in-flight load when one is running, so callers can await it.
 function loadInsights() {
   if (state.insightsLoading && state.insightsPromise) return state.insightsPromise;
@@ -2071,6 +2366,7 @@ function loadInsights() {
 
 async function fetchInsights() {
   const requestId = ++state.insightsRequestId;
+  loadIncidents().catch(() => {});
   state.insightsLoading = true;
   state.insightsLoaded = false;
   if (!state.anomalies.length) {
@@ -4048,6 +4344,8 @@ el('refreshPipeline').addEventListener('click', () => {
 //   rec     log entry id whose context is open (Logs)
 //   ctx     10 | 25 | 50 lines each side;  ctxall=1: context ignores the range
 //   anomaly anomaly id (expanded in Insights, or investigated in Actionable)
+//   tier    VulnScan risk tier: critical | high | medium | low | all  (critical+high when absent)
+//   vns     VulnScan namespace;  kev=1: KEV only;  resolved=1: include resolved
 //   line    log entry id investigated in Actionable
 //   view    open saved view id (its filters are the ones above; a difference
 //           marks the view as modified)
@@ -4091,7 +4389,8 @@ function parseUrlState(search) {
   } catch (_) {
     params = new URLSearchParams();
   }
-  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null };
+  const out = { tab: 'logs', filters: {}, exclude: {}, q: '', qmode: 'phrase', range: null, from: '', to: '', rec: null, ctx: 10, ctxAll: false, anomaly: null, line: null, view: null,
+    vuln: { tier: VULN_DEFAULT_TIER, namespace: '', kev: false, resolved: false } };
   const tab = params.get('tab');
   if (TABS.includes(tab)) out.tab = tab;
   for (const [key, field, max] of URL_FILTERS) {
@@ -4119,6 +4418,13 @@ function parseUrlState(search) {
   out.anomaly = cleanId(params.get('anomaly'));
   out.line = cleanId(params.get('line'));
   out.view = cleanId(params.get('view'));
+  const tierParam = params.get('tier');
+  if (tierParam === 'critical+high' || tierParam === 'critical,high') out.vuln.tier = VULN_DEFAULT_TIER;
+  else if (VULN_TIER_CHOICES.includes(tierParam)) out.vuln.tier = tierParam;
+  const vns = cleanParam(params.get('vns'), 253);
+  if (vns && VULN_NAMESPACE_RE.test(vns)) out.vuln.namespace = vns;
+  out.vuln.kev = params.get('kev') === '1' || params.get('kev') === 'true';
+  out.vuln.resolved = params.get('resolved') === '1' || params.get('resolved') === 'true';
   return out;
 }
 
@@ -4156,6 +4462,13 @@ function buildUrlParams() {
   }
   if (state.activeTab === 'actionable' && state.actionable.sourceType === 'line' && state.actionable.lineItem) {
     params.set('line', String(state.actionable.lineItem.id));
+  }
+  if (state.activeTab === 'vulnscan') {
+    const f = vulnFilters();
+    if (f.tier !== VULN_DEFAULT_TIER) params.set('tier', f.tier);
+    if (f.namespace && VULN_NAMESPACE_RE.test(f.namespace)) params.set('vns', f.namespace);
+    if (f.kev) params.set('kev', '1');
+    if (f.resolved) params.set('resolved', '1');
   }
   return params;
 }
@@ -4224,6 +4537,13 @@ async function applyUrlState(parsed, { history = 'replace' } = {}) {
     state.context.lines = parsed.ctx;
     state.context.limitToRange = !parsed.ctxAll;
     state.focusAnomalyId = parsed.anomaly;
+    const vulnChanged = el('vulnsTier').value !== parsed.vuln.tier || el('vulnsNamespace').value.trim() !== parsed.vuln.namespace
+      || el('vulnsKev').checked !== parsed.vuln.kev || el('vulnsResolved').checked !== parsed.vuln.resolved;
+    el('vulnsTier').value = parsed.vuln.tier;
+    el('vulnsNamespace').value = parsed.vuln.namespace;
+    el('vulnsKev').checked = parsed.vuln.kev;
+    el('vulnsResolved').checked = parsed.vuln.resolved;
+    if (vulnChanged) vulnsState.loaded = false; // reloaded when the tab is shown
     resetOlderLogsState();
     if (parsed.tab !== 'logs' || parsed.rec === null) closeContext({ history: null });
     switchTab(parsed.tab, { history: null });

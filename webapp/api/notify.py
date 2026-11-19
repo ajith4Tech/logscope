@@ -65,6 +65,7 @@ def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
     severity_shift     a rising share of error -> high, of warning -> medium,
                        anything else (including a falling share) -> low
     message_frequency  a flood of error/warning lines -> high, else medium
+    web_behavioral     high (one source IP brute-forcing, scanning or flooding)
     other              low
     """
     kind = str(anomaly.get("type") or "")
@@ -86,6 +87,8 @@ def anomaly_urgency(anomaly: dict[str, Any], evidence: dict[str, Any]) -> str:
         # flood, now classified by severity) is worth triaging; info chatter
         # stays medium so it is not summarized automatically.
         return {"error": "high", "warning": "high"}.get(severity, "medium")
+    if kind == "web_behavioral":
+        return "high"
     return "low"
 
 
@@ -101,6 +104,7 @@ CASE a.type
          THEN CASE a.severity WHEN 'error' THEN 2 WHEN 'warning' THEN 1 ELSE 0 END
          ELSE 0 END
   WHEN 'message_frequency' THEN CASE a.severity WHEN 'error' THEN 2 WHEN 'warning' THEN 2 ELSE 1 END
+  WHEN 'web_behavioral' THEN 2
   ELSE 0
 END
 """
@@ -110,6 +114,7 @@ _TYPE_LABELS = {
     "message_frequency": "Frequency spike",
     "new_falco_rule": "New Falco rule",
     "severity_shift": "Severity shift",
+    "web_behavioral": "Web behavior (per source IP)",
 }
 
 
@@ -131,7 +136,7 @@ def investigation_links(anomaly: dict[str, Any], evidence: dict[str, Any], base_
     params: dict[str, str] = {"tab": "logs"}
     if anomaly.get("namespace"):
         params["ns"] = str(anomaly["namespace"])
-    if anomaly.get("pod"):
+    if anomaly.get("pod") and anomaly["pod"] != "-":
         params["pod"] = str(anomaly["pod"])
     kind = anomaly.get("type")
     if kind == "error_rate_spike":
@@ -140,6 +145,8 @@ def investigation_links(anomaly: dict[str, Any], evidence: dict[str, Any], base_
         params["sev"] = str(anomaly["severity"])
     elif kind == "new_falco_rule":
         params["scope"] = "security"
+    elif kind == "web_behavioral" and evidence.get("client_ip"):
+        params["q"] = str(evidence["client_ip"])
     if evidence.get("window_start") and evidence.get("window_end"):
         params["from"] = str(evidence["window_start"])
         params["to"] = str(evidence["window_end"])
