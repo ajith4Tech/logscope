@@ -1758,7 +1758,7 @@ function vulnRowMarkup(v) {
       <p class="vuln-title">${escapeHtml(v.title || '')}</p>
       <p class="subtle"><code>${escapeHtml(v.package || '?')}</code> ${escapeHtml(v.installed_version || '')} · ${fix}
         · image <code>${escapeHtml(v.image || '?')}</code></p>
-      <p class="subtle">${escapeHtml((v.risk?.reasons || []).join(' · ') || 'no risk signals')}${v.exposure ? ` · exposed via ${escapeHtml(v.exposure)}` : ''}${attacks ? ` · attacks: ${attacks}` : ''}</p>
+      <p class="subtle">${escapeHtml((v.risk?.reasons || []).join(' · ') || 'no risk signals')}${v.exposure ? ` · exposed via ${escapeHtml(v.exposure)}` : (v.exposure_state === 'unknown' ? ' · exposure unknown (Ingress/Service/EndpointSlice data not readable)' : '')}${attacks ? ` · attacks: ${attacks}` : ''}</p>
     </article>`;
 }
 

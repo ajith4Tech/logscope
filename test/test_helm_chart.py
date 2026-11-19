@@ -458,7 +458,12 @@ def test_vulnerability_view_has_its_own_read_only_cluster_role():
         {"apiGroups": ["aquasecurity.github.io"], "resources": ["vulnerabilityreports", "configauditreports"],
          "verbs": ["get", "list", "watch"]},
         {"apiGroups": ["networking.k8s.io"], "resources": ["ingresses"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": [""], "resources": ["services"], "verbs": ["get", "list", "watch"]},
+        {"apiGroups": ["discovery.k8s.io"], "resources": ["endpointslices"], "verbs": ["get", "list", "watch"]},
     ]
+    # Nothing beyond reads, and no Pods, workloads, Endpoints or Secrets.
+    granted = {r for rule in role["rules"] for r in rule["resources"]}
+    assert granted.isdisjoint({"pods", "deployments", "replicasets", "endpoints", "secrets"})
     binding = _find(docs, "ClusterRoleBinding", "logging-logscope-vulnscan")
     assert binding["roleRef"]["name"] == "logging-logscope-vulnscan"
     assert binding["subjects"] == [{"kind": "ServiceAccount", "name": "logscope-webapp", "namespace": "logging"}]

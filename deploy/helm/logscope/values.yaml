@@ -288,11 +288,12 @@ rbac:
     create: false
 
 # Vulnerability view (webapp/api/vulnscan.py): reads Trivy Operator's
-# VulnerabilityReport / ConfigAuditReport objects and Ingresses with one fixed,
-# read-only kubectl command each. Separate from kubectl.enabled / rbac.* (the
-# actions): enabling this creates a ClusterRole with get/list/watch on exactly
-# those three resources, binds it to this release's ServiceAccount and mounts
-# its token. Needs Trivy Operator installed (README, "Vulnerability scanning")
+# VulnerabilityReport / ConfigAuditReport objects, and Ingresses, Services and
+# EndpointSlices (exposure: Ingress -> Service -> backing pods), with one
+# fixed, read-only kubectl command each. Separate from kubectl.enabled / rbac.*
+# (the actions): enabling this creates a ClusterRole with get/list/watch on
+# exactly those five resources, binds it to this release's ServiceAccount and
+# mounts its token. Needs Trivy Operator installed (README, "Vulnerability scanning")
 # and an image built with INCLUDE_KUBECTL=true.
 security:
   vulnerabilityScanning:

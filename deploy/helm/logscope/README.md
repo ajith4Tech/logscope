@@ -345,11 +345,13 @@ TAG=$(make -s version | sed 's/^v//')
   default) also needs an image with kubectl, plus Trivy Operator installed
   separately (repository README, "Vulnerability scanning"). It creates its own
   ClusterRole `<namespace>-<release>-vulnscan` with `get`/`list`/`watch` on
-  `vulnerabilityreports` and `configauditreports` (`aquasecurity.github.io`)
-  and `ingresses` (`networking.k8s.io`) only, binds it to this release's
-  ServiceAccount and mounts the SA token. It does not depend on, or enable,
-  `kubectl.enabled` or the action Roles; the web app runs only three fixed
-  `kubectl get ... -A -o json` commands with it.
+  `vulnerabilityreports` and `configauditreports` (`aquasecurity.github.io`),
+  `ingresses` (`networking.k8s.io`), `services` and `endpointslices`
+  (`discovery.k8s.io`) only (no Pods, workloads, Endpoints or Secrets, no
+  write verb), binds it to this release's ServiceAccount and mounts the SA
+  token. It does not depend on, or enable, `kubectl.enabled` or the action
+  Roles; the web app runs only five fixed `kubectl get ... -A -o json`
+  commands with it.
 
 Vector (`docker.io/timberio/vector`) and Falco keep pulling their upstream
 images from public registries, as they do today.

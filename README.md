@@ -257,14 +257,16 @@ Operator](https://github.com/aquasecurity/trivy-operator) is a separate
 official Helm chart install, like Falco. It scans every workload's images and
 writes `VulnerabilityReport` / `ConfigAuditReport` objects
 (`aquasecurity.github.io/v1alpha1` with chart 0.38.1) into each workload's
-namespace. The web app reads them with three fixed, read-only kubectl
-commands (no user input, separate from the kubectl actions and their
-allowlist):
+namespace. The web app reads them, and what it needs for exposure, with five
+fixed, read-only kubectl commands (no user input, separate from the kubectl
+actions and their allowlist):
 
 ```
 kubectl get vulnerabilityreports.aquasecurity.github.io -A -o json
 kubectl get configauditreports.aquasecurity.github.io -A -o json
 kubectl get ingresses.networking.k8s.io -A -o json
+kubectl get services -A -o json
+kubectl get endpointslices.discovery.k8s.io -A -o json
 ```
 
 every `webapp.security.vulnscan.poll_interval_s` (1800). It enriches the
@@ -274,16 +276,20 @@ copy is kept when it fails), and scores each finding by risk at read time:
 
 | Tier | Rule (`vulnscan.risk_tier`) |
 |---|---|
-| critical | severity CRITICAL/HIGH **and** a fix exists **and** in KEV **and** (exposed **or** attacked recently) |
+| critical | in KEV **and** (exposed **or** attacked recently), whatever the severity or fix. (The earlier, narrower path — CRITICAL/HIGH **and** a fix **and** in KEV **and** reachable — is still written out; today the KEV path contains it.) |
 | high | two or more of: severity ≥ HIGH, in KEV, exposed, attacked recently |
 | medium | exactly one of those |
 | low | none |
 
-*Exposed*: an Ingress in the namespace routes to a Service whose name matches
-the workload (`-service`/`-svc` and `-deployment`/`-deploy` suffixes ignored;
-Services are not read), or the workload is listed in
+*Exposed*: a real path from an Ingress to a pod of the workload: the
+Ingress's backend Service exists and its EndpointSlices list a pod whose name
+belongs to the workload (`<deployment>-<hash>-xxxxx`, `<statefulset>-N`, ...,
+including names Kubernetes cut to 63 characters). Nothing is inferred from
+names alone. Otherwise the workload is exposed only if it is listed in
 `webapp.security.vulnscan.exposed_workloads` (`namespace` or
-`namespace/workload`, for NodePorts and external load balancers). *Attacked
+`namespace/workload`, for NodePorts and external load balancers). When the
+Ingress/Service/EndpointSlice data could not be read on the last poll and
+neither applies, exposure is reported as `unknown` (counted as not exposed). *Attacked
 recently*: a security incident or an attack-tagged anomaly (web signature or
 `web_behavioral`) on a pod of the workload within `correlation_lookback_s`
 (86400).
@@ -309,8 +315,9 @@ Then enable the view:
 
 - **Helm chart:** `--set security.vulnerabilityScanning.enabled=true`. This
   creates a ClusterRole with `get`/`list`/`watch` on exactly
-  `vulnerabilityreports` and `configauditreports` (`aquasecurity.github.io`)
-  and `ingresses` (`networking.k8s.io`), binds it to the web app's
+  `vulnerabilityreports` and `configauditreports` (`aquasecurity.github.io`),
+  `ingresses` (`networking.k8s.io`), `services` and `endpointslices`
+  (`discovery.k8s.io`), and nothing else, binds it to the web app's
   ServiceAccount and mounts the SA token. It is independent of
   `kubectl.enabled` / `rbac.*` and of `LOGSCOPE_ACTIONS_ENABLED`. The image must
   contain kubectl (`make image INCLUDE_KUBECTL=true`).

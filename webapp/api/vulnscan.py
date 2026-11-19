@@ -1,16 +1,18 @@
 """Vulnerability view: Trivy Operator reports + CISA KEV + exposure + attacks.
 
-Read path (separate from actions.py and its executor, by design): three fixed,
+Read path (separate from actions.py and its executor, by design): five fixed,
 read-only kubectl commands with no input from requests, configuration or
 data (FIXED_COMMANDS), run on a timer:
 
     kubectl get vulnerabilityreports.aquasecurity.github.io -A -o json
     kubectl get configauditreports.aquasecurity.github.io -A -o json
     kubectl get ingresses.networking.k8s.io -A -o json
+    kubectl get services -A -o json
+    kubectl get endpointslices.discovery.k8s.io -A -o json
 
 (group/version as installed by trivy-operator chart 0.38.1: v1alpha1). In
 the cluster the web app's ServiceAccount gets exactly get/list/watch on these
-three resources (Helm chart, security.vulnerabilityScanning.enabled).
+five resources (Helm chart, security.vulnerabilityScanning.enabled).
 
 Without kubectl, RBAC or the CRDs the poller records the degraded state (shown
 in /api/status), logs it once per change of state and tries again only on its
@@ -24,14 +26,20 @@ Trivy last reported, never a source of truth):
                           whose report is absent is left as it was: Trivy
                           deletes and recreates reports on its own TTL)
   config_audit_summary    ConfigAuditReport counts per workload
-  ingress_backends        Service names Ingresses route to, per namespace
+  exposure_paths          Ingress -> Service -> backing pod, from the Services and
+                          their EndpointSlices (targetRef pods)
   kev_catalog / kev_meta  CISA's KEV catalog, refreshed on its own thread
                           (never blocks the poller); on failure the last good
                           catalog stays in use and /api/status shows its age
 
-Risk is computed at read time (risk_tier), joined with exposure (Ingress or
-webapp.security.vulnscan.exposed_workloads) and recent attacks (security
-incidents and attack-tagged anomalies on a pod of the workload).
+Risk is computed at read time (risk_tier), joined with exposure and recent
+attacks (security incidents and attack-tagged anomalies on a pod of the
+workload). Exposure is a real path, never a guess from names: an Ingress
+backend Service that exists, whose EndpointSlices list a pod of the workload
+(pod_matches_workload). Without such a path the allowlist
+webapp.security.vulnscan.exposed_workloads decides; when the Ingress/Service/
+EndpointSlice data could not be read on the last poll and neither says
+"exposed", exposure is "unknown" (counted as not exposed for the risk tier).
 """
 
 from __future__ import annotations
@@ -58,7 +66,10 @@ TRIVY_GROUP = "aquasecurity.github.io"
 VULN_ARGV = ("kubectl", "get", f"vulnerabilityreports.{TRIVY_GROUP}", "-A", "-o", "json")
 CONFIG_AUDIT_ARGV = ("kubectl", "get", f"configauditreports.{TRIVY_GROUP}", "-A", "-o", "json")
 INGRESS_ARGV = ("kubectl", "get", "ingresses.networking.k8s.io", "-A", "-o", "json")
-FIXED_COMMANDS = frozenset({VULN_ARGV, CONFIG_AUDIT_ARGV, INGRESS_ARGV})
+SERVICES_ARGV = ("kubectl", "get", "services", "-A", "-o", "json")
+ENDPOINTSLICES_ARGV = ("kubectl", "get", "endpointslices.discovery.k8s.io", "-A", "-o", "json")
+FIXED_COMMANDS = frozenset({VULN_ARGV, CONFIG_AUDIT_ARGV, INGRESS_ARGV, SERVICES_ARGV, ENDPOINTSLICES_ARGV})
+SERVICE_NAME_LABEL = "kubernetes.io/service-name"
 MAX_OUTPUT_BYTES = 256 * 1024 * 1024
 KEV_MAX_BYTES = 64 * 1024 * 1024
 KEV_TIMEOUT_S = 30
@@ -108,12 +119,15 @@ _SCHEMA = (
         PRIMARY KEY (namespace, workload_kind, workload)
     )
     """,
+    # Replaced by exposure_paths (the old table held name-matched Services).
+    "DROP TABLE IF EXISTS ingress_backends",
     """
-    CREATE TABLE IF NOT EXISTS ingress_backends (
+    CREATE TABLE IF NOT EXISTS exposure_paths (
         namespace TEXT NOT NULL,
         ingress TEXT NOT NULL,
         service TEXT NOT NULL,
-        PRIMARY KEY (namespace, ingress, service)
+        pod TEXT NOT NULL,
+        PRIMARY KEY (namespace, ingress, service, pod)
     )
     """,
     """
@@ -311,32 +325,76 @@ def parse_ingresses(data: dict[str, Any]) -> list[tuple[str, str, str]]:
     return sorted(out)
 
 
+def parse_services(data: dict[str, Any]) -> set[tuple[str, str]]:
+    """(namespace, name) of every Service."""
+    out: set[tuple[str, str]] = set()
+    for svc in data.get("items") or []:
+        meta = (svc or {}).get("metadata") or {}
+        if meta.get("namespace") and meta.get("name"):
+            out.add((str(meta["namespace"]), str(meta["name"])))
+    return out
+
+
+def parse_endpointslices(data: dict[str, Any]) -> dict[tuple[str, str], set[str]]:
+    """{(namespace, service): pod names} from EndpointSlices: the slice's
+    kubernetes.io/service-name label and its endpoints' Pod targetRefs
+    (ready or not: a path exists either way)."""
+    out: dict[tuple[str, str], set[str]] = {}
+    for sl in data.get("items") or []:
+        meta = (sl or {}).get("metadata") or {}
+        ns = str(meta.get("namespace") or "")
+        service = str((meta.get("labels") or {}).get(SERVICE_NAME_LABEL) or "")
+        if not ns or not service:
+            continue
+        pods = out.setdefault((ns, service), set())
+        for endpoint in sl.get("endpoints") or []:
+            ref = (endpoint or {}).get("targetRef") or {}
+            if ref.get("kind") == "Pod" and ref.get("name") and str(ref.get("namespace") or ns) == ns:
+                pods.add(str(ref["name"]))
+    return out
+
+
+def exposure_chain(backends: list[tuple[str, str, str]], services: set[tuple[str, str]],
+                   slices: dict[tuple[str, str], set[str]]) -> list[tuple[str, str, str, str]]:
+    """(namespace, ingress, service, pod) for every Ingress backend Service
+    that exists and has a pod behind it. A backend whose Service is missing,
+    or has no EndpointSlice pods, yields nothing (no path)."""
+    out: set[tuple[str, str, str, str]] = set()
+    for ns, ingress, service in backends:
+        if (ns, service) not in services:
+            continue
+        for pod in slices.get((ns, service), ()):
+            out.add((ns, ingress, service, pod))
+    return sorted(out)
+
+
 # ─── Exposure, attack correlation, risk ──────────────────────────────────────
 
-_SERVICE_SUFFIXES = ("-service", "-svc")
-_WORKLOAD_SUFFIXES = ("-deployment", "-deploy", "-statefulset", "-sts", "-daemonset", "-ds")
-
-
-def _base(name: str, suffixes: tuple[str, ...]) -> str:
-    for suffix in suffixes:
-        if name.endswith(suffix) and len(name) > len(suffix):
-            return name[: -len(suffix)]
-    return name
-
-
-def service_routes_to(service: str, workload: str) -> bool:
-    """Whether a Service of this name fronts this workload, by name: equal
-    once a trailing -service/-svc and -deployment/-deploy/... are removed
-    (user-ajith-pgadmin-service -> user-ajith-pgadmin-deployment). Service
-    selectors are not read (the ClusterRole grants no access to Services);
-    webapp.security.vulnscan.exposed_workloads covers what this misses."""
-    return _base(service, _SERVICE_SUFFIXES) == _base(workload, _WORKLOAD_SUFFIXES)
+_GENERATED_SUFFIX_KINDS = ("Deployment", "ReplicaSet", "DaemonSet", "Job")
 
 
 def pod_matches_workload(pod: str | None, kind: str, workload: str) -> bool:
-    """A pod belongs to the workload, by its generated name."""
+    """A pod belongs to the workload, by its generated name: the identity
+    used both for attack correlation and for exposure (EndpointSlice pods).
+
+    Kubernetes cuts a generated pod name to 63 characters: the owner's
+    generateName is truncated to 58 and 5 random characters follow, so a
+    long Deployment's pods lose the hash (e.g. "...-pgadmin-deploymenzpnl").
+    A 63-character name matches only what that cut can produce:
+      * ReplicaSet/DaemonSet/Job pods ("<name>-"): its first 58 characters
+        are exactly ("<workload>-")[:58];
+      * Deployment pods ("<deployment>-<pod-template-hash>-"): the same, or
+        "<workload>-" followed by the start of a 1-10 character hash (so a
+        shorter workload that is merely a prefix does not match)."""
     if not pod or pod == "-" or not workload:
         return False
+    if kind in _GENERATED_SUFFIX_KINDS and len(pod) == 63:
+        head = pod[:58]
+        if head == (workload + "-")[:58]:
+            return True
+        if kind == "Deployment" and head.startswith(workload + "-") and \
+                re.fullmatch(r"[a-z0-9]{1,10}-?", head[len(workload) + 1:]):
+            return True
     w = re.escape(workload)
     patterns = {
         "Deployment": rf"{w}-[a-z0-9]{{6,10}}-[a-z0-9]{{5}}",
@@ -353,22 +411,35 @@ def pod_matches_workload(pod: str | None, kind: str, workload: str) -> bool:
 def risk_tier(*, severity: str, fixable: bool, is_kev: bool, exposed: bool, attacked: bool) -> dict[str, Any]:
     """The risk tier of one finding, and why. The rule (tune here):
 
-      critical  severity CRITICAL or HIGH, AND a fix exists, AND in CISA KEV,
-                AND (exposed OR attacked recently)
+      critical  either path:
+                  (A) severity CRITICAL or HIGH, AND a fix exists, AND in CISA
+                      KEV, AND (exposed OR attacked recently)
+                  (B) in CISA KEV AND (exposed OR attacked recently), whatever
+                      the severity or fix: KEV listing already means real-world
+                      exploitation, and reachability makes it urgent
+                Today (B) contains (A): every finding (A) catches, (B) catches
+                too. (A) stays written out because tightening (B) later (e.g.
+                requiring a fix, or a severity floor) must not drop what (A)
+                covers. The reason list says which path matched.
       high      at least two of: severity >= HIGH, in KEV, exposed, attacked
       medium    exactly one of those four
       low       none of them
 
-    "exposed": an Ingress routes to the workload or it is listed in
-    exposed_workloads. "attacked": a security incident or attack-tagged
-    anomaly on a pod of the workload within correlation_lookback_s.
+    "exposed": a real Ingress -> Service -> EndpointSlice path to a pod of
+    the workload, or the workload listed in exposed_workloads. "attacked": a
+    security incident or attack-tagged anomaly on a pod of the workload
+    within correlation_lookback_s.
     """
     severe = SEVERITY_RANK.get(severity, 0) >= SEVERITY_RANK["HIGH"]
     signals = {"severity>=HIGH": severe, "known exploited (KEV)": is_kev, "exposed": exposed,
                "recent attack": attacked}
     reasons = [name for name, on in signals.items() if on]
-    if severe and fixable and is_kev and (exposed or attacked):
+    reachable = exposed or attacked
+    path_a = severe and fixable and is_kev and reachable
+    path_b = is_kev and reachable
+    if path_a or path_b:
         tier = "critical"
+        reasons.append("critical: fixable severe KEV, reachable" if path_a else "critical: KEV, reachable")
     elif len(reasons) >= 2:
         tier = "high"
     elif len(reasons) == 1:
@@ -464,11 +535,11 @@ class VulnStore:
                   _iso(now)) for i in items])
             self._conn.commit()
 
-    def replace_ingresses(self, backends: list[tuple[str, str, str]]) -> None:
+    def replace_exposure_paths(self, paths: list[tuple[str, str, str, str]]) -> None:
         with self._lock:
-            self._conn.execute("DELETE FROM ingress_backends")
-            self._conn.executemany("INSERT INTO ingress_backends (namespace, ingress, service) VALUES (?, ?, ?)",
-                                   backends)
+            self._conn.execute("DELETE FROM exposure_paths")
+            self._conn.executemany(
+                "INSERT INTO exposure_paths (namespace, ingress, service, pod) VALUES (?, ?, ?, ?)", paths)
             self._conn.commit()
 
     # -- KEV ----------------------------------------------------------------------
@@ -549,7 +620,10 @@ class VulnScanner:
         self.last_success_at: str | None = None
         self.last_error: str | None = None
         self.last_counts: dict[str, int] = {}
-        self.ingress_state = "never"
+        # Ingress/Service/EndpointSlice chain: "ok" when all three were read on
+        # the last poll, else the failure's state (exposure is then "unknown"
+        # unless a path or the allowlist says exposed).
+        self.exposure_state = "never"
         self._logged_state: str | None = None
 
     @property
@@ -629,10 +703,16 @@ class VulnScanner:
         except KubectlUnavailable as exc:
             logger.info("ConfigAuditReports not read (%s)", exc.state)
         try:
-            self.store.replace_ingresses(parse_ingresses(self._runner(INGRESS_ARGV, timeout=timeout)))
-            self.ingress_state = "ok"
+            backends = parse_ingresses(self._runner(INGRESS_ARGV, timeout=timeout))
+            services = parse_services(self._runner(SERVICES_ARGV, timeout=timeout))
+            slices = parse_endpointslices(self._runner(ENDPOINTSLICES_ARGV, timeout=timeout))
         except KubectlUnavailable as exc:
-            self.ingress_state = exc.state
+            # Keep the last paths (positive evidence); absence is now unknown.
+            self.exposure_state = exc.state
+            logger.info("Exposure chain not read (%s); exposure is unknown where no path is known", exc.state)
+        else:
+            self.store.replace_exposure_paths(exposure_chain(backends, services, slices))
+            self.exposure_state = "ok"
         self.last_counts = counts
         return counts
 
@@ -687,21 +767,25 @@ class VulnScanner:
         return {"enabled": bool(self.vcfg.enabled), "state": self.state, "degraded": degraded,
                 "rbac_missing": self.state == "rbac_missing", "kubectl_missing": self.state == "kubectl_missing",
                 "last_poll_at": self.last_poll_at, "last_success_at": self.last_success_at,
-                "last_error": self.last_error, "ingress_state": self.ingress_state,
+                "last_error": self.last_error, "exposure_state": self.exposure_state,
                 "findings_open": open_count, "last_counts": dict(self.last_counts), "kev": kev}
 
     # -- read-time view ------------------------------------------------------------
 
-    def exposure(self, namespace: str, workload: str, backends: dict[str, list[tuple[str, str]]]) -> str | None:
-        """Why the workload is exposed ("config" / "ingress <name>"), or None."""
+    def exposure(self, namespace: str, kind: str, workload: str,
+                 paths: dict[str, list[tuple[str, str, str]]]) -> dict[str, Any]:
+        """{"state": exposed | not_exposed | unknown, "via": text or None}.
+        A real Ingress -> Service -> pod path first, then the allowlist; with
+        neither, "not_exposed" when the chain was read on the last poll, else
+        "unknown". Never decided from names."""
+        for ingress, service, pod in paths.get(namespace, []):
+            if pod_matches_workload(pod, kind, workload):
+                return {"state": "exposed", "via": f"ingress {ingress} -> service {service} -> pod {pod}"}
         for entry in self.vcfg.exposed_workloads:
             ns, _, wl = entry.partition("/")
             if ns == namespace and (not wl or wl == workload):
-                return "config"
-        for ingress, service in backends.get(namespace, []):
-            if service_routes_to(service, workload):
-                return f"ingress {ingress}"
-        return None
+                return {"state": "exposed", "via": "config (exposed_workloads)"}
+        return {"state": "not_exposed" if self.exposure_state == "ok" else "unknown", "via": None}
 
     def attacks(self, namespace: str, kind: str, workload: str, now: datetime) -> dict[str, list[dict[str, Any]]]:
         """Security incidents and attack-tagged anomalies on a pod of the
@@ -747,9 +831,9 @@ class VulnScanner:
             "k.short_description AS kev_description, k.known_ransomware AS kev_ransomware "
             "FROM vulnerability_findings f LEFT JOIN kev_catalog k ON k.cve_id = f.cve_id"
             + (" WHERE " + " AND ".join(where) if where else ""), tuple(args))
-        backends: dict[str, list[tuple[str, str]]] = {}
-        for b in self.store.rows("SELECT namespace, ingress, service FROM ingress_backends"):
-            backends.setdefault(b["namespace"], []).append((b["ingress"], b["service"]))
+        paths: dict[str, list[tuple[str, str, str]]] = {}
+        for p in self.store.rows("SELECT namespace, ingress, service, pod FROM exposure_paths ORDER BY ingress, pod"):
+            paths.setdefault(p["namespace"], []).append((p["ingress"], p["service"], p["pod"]))
         audits = {(a["namespace"], a["workload_kind"], a["workload"]): a
                   for a in self.store.rows("SELECT * FROM config_audit_summary")}
         per_workload: dict[tuple, dict[str, Any]] = {}
@@ -760,13 +844,15 @@ class VulnScanner:
                 attacks = self.attacks(*wkey, now)
                 audit = audits.get(wkey)
                 per_workload[wkey] = {
-                    "exposure": self.exposure(row["namespace"], row["workload"], backends), "attacks": attacks,
+                    "exposure": self.exposure(row["namespace"], row["workload_kind"], row["workload"], paths),
+                    "attacks": attacks,
                     "config_audit": ({k: audit[k] for k in ("critical", "high", "medium", "low")} if audit else None)}
             context = per_workload[wkey]
             is_kev = row["kev_cve"] is not None
             attacked = bool(context["attacks"]["incidents"] or context["attacks"]["anomalies"])
+            exposed = context["exposure"]["state"] == "exposed"
             risk = risk_tier(severity=row["severity"], fixable=bool(row["fixed_version"]), is_kev=is_kev,
-                             exposed=context["exposure"] is not None, attacked=attacked)
+                             exposed=exposed, attacked=attacked)
             counts[risk["tier"]] += 1
             if tier and risk["tier"] != tier:
                 continue
@@ -777,7 +863,8 @@ class VulnScanner:
                 "is_kev": is_kev,
                 "kev": ({"date_added": row["kev_date_added"], "short_description": row["kev_description"],
                          "known_ransomware": row["kev_ransomware"]} if is_kev else None),
-                "exposed": context["exposure"] is not None, "exposure": context["exposure"],
+                "exposed": exposed, "exposure": context["exposure"]["via"],
+                "exposure_state": context["exposure"]["state"],
                 "attacks": context["attacks"], "config_audit": context["config_audit"], "risk": risk,
             })
             items.append(item)
@@ -789,4 +876,5 @@ class VulnScanner:
 
 
 __all__ = ["FIXED_COMMANDS", "KubectlUnavailable", "VulnScanner", "VulnStore", "parse_ingresses", "parse_kev",
-           "parse_vulnerability_reports", "pod_matches_workload", "risk_tier", "run_fixed", "service_routes_to"]
+           "parse_endpointslices", "parse_services", "parse_vulnerability_reports", "pod_matches_workload",
+           "exposure_chain", "risk_tier", "run_fixed"]

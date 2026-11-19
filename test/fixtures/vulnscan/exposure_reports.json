@@ -1,0 +1,150 @@
+{
+ "apiVersion": "v1",
+ "kind": "List",
+ "items": [
+  {
+   "apiVersion": "aquasecurity.github.io/v1alpha1",
+   "kind": "VulnerabilityReport",
+   "metadata": {
+    "name": "statefulset-ghost-ghost",
+    "namespace": "blog",
+    "creationTimestamp": "2026-11-19T14:00:00Z",
+    "labels": {
+     "app.kubernetes.io/managed-by": "trivy-operator",
+     "resource-spec-hash": "7bf5c4d6b6",
+     "trivy-operator.container.name": "ghost",
+     "trivy-operator.resource.kind": "StatefulSet",
+     "trivy-operator.resource.name": "ghost",
+     "trivy-operator.resource.namespace": "blog"
+    },
+    "ownerReferences": [
+     {
+      "apiVersion": "apps/v1",
+      "blockOwnerDeletion": false,
+      "controller": true,
+      "kind": "StatefulSet",
+      "name": "ghost",
+      "uid": "00000000-0000-0000-0000-000000000000"
+     }
+    ]
+   },
+   "report": {
+    "artifact": {
+     "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+     "repository": "library/mysql",
+     "tag": "8.0.36"
+    },
+    "os": {
+     "family": "debian",
+     "name": "12.5"
+    },
+    "registry": {
+     "server": "index.docker.io"
+    },
+    "scanner": {
+     "name": "Trivy",
+     "vendor": "Aqua Security",
+     "version": "0.58.0"
+    },
+    "summary": {
+     "criticalCount": 1,
+     "highCount": 1,
+     "mediumCount": 0,
+     "lowCount": 0,
+     "noneCount": 0,
+     "unknownCount": 0
+    },
+    "updateTimestamp": "2026-11-19T14:00:00Z",
+    "vulnerabilities": [
+     {
+      "vulnerabilityID": "CVE-2024-30001",
+      "severity": "HIGH",
+      "resource": "mysql-client",
+      "installedVersion": "8.0.36",
+      "fixedVersion": "8.0.37",
+      "title": "mysql: mysqldump unspecified vulnerability",
+      "primaryLink": "https://avd.aquasec.com/nvd/cve-2024-21096",
+      "score": 7.5,
+      "links": [],
+      "packagePURL": "pkg:deb/debian/mysql-client@8.0.36",
+      "publishedDate": "2024-06-09T20:15:11Z",
+      "lastModifiedDate": "2024-08-14T17:49:19Z",
+      "target": ""
+     }
+    ]
+   }
+  },
+  {
+   "apiVersion": "aquasecurity.github.io/v1alpha1",
+   "kind": "VulnerabilityReport",
+   "metadata": {
+    "name": "replicaset-tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-",
+    "namespace": "tenants",
+    "creationTimestamp": "2026-11-19T14:00:00Z",
+    "labels": {
+     "app.kubernetes.io/managed-by": "trivy-operator",
+     "resource-spec-hash": "7bf5c4d6b6",
+     "trivy-operator.container.name": "pgadmin",
+     "trivy-operator.resource.kind": "ReplicaSet",
+     "trivy-operator.resource.name": "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployment-7d4f8b9c6d",
+     "trivy-operator.resource.namespace": "tenants"
+    },
+    "ownerReferences": [
+     {
+      "apiVersion": "apps/v1",
+      "blockOwnerDeletion": false,
+      "controller": true,
+      "kind": "ReplicaSet",
+      "name": "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployment-7d4f8b9c6d",
+      "uid": "00000000-0000-0000-0000-000000000000"
+     }
+    ]
+   },
+   "report": {
+    "artifact": {
+     "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+     "repository": "library/mysql",
+     "tag": "8.0.36"
+    },
+    "os": {
+     "family": "debian",
+     "name": "12.5"
+    },
+    "registry": {
+     "server": "index.docker.io"
+    },
+    "scanner": {
+     "name": "Trivy",
+     "vendor": "Aqua Security",
+     "version": "0.58.0"
+    },
+    "summary": {
+     "criticalCount": 1,
+     "highCount": 1,
+     "mediumCount": 0,
+     "lowCount": 0,
+     "noneCount": 0,
+     "unknownCount": 0
+    },
+    "updateTimestamp": "2026-11-19T14:00:00Z",
+    "vulnerabilities": [
+     {
+      "vulnerabilityID": "CVE-2024-30002",
+      "severity": "HIGH",
+      "resource": "mysql-client",
+      "installedVersion": "8.0.36",
+      "fixedVersion": "8.0.37",
+      "title": "mysql: mysqldump unspecified vulnerability",
+      "primaryLink": "https://avd.aquasec.com/nvd/cve-2024-21096",
+      "score": 7.5,
+      "links": [],
+      "packagePURL": "pkg:deb/debian/mysql-client@8.0.36",
+      "publishedDate": "2024-06-09T20:15:11Z",
+      "lastModifiedDate": "2024-08-14T17:49:19Z",
+      "target": ""
+     }
+    ]
+   }
+  }
+ ]
+}

@@ -30,18 +30,23 @@ from webapp.api.security import IncidentStore  # noqa: E402
 from webapp.api.storage import LogStorage  # noqa: E402
 from webapp.api.vulnscan import (  # noqa: E402
     CONFIG_AUDIT_ARGV,
+    ENDPOINTSLICES_ARGV,
     FIXED_COMMANDS,
     INGRESS_ARGV,
+    SERVICES_ARGV,
+    SEVERITIES,
     VULN_ARGV,
     KubectlUnavailable,
     VulnScanner,
     VulnStore,
+    exposure_chain,
+    parse_endpointslices,
     parse_ingresses,
+    parse_services,
     parse_vulnerability_reports,
     pod_matches_workload,
     risk_tier,
     run_fixed,
-    service_routes_to,
 )
 
 FIX = ROOT / "test" / "fixtures" / "vulnscan"
@@ -61,19 +66,33 @@ def _cfg(**vulnscan_values):
 
 
 class FakeKubectl:
-    """Answers the three fixed commands from fixtures (or raises)."""
+    """Answers the five fixed commands from fixtures, or raises: `fail` for
+    every command, `fail_on` for one command."""
 
-    def __init__(self, reports: dict | None = None, *, fail: KubectlUnavailable | None = None):
+    def __init__(self, reports: dict | None = None, *, fail: KubectlUnavailable | None = None,
+                 fail_on: dict | None = None):
         self.reports = reports if reports is not None else _load("vulnerabilityreports")
         self.fail = fail
+        self.fail_on = fail_on or {}
         self.calls: list[tuple] = []
 
     def __call__(self, argv, *, timeout):
         self.calls.append(argv)
         if self.fail is not None:
             raise self.fail
+        if argv in self.fail_on:
+            raise self.fail_on[argv]
         return {VULN_ARGV: self.reports, CONFIG_AUDIT_ARGV: _load("configauditreports"),
-                INGRESS_ARGV: _load("ingresses")}[argv]
+                INGRESS_ARGV: _load("ingresses"), SERVICES_ARGV: _load("services"),
+                ENDPOINTSLICES_ARGV: _load("endpointslices")}[argv]
+
+
+def _with_exposure_reports() -> dict:
+    """The base reports plus blog/ghost (broken chain) and a long-named
+    tenants Deployment (truncated pod name)."""
+    reports = _load("vulnerabilityreports")
+    reports["items"] += _load("exposure_reports")["items"]
+    return reports
 
 
 class FakeKev:
@@ -223,26 +242,85 @@ def test_kev_does_not_block_polling(tmp_path):
 # ─── exposure ────────────────────────────────────────────────────────────────
 
 
-def test_exposure_by_ingress_allowlist_or_neither(tmp_path):
+def test_exposure_by_real_chain_allowlist_or_neither(tmp_path):
     scanner = _scanner(tmp_path, exposed_workloads=("db/mysql",))
     scanner.poll_once(NOW)
+    assert scanner.exposure_state == "ok"
     view = scanner.view(limit=100)
-    assert _find(view, "CVE-2024-4577")["exposure"] == "ingress shop-ingress"  # wordpress-service -> wordpress
-    assert _find(view, "CVE-2021-44228")["exposure"] == "config"
-    assert _find(view, "CVE-2026-13221")["exposure"] is None and not _find(view, "CVE-2026-13221")["exposed"]
+    wp = _find(view, "CVE-2024-4577")
+    assert wp["exposed"] and wp["exposure_state"] == "exposed"
+    assert wp["exposure"] == "ingress shop-ingress -> service wordpress-service -> pod wordpress-7d79967bc8-qjt4c"
+    # db/mysql has a Service with pods (mysql-0) but no Ingress: only the allowlist exposes it.
+    mysql = _find(view, "CVE-2021-44228")
+    assert mysql["exposure_state"] == "exposed" and mysql["exposure"] == "config (exposed_workloads)"
+    vector = _find(view, "CVE-2026-13221")
+    assert vector["exposure"] is None and not vector["exposed"] and vector["exposure_state"] == "not_exposed"
+    # Without the allowlist entry mysql is not exposed either (no name guessing from the "mysql" Service).
+    scanner.cfg = _cfg()
+    assert _find(scanner.view(limit=100), "CVE-2021-44228")["exposure_state"] == "not_exposed"
     # A whole namespace in the allowlist.
     scanner.cfg = _cfg(exposed_workloads=("logging",))
-    assert _find(scanner.view(limit=100), "CVE-2026-13221")["exposure"] == "config"
+    assert _find(scanner.view(limit=100), "CVE-2026-13221")["exposure"] == "config (exposed_workloads)"
 
 
-def test_service_name_matching():
-    assert service_routes_to("wordpress-service", "wordpress")
-    assert service_routes_to("user-ajith-pgadmin-service", "user-ajith-pgadmin-deployment")
-    assert service_routes_to("user-postgres-pga", "user-postgres-pga")
-    assert not service_routes_to("user-ajith-pgadmin-service", "user-ajith-deployment")
-    assert not service_routes_to("web", "web-api")
-    assert parse_ingresses(_load("ingresses")) == [("shop", "shop-ingress", "wordpress-service"),
-                                                   ("user-ajith", "admin", "user-ajith-pgadmin-service")]
+def test_broken_chain_is_not_exposed_and_never_guessed_from_names(tmp_path):
+    """blog/ghost-service exists and has an Ingress, but its EndpointSlice pods
+    belong to ghost-canary, not StatefulSet ghost (the old name rule would have
+    called ghost exposed); shop/old-ingress points at a Service that does not
+    exist."""
+    scanner = _scanner(tmp_path, runner=FakeKubectl(_with_exposure_reports()))
+    scanner.poll_once(NOW)
+    ghost = _find(scanner.view(limit=100), "CVE-2024-30001")
+    assert ghost["workload"] == "ghost" and ghost["exposed"] is False and ghost["exposure_state"] == "not_exposed"
+    paths = scanner.store.rows("SELECT namespace, ingress, service, pod FROM exposure_paths ORDER BY namespace")
+    assert [(p["namespace"], p["service"], p["pod"]) for p in paths] == [
+        ("blog", "ghost-service", "ghost-canary-6d9f7c8b5-k2p4x"),
+        ("shop", "wordpress-service", "wordpress-7d79967bc8-qjt4c"),
+        ("tenants", "tenant-pgadmin-service", "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployzpnl7"),
+    ]  # no row for old-ingress -> missing-svc, none for the Pod-less endpoint, none for mysql (no Ingress)
+
+
+def test_truncated_pod_name_still_exposes_its_deployment(tmp_path):
+    scanner = _scanner(tmp_path, runner=FakeKubectl(_with_exposure_reports()))
+    scanner.poll_once(NOW)
+    tenant = _find(scanner.view(limit=100), "CVE-2024-30002")
+    assert tenant["workload_kind"] == "Deployment"
+    assert tenant["workload"] == "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployment"
+    assert tenant["exposure_state"] == "exposed" and "deployzpnl7" in tenant["exposure"]
+
+
+def test_unreadable_chain_means_unknown_not_guessed(tmp_path):
+    runner = FakeKubectl(_with_exposure_reports())
+    scanner = _scanner(tmp_path, runner=runner, exposed_workloads=("db/mysql",))
+    scanner.poll_once(NOW)
+    # Next poll: EndpointSlices are forbidden (RBAC not updated yet).
+    runner.fail_on = {ENDPOINTSLICES_ARGV: KubectlUnavailable("rbac_missing", "endpointslices is forbidden")}
+    scanner.poll_once(NOW + timedelta(minutes=30))
+    assert scanner.exposure_state == "rbac_missing" and scanner.status()["exposure_state"] == "rbac_missing"
+    view = scanner.view(limit=100)
+    # A path found earlier is still positive evidence; the allowlist still applies.
+    assert _find(view, "CVE-2024-4577")["exposure_state"] == "exposed"
+    assert _find(view, "CVE-2021-44228")["exposure_state"] == "exposed"
+    # No known path and nothing in the allowlist: unknown, counted as not exposed for risk.
+    vector = _find(view, "CVE-2026-13221")
+    assert vector["exposure_state"] == "unknown" and vector["exposed"] is False
+    assert "exposed" not in vector["risk"]["reasons"]
+    # Never read at all (first poll fails): unknown from the start.
+    fresh = _scanner(tmp_path / "fresh", runner=FakeKubectl(fail_on={
+        SERVICES_ARGV: KubectlUnavailable("rbac_missing", "services is forbidden")}))
+    fresh.poll_once(NOW)
+    assert {i["exposure_state"] for i in fresh.view(limit=100)["items"]} == {"unknown"}
+
+
+def test_chain_parsers():
+    assert parse_ingresses(_load("ingresses"))[:2] == [("blog", "blog-ingress", "ghost-service"),
+                                                       ("shop", "old-ingress", "missing-svc")]
+    services = parse_services(_load("services"))
+    assert ("shop", "wordpress-service") in services and ("shop", "missing-svc") not in services
+    slices = parse_endpointslices(_load("endpointslices"))
+    assert slices[("shop", "wordpress-service")] == {"wordpress-7d79967bc8-qjt4c"}  # two slices merged, Pod-less skipped
+    assert exposure_chain([("shop", "i", "missing-svc"), ("db", "i", "mysql")], services, {}) == []
+    assert exposure_chain([("db", "i", "mysql")], services, slices) == [("db", "i", "mysql", "mysql-0")]
 
 
 # ─── attack correlation ──────────────────────────────────────────────────────
@@ -290,6 +368,17 @@ def test_attack_tagged_anomaly_on_a_pod_of_the_workload_correlates(tmp_path):
     assert [a["id"] for a in log4j["attacks"]["anomalies"]] == [behavioral] and other != behavioral
 
 
+def test_truncated_generated_pod_names():
+    long_deploy = "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployment"
+    pod = "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployzpnl7"
+    assert len(pod) == 63 and pod_matches_workload(pod, "Deployment", long_deploy)
+    assert not pod_matches_workload(pod, "Deployment", long_deploy.replace("pgadmin", "pgbouncer"))
+    assert not pod_matches_workload(pod, "StatefulSet", long_deploy)  # StatefulSet pod names are never generated
+    # A 63-char pod of a different, shorter workload whose name is a prefix does not match.
+    other = "tenant-0c9a6e2b-7f41-4d2e-9b3a-55aa11bb22cc-pgadmin-deployment-extra-7d4f8b9c6d-"[:58] + "abcde"
+    assert len(other) == 63 and not pod_matches_workload(other, "Deployment", "tenant-0c9a6e2b-7f41")
+
+
 def test_pod_names_per_workload_kind():
     assert pod_matches_workload(WP_POD, "Deployment", "wordpress")
     assert not pod_matches_workload("wordpress-api-7d79967bc8-qjt4c", "Deployment", "wordpress")
@@ -305,21 +394,60 @@ BASE_RISK = {"severity": "HIGH", "fixable": True, "is_kev": True, "exposed": Tru
 
 
 @pytest.mark.parametrize("changes, tier", [
-    ({}, "critical"),                                            # HIGH, fix, KEV, exposed
+    # The original 12. Two moved up with path (B) (KEV + reachable), by design:
+    ({}, "critical"),                                            # HIGH, fix, KEV, exposed (A and B)
     ({"exposed": False, "attacked": True}, "critical"),          # attacked instead of exposed
     ({"severity": "CRITICAL"}, "critical"),
-    ({"severity": "MEDIUM"}, "high"),                            # just below HIGH: KEV + exposed = 2 signals
-    ({"fixable": False}, "high"),                                # no fix: not critical, 3 signals
+    ({"severity": "MEDIUM"}, "critical"),                        # was high: (B) KEV + exposed, any severity
+    ({"fixable": False}, "critical"),                            # was high: (B) has no fix condition
     ({"is_kev": False}, "high"),                                 # not KEV: severe + exposed
-    ({"exposed": False}, "high"),                                # neither exposed nor attacked: severe + KEV
+    ({"exposed": False}, "high"),                                # KEV but not reachable: severe + KEV
     ({"is_kev": False, "exposed": False}, "medium"),             # severity alone
-    ({"severity": "MEDIUM", "exposed": False}, "medium"),        # KEV alone
+    ({"severity": "MEDIUM", "exposed": False}, "medium"),        # KEV alone (not reachable)
     ({"severity": "LOW", "is_kev": False}, "medium"),            # exposed alone
     ({"severity": "LOW", "is_kev": False, "exposed": False}, "low"),
     ({"severity": "UNKNOWN", "is_kev": False, "exposed": False, "fixable": False}, "low"),
+    # Path (B) boundaries:
+    ({"severity": "LOW", "fixable": False}, "critical"),         # LOW, no fix, KEV, exposed
+    ({"severity": "UNKNOWN", "fixable": False, "exposed": False, "attacked": True}, "critical"),
+    ({"severity": "MEDIUM", "is_kev": False}, "medium"),         # same finding without KEV: exposed only
+    ({"severity": "MEDIUM", "is_kev": False, "attacked": True}, "high"),  # without KEV: exposed + attacked
+    ({"severity": "LOW", "exposed": False}, "medium"),           # KEV, LOW, not reachable: KEV alone
 ])
 def test_risk_tier_boundaries(changes, tier):
     assert risk_tier(**{**BASE_RISK, **changes})["tier"] == tier
+
+
+def test_critical_paths_are_named_in_the_reasons():
+    assert "critical: fixable severe KEV, reachable" in risk_tier(**BASE_RISK)["reasons"]
+    assert "critical: KEV, reachable" in risk_tier(**{**BASE_RISK, "severity": "LOW"})["reasons"]
+    assert not any(r.startswith("critical") for r in risk_tier(**{**BASE_RISK, "exposed": False})["reasons"])
+
+
+def _old_tier(severity, fixable, is_kev, exposed, attacked):
+    """The rule before path (B), kept here to prove the change is additive."""
+    severe = SEVERITIES.index(severity) <= SEVERITIES.index("HIGH")
+    signals = sum((severe, is_kev, exposed, attacked))
+    if severe and fixable and is_kev and (exposed or attacked):
+        return "critical"
+    return "high" if signals >= 2 else "medium" if signals == 1 else "low"
+
+
+def test_path_b_only_ever_adds_to_critical():
+    import itertools  # noqa: PLC0415
+
+    moved = []
+    for severity, *flags in itertools.product(SEVERITIES, *[(False, True)] * 4):
+        old = _old_tier(severity, *flags)
+        new = risk_tier(severity=severity, fixable=flags[0], is_kev=flags[1], exposed=flags[2],
+                        attacked=flags[3])["tier"]
+        if old == "critical":
+            assert new == "critical", (severity, flags)  # nothing critical drops
+        if new != old:
+            assert new == "critical" and flags[1] and (flags[2] or flags[3]), (severity, flags, old)
+            moved.append((severity, old))
+    # Exactly the KEV + reachable findings outside (A) moved up, from high or medium.
+    assert moved and {old for _, old in moved} <= {"high", "medium"}
 
 
 def test_risk_in_the_view(tmp_path):
@@ -399,7 +527,7 @@ def test_run_fixed_states_without_a_cluster(monkeypatch):
 
 
 def test_only_the_fixed_commands_can_run():
-    assert {VULN_ARGV, CONFIG_AUDIT_ARGV, INGRESS_ARGV} == FIXED_COMMANDS
+    assert {VULN_ARGV, CONFIG_AUDIT_ARGV, INGRESS_ARGV, SERVICES_ARGV, ENDPOINTSLICES_ARGV} == FIXED_COMMANDS
     assert all(argv[:2] == ("kubectl", "get") and argv[-3:] == ("-A", "-o", "json") for argv in FIXED_COMMANDS)
     for argv in (("kubectl", "delete", "pods", "-A"), ("kubectl", "get", "secrets", "-A", "-o", "json"), ("sh",)):
         with pytest.raises(ValueError):
@@ -501,3 +629,15 @@ eval(grab('function escapeHtml') + consts
     for raw in ("<img", "<script>", "<svg>", "<b>", "<i>", "<u>", "<x>", "<t>", "javascript:", "onclick=x"):
         assert raw not in out, raw
     assert "&lt;img src=x onerror=alert(1)&gt;" in out and "KEV" in out
+
+
+def test_truncated_names_with_the_hash_partly_kept():
+    # A 47-char Deployment: generateName "<47>-<10-char hash>-" is cut inside the hash.
+    deploy = "a" * 40 + "-pgadmin"  # 48 chars
+    pod = (deploy + "-7d4f8b9c6d-")[:58] + "q2x9z"
+    assert len(pod) == 63 and pod_matches_workload(pod, "Deployment", deploy)
+    assert not pod_matches_workload(pod, "Deployment", "a" * 40)  # a prefix with "-pgadmin..." left over
+    # A DaemonSet pod is "<name>-" cut at 58: no hash part is allowed.
+    ds = "b" * 60
+    assert pod_matches_workload(ds[:58] + "k2p4x", "DaemonSet", ds)
+    assert not pod_matches_workload(("b" * 50 + "-7d4f8b9c6d-")[:58] + "k2p4x", "DaemonSet", "b" * 50)

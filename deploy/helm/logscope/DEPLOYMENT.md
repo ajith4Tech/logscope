@@ -128,7 +128,7 @@ Vector and Falco keep running unchanged.
 | **Storage** | A StorageClass for the PVC (`local-path` is the cluster default today) | `persistence.*` ⚙ |
 | **DNS** (optional) | A/AAAA/CNAME for the UI hostname → an address reaching Traefik on 80/443 | DNS provider; `ingress.host` ⚙ |
 | **TLS** (with Ingress) | Certificate for the hostname as a `kubernetes.io/tls` Secret, or cert-manager | `ingress.tls.secretName` ⚙. Without it, Traefik serves a self-signed certificate |
-| **Vulnerability view** (optional) | Trivy Operator installed separately (official chart, `trivy-system`), an image with kubectl (`INCLUDE_KUBECTL=true`), HTTPS to `www.cisa.gov` for the KEV catalog | `security.vulnerabilityScanning.enabled` ⚙ (adds a read-only ClusterRole on Trivy reports + Ingresses and mounts the SA token; see the repository README) |
+| **Vulnerability view** (optional) | Trivy Operator installed separately (official chart, `trivy-system`), an image with kubectl (`INCLUDE_KUBECTL=true`), HTTPS to `www.cisa.gov` for the KEV catalog | `security.vulnerabilityScanning.enabled` ⚙ (adds a read-only ClusterRole on Trivy reports, Ingresses, Services and EndpointSlices and mounts the SA token; see the repository README) |
 | **Authentication** (with Ingress) | htpasswd Secret for Traefik basic auth, or SSO in front | `ingress.basicAuth.secretName` or `ingress.externalAuth` ⚙. **The app has no login of its own** |
 
 ## Things to know
